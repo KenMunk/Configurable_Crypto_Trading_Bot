@@ -46,9 +46,11 @@ cp .env.example .env
 Example values:
 
 ```env
-COINBASE_API_KEY=your_coinbase_api_key
-COINBASE_API_SECRET=your_coinbase_api_secret
-COINBASE_PASSPHRASE=your_coinbase_passphrase
+COINBASE_AUTH_MODE=secret_api_key
+COINBASE_API_KEY_NAME=organizations/.../apiKeys/...
+COINBASE_API_KEY_SECRET=your_ed25519_secret
+COINBASE_REQUIRED_PERMISSIONS=wallet:accounts:read
+COINBASE_ALLOW_TRADING=false
 COINBASE_BASE_URL=https://api.coinbase.com
 KRAKEN_API_KEY=your_kraken_api_key
 KRAKEN_API_SECRET=your_kraken_api_secret
@@ -56,6 +58,25 @@ KRAKEN_BASE_URL=https://api.kraken.com
 LAN_PORT=8080
 LIVE_EXECUTION_ACTIVE=false
 ```
+
+`COINBASE_REQUIRED_PERMISSIONS` documents the permissions the application
+expects the Coinbase key to have; it does not grant permissions. Keep both
+`COINBASE_ALLOW_TRADING` and `LIVE_EXECUTION_ACTIVE` false until trading is
+deliberately enabled.
+
+Start the local engine and call `http://localhost:8080/api/coinbase/authenticate`
+or use the simulator's **Test Coinbase Authentication** button. The engine
+performs a read-only account request using an Ed25519 JWT and logs the result
+without printing the key, secret, or JWT.
+
+The simulator uses the same authentication configuration and displays the full
+authentication result in its metrics panel.
+
+Before authentication, both tools check that `cdp-sdk` is installed and that
+the active Python directory is on `PATH`. Missing packages and PATH updates
+require approval. On Windows, an approved PATH update is persisted for the
+current user and applied to the current process immediately. PATH is not needed
+for imports when the correct virtual-environment interpreter is already used.
 
 ## Local validation
 

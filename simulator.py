@@ -1,6 +1,7 @@
 import json
-import os
 from pathlib import Path
+
+from engine import QuantitativeTradingEngine, ensure_coinbase_sdk, load_environment_config
 
 try:
     import tkinter as tk
@@ -28,6 +29,11 @@ class SimulationWindow:
 
         self.config_path_var = tk.StringVar(value="config/btc_macro_horizon.json")
         self.result_var = tk.StringVar(value="Simulation status: idle")
+        self.auth_status_var = tk.StringVar(value="Coinbase authentication: not tested")
+        self.runtime_config = load_environment_config()
+        self.auth_engine = QuantitativeTradingEngine(
+            base_directory=".", node_is_primary=False, env_file=".env"
+        )
 
         self._build_ui()
 
@@ -46,6 +52,9 @@ class SimulationWindow:
         action_row.pack(fill="x", pady=(0, 12))
         ttk.Button(action_row, text="Load Profile", command=self._load_profile).pack(side="left")
         ttk.Button(action_row, text="Run Simulation", command=self._run_simulation).pack(side="left", padx=(8, 0))
+        ttk.Button(action_row, text="Test Coinbase Authentication", command=self._authenticate_coinbase).pack(
+            side="left", padx=(8, 0)
+        )
 
         ttk.Label(main, text="Metrics", font=("Segoe UI", 10, "bold")).pack(anchor="w")
         self.metrics_text = tk.Text(main, height=18, wrap="word", bg="#f5f5f5")
@@ -53,6 +62,34 @@ class SimulationWindow:
 
         ttk.Label(main, text="Status", font=("Segoe UI", 10, "bold")).pack(anchor="w")
         ttk.Label(main, textvariable=self.result_var, foreground="#1a5d1a").pack(anchor="w", pady=(4, 0))
+        ttk.Label(main, textvariable=self.auth_status_var, foreground="#1a5d1a").pack(anchor="w", pady=(4, 0))
+
+    def _authenticate_coinbase(self):
+        coinbase = self.runtime_config["coinbase"]
+        mode = coinbase.get("auth_mode", "secret_api_key")
+        self.auth_status_var.set(f"Coinbase authentication: testing {mode}")
+        approve_path_update = lambda: messagebox.askyesno(
+            "Update PATH",
+            "The active Python directory is not on PATH. Add it to your user PATH?",
+        ) if messagebox is not None else False
+        result = self.auth_engine.authenticate_coinbase(
+            dependency_prompt=lambda: messagebox.askyesno(
+                "Install Coinbase SDK",
+                "The Coinbase SDK is missing. Install it now?",
+            )
+            if messagebox is not None
+            else False,
+            path_prompt=approve_path_update,
+        )
+        self.metrics_text.delete("1.0", tk.END)
+        self.metrics_text.insert("1.0", json.dumps(result, indent=2))
+        if result["authenticated"]:
+            account_count = result.get("account_count", "unknown")
+            self.auth_status_var.set(f"Coinbase authentication: succeeded ({account_count} accounts)")
+        else:
+            self.auth_status_var.set(
+                f"Coinbase authentication: failed ({result.get('message', 'see engine logs')})"
+            )
 
     def _browse_config(self):
         from tkinter import filedialog

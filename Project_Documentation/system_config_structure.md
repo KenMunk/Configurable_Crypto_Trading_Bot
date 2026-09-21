@@ -36,9 +36,11 @@ This keeps model files focused on strategy decisions and keeps shared infrastruc
   "exchange_connections": {
     "coinbase": {
       "enabled": true,
-      "api_key": "",
-      "api_secret": "",
-      "passphrase": "",
+      "auth_mode": "secret_api_key",
+      "api_key_name": "",
+      "api_key_secret": "",
+      "required_permissions": ["wallet:accounts:read"],
+      "allow_trading": false,
       "base_url": "https://api.coinbase.com",
       "fee_refresh_interval": "WEEKLY",
       "fee_refresh_time_utc": "00:00:00",
@@ -83,9 +85,11 @@ This block defines each exchange the system may use.
 
 Each exchange object can contain:
 - `enabled`: whether the exchange is active for this system
-- `api_key`: API key from the local environment or `.env` file
-- `api_secret`: secret credential for the exchange API
-- `passphrase`: optional exchange passphrase where required
+- `auth_mode`: Coinbase authentication method, such as `secret_api_key` or `oauth`
+- `api_key_name`: Coinbase Secret API Key name
+- `api_key_secret`: Ed25519 private key material, kept only in the local `.env`
+- `required_permissions`: permissions the application expects the key to have; this does not grant them
+- `allow_trading`: local guard that must be enabled before trade routing is permitted
 - `base_url`: API base URL for the exchange
 - `fee_refresh_interval`: how often the fee schedule should be refreshed; common values are `WEEKLY`, `MONTHLY`, or `MANUAL`
 - `fee_refresh_time_utc`: the scheduled time to refresh fees in UTC
@@ -93,6 +97,26 @@ Each exchange object can contain:
 - `fallback_commission_rate`: fee rate used when the live rate cannot be fetched
 
 These settings are intentionally global because they affect all models sharing the same orchestration layer.
+
+Authentication permissions are system-level settings, not model settings. A
+model cannot grant itself trading access. The `live_execution_active` safeguard
+must also be enabled before any live order-routing implementation can execute
+trades.
+
+### Coinbase authentication and diagnostics
+
+When `auth_mode` is `secret_api_key`, the local dashboard provides:
+
+- `GET /api/coinbase/authenticate`: performs a read-only account request
+
+The engine logs JWT generation and the final authentication result without
+printing secrets or bearer tokens. The simulator's `Test Coinbase Authentication`
+button uses the same probe and displays the result.
+
+Before authentication, both tools check the required `cdp-sdk` package and the
+active Python interpreter directory. Missing packages and PATH updates require
+user approval. On Windows, an approved PATH update is written to the current
+user environment and applied to the current process immediately.
 
 ### `global_safeguards`
 
