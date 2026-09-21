@@ -157,6 +157,11 @@ ENV/
 env.bak/
 venv.bak/
 
+# Private runtime configuration and strategy models
+config/
+!config/.gitkeep
+!config/.example/
+
 # Spyder project settings
 .spyderproject
 .spyproject
