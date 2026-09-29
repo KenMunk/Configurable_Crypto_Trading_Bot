@@ -3,14 +3,11 @@ import json
 import logging
 import os
 import subprocess
-import secrets
 import sqlite3
 import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from urllib.error import HTTPError
-from urllib.parse import parse_qs, urlencode, urlsplit
 from urllib.request import Request, urlopen
 
 DEFAULT_ENV_PATH = ".env"
@@ -41,44 +38,44 @@ def _coerce_env_value(raw_value):
 
 
 def ensure_coinbase_sdk(prompt=None, path_prompt=None):
-    """Load cdp-sdk, optionally asking before installing it into this interpreter."""
+    """Load coinbase-advanced-py, optionally asking before installing it into this interpreter."""
     path_configured = ensure_python_path(path_prompt)
     try:
-        import cdp.auth.utils.jwt  # noqa: F401
+        import coinbase.rest  # noqa: F401
 
         if not path_configured:
-            LOGGER.info("[RUNTIME] cdp-sdk is usable through the active interpreter despite PATH")
+            LOGGER.info("[RUNTIME] coinbase-advanced-py is usable through the active interpreter despite PATH")
         return True
     except ImportError:
         pass
 
     if prompt is None:
         if not sys.stdin.isatty():
-            LOGGER.error("[DEPENDENCY] cdp-sdk is missing and no interactive prompt is available")
+            LOGGER.error("[DEPENDENCY] coinbase-advanced-py is missing and no interactive prompt is available")
             return False
-        answer = input("Coinbase cdp-sdk is missing. Install it now? [y/N] ").strip().lower()
+        answer = input("Coinbase coinbase-advanced-py is missing. Install it now? [y/N] ").strip().lower()
         prompt = lambda: answer in {"y", "yes"}
 
     if not prompt():
-        LOGGER.warning("[DEPENDENCY] Coinbase cdp-sdk installation declined")
+        LOGGER.warning("[DEPENDENCY] coinbase-advanced-py installation declined")
         return False
 
-    LOGGER.info("[DEPENDENCY] Installing cdp-sdk with %s", sys.executable)
+    LOGGER.info("[DEPENDENCY] Installing coinbase-advanced-py with %s", sys.executable)
     result = subprocess.run(
-        [sys.executable, "-m", "pip", "install", "cdp-sdk"],
+        [sys.executable, "-m", "pip", "install", "coinbase-advanced-py"],
         check=False,
     )
     if result.returncode != 0:
-        LOGGER.error("[DEPENDENCY] cdp-sdk installation failed with exit code %s", result.returncode)
+        LOGGER.error("[DEPENDENCY] coinbase-advanced-py installation failed with exit code %s", result.returncode)
         return False
 
     try:
-        import cdp.auth.utils.jwt  # noqa: F401
+        import coinbase.rest  # noqa: F401
 
-        LOGGER.info("[DEPENDENCY] cdp-sdk installed successfully")
+        LOGGER.info("[DEPENDENCY] coinbase-advanced-py installed successfully")
         return True
     except ImportError as exc:
-        LOGGER.error("[DEPENDENCY] cdp-sdk remains unavailable after installation: %s", exc)
+        LOGGER.error("[DEPENDENCY] coinbase-advanced-py remains unavailable after installation: %s", exc)
         return False
 
 
@@ -140,20 +137,11 @@ def load_environment_config(env_path=DEFAULT_ENV_PATH):
     env_file = env_path or DEFAULT_ENV_PATH
     config = {
         "coinbase": {
-            "auth_mode": "api_key",
             "api_key_name": "",
             "api_key_secret": "",
-            "required_permissions": ["wallet:accounts:read"],
+            "key_file": "",
+            "required_permissions": ["view"],
             "allow_trading": False,
-            "api_key": "",
-            "api_secret": "",
-            "passphrase": "",
-            "oauth_client_id": "",
-            "oauth_client_secret": "",
-            "oauth_redirect_uri": "http://localhost:8080/oauth/callback",
-            "oauth_scopes": ["wallet:accounts:read", "offline_access"],
-            "oauth_access_token": "",
-            "oauth_refresh_token": "",
             "base_url": "https://api.coinbase.com",
             "enabled": False,
         },
@@ -180,12 +168,13 @@ def load_environment_config(env_path=DEFAULT_ENV_PATH):
             normalized_key = key.upper()
             value = _coerce_env_value(value)
 
-            if normalized_key == "COINBASE_AUTH_MODE":
-                config["coinbase"]["auth_mode"] = str(value).lower()
-            elif normalized_key == "COINBASE_API_KEY_NAME":
+            if normalized_key == "COINBASE_API_KEY_NAME":
                 config["coinbase"]["api_key_name"] = str(value)
             elif normalized_key == "COINBASE_API_KEY_SECRET":
-                config["coinbase"]["api_key_secret"] = str(value)
+                # A PEM key fits on one .env line only with its newlines escaped as \n.
+                config["coinbase"]["api_key_secret"] = str(value).replace("\\n", "\n")
+            elif normalized_key == "COINBASE_KEY_FILE":
+                config["coinbase"]["key_file"] = str(value)
             elif normalized_key == "COINBASE_REQUIRED_PERMISSIONS":
                 config["coinbase"]["required_permissions"] = [
                     permission.strip()
@@ -194,26 +183,6 @@ def load_environment_config(env_path=DEFAULT_ENV_PATH):
                 ]
             elif normalized_key == "COINBASE_ALLOW_TRADING":
                 config["coinbase"]["allow_trading"] = bool(value)
-            elif normalized_key == "COINBASE_API_KEY":
-                config["coinbase"]["api_key"] = str(value)
-            elif normalized_key == "COINBASE_API_SECRET":
-                config["coinbase"]["api_secret"] = str(value)
-            elif normalized_key == "COINBASE_PASSPHRASE":
-                config["coinbase"]["passphrase"] = str(value)
-            elif normalized_key == "COINBASE_OAUTH_CLIENT_ID":
-                config["coinbase"]["oauth_client_id"] = str(value)
-            elif normalized_key == "COINBASE_OAUTH_CLIENT_SECRET":
-                config["coinbase"]["oauth_client_secret"] = str(value)
-            elif normalized_key == "COINBASE_OAUTH_REDIRECT_URI":
-                config["coinbase"]["oauth_redirect_uri"] = str(value)
-            elif normalized_key == "COINBASE_OAUTH_SCOPES":
-                config["coinbase"]["oauth_scopes"] = [
-                    scope.strip() for scope in str(value).split(",") if scope.strip()
-                ]
-            elif normalized_key == "COINBASE_OAUTH_ACCESS_TOKEN":
-                config["coinbase"]["oauth_access_token"] = str(value)
-            elif normalized_key == "COINBASE_OAUTH_REFRESH_TOKEN":
-                config["coinbase"]["oauth_refresh_token"] = str(value)
             elif normalized_key == "COINBASE_BASE_URL":
                 config["coinbase"]["base_url"] = str(value)
             elif normalized_key == "COINBASE_ENABLED":
@@ -342,11 +311,6 @@ class QuantitativeTradingEngine:
         self.is_active_executor = node_is_primary
         self.serial_link_active = False
         self.web_server = None
-        self.oauth_state = None
-        self.oauth_tokens = {
-            "access_token": self.api_config["coinbase"].get("oauth_access_token", ""),
-            "refresh_token": self.api_config["coinbase"].get("oauth_refresh_token", ""),
-        }
         self.last_coinbase_authentication = None
 
     def get_exchange_connection(self, exchange_name):
@@ -375,59 +339,100 @@ class QuantitativeTradingEngine:
         key_name = self.api_config["coinbase"].get("api_key_name", "")
         return key_name.rsplit("/", 1)[-1] if key_name else "unconfigured"
 
-    def create_coinbase_jwt(
-        self, request_path="/api/v3/brokerage/accounts", dependency_prompt=None, path_prompt=None
-    ):
-        """Create a short-lived Ed25519 JWT for one Coinbase API request."""
+    def load_coinbase_credentials(self):
+        """Resolve the CDP API key name and private key from .env or a key file."""
         coinbase = self.api_config["coinbase"]
         key_name = coinbase.get("api_key_name", "")
         key_secret = coinbase.get("api_key_secret", "")
+        key_file = coinbase.get("key_file", "")
+
+        if key_file and not (key_name and key_secret):
+            if not os.path.isabs(key_file):
+                key_file = os.path.join(self.base_dir, key_file)
+            if not os.path.exists(key_file):
+                raise FileNotFoundError(f"Coinbase key file not found: {key_file}")
+            with open(key_file, "r", encoding="utf-8") as handle:
+                key_data = json.load(handle)
+            # Accept both the CDP download format and the api_key/api_secret format.
+            key_name = key_data.get("api_key") or key_data.get("name") or ""
+            key_secret = key_data.get("api_secret") or key_data.get("privateKey") or ""
+            coinbase["api_key_name"] = key_name
+
         if not key_name or not key_secret:
-            raise ValueError("Coinbase API key name and Ed25519 secret are required")
+            raise ValueError(
+                "Coinbase API key name and private key are required "
+                "(set COINBASE_API_KEY_NAME and COINBASE_API_KEY_SECRET, or COINBASE_KEY_FILE)"
+            )
+        return key_name, key_secret
+
+    def create_coinbase_client(self, dependency_prompt=None, path_prompt=None):
+        """Create an Advanced Trade REST client; the SDK signs each request with a fresh JWT."""
+        key_name, key_secret = self.load_coinbase_credentials()
 
         if not ensure_coinbase_sdk(dependency_prompt, path_prompt):
             raise RuntimeError(
-                f"The Coinbase cdp-sdk package is unavailable to {sys.executable}"
+                f"The coinbase-advanced-py package is unavailable to {sys.executable}"
             )
 
-        from cdp.auth.utils.jwt import JwtOptions, generate_jwt
+        from coinbase.rest import RESTClient
 
-        LOGGER.info("[COINBASE AUTH] Generating Ed25519 JWT for key %s", self._coinbase_key_label())
-        token = generate_jwt(
-            JwtOptions(
-                api_key_id=key_name,
-                api_key_secret=key_secret,
-                request_method="GET",
-                request_host="api.coinbase.com",
-                request_path=request_path,
-                expires_in=120,
-            )
+        base_url = self.api_config["coinbase"].get("base_url", "https://api.coinbase.com")
+        LOGGER.info("[COINBASE AUTH] Creating REST client for key %s", self._coinbase_key_label())
+        return RESTClient(
+            api_key=key_name,
+            api_secret=key_secret,
+            base_url=base_url.split("://", 1)[-1],
         )
-        LOGGER.info("[COINBASE AUTH] JWT generated; expires in 120 seconds")
-        return token
 
-    def authenticate_coinbase(self, dependency_prompt=None, path_prompt=None):
-        """Run a read-only Coinbase authentication check for the configured mode."""
-        coinbase = self.api_config["coinbase"]
-        mode = coinbase.get("auth_mode", "secret_api_key")
-        if mode == "secret_api_key":
-            result = self._authenticate_coinbase_secret_api_key(dependency_prompt, path_prompt)
-        elif mode == "oauth":
-            result = self._authenticate_coinbase_oauth()
-        else:
-            LOGGER.error("[COINBASE AUTH] Unsupported authentication mode: %s", mode)
+    def authenticate_coinbase(self, dependency_prompt=None, path_prompt=None, client=None):
+        """Run a read-only Coinbase authentication check by listing accounts.
+
+        Pass `client` to test a client that was already created.
+        """
+        try:
+            from requests.exceptions import ConnectionError as RequestsConnectionError
+            from requests.exceptions import HTTPError
+        except ImportError:  # requests ships with coinbase-advanced-py
+            RequestsConnectionError = HTTPError = type("_Unavailable", (Exception,), {})
+
+        try:
+            client = client or self.create_coinbase_client(dependency_prompt, path_prompt)
+            response = client.get_accounts()
+            account_count = len(response.accounts or [])
+            LOGGER.info("[COINBASE AUTH] Authentication succeeded; accounts returned: %d", account_count)
             result = self._authentication_result(
-                authenticated=False,
-                auth_mode=mode,
-                message="Unsupported authentication mode",
+                authenticated=True,
+                message="Read-only Coinbase account request succeeded",
+                account_count=account_count,
             )
+        except HTTPError as exc:
+            status = exc.response.status_code if exc.response is not None else None
+            message = f"HTTP Error {status}: {exc}"
+            if status == 401:
+                message += "; check the API key name and private key, and that the key is not expired"
+            elif status == 403:
+                message += "; the key was accepted but lacks permission (enable 'View' on the key)"
+            LOGGER.error("[COINBASE AUTH] Authentication failed with HTTP %s", status)
+            result = self._authentication_result(authenticated=False, message=message)
+            if status == 401:
+                result["outbound_ip"] = self._get_outbound_ip()
+                result["message"] += f"; detected outbound IP: {result['outbound_ip']}"
+        except RequestsConnectionError as exc:
+            LOGGER.error("[COINBASE AUTH] Could not reach the Coinbase API: %s", exc)
+            result = self._authentication_result(
+                authenticated=False, message=f"Could not reach the Coinbase API: {exc}"
+            )
+        except Exception as exc:  # Authentication diagnostics must not stop the engine.
+            # The SDK's JWT signer raises a plain Exception when the private key can't be loaded.
+            LOGGER.error("[COINBASE AUTH] Authentication failed: %s", exc)
+            result = self._authentication_result(authenticated=False, message=str(exc))
+
         self.last_coinbase_authentication = result
         return result
 
-    def _authentication_result(self, authenticated, auth_mode, message, account_count=0):
+    def _authentication_result(self, authenticated, message, account_count=0):
         return {
             "authenticated": authenticated,
-            "auth_mode": auth_mode,
             "message": message,
             "account_count": account_count,
             "required_permissions": self.api_config["coinbase"].get("required_permissions", []),
@@ -448,130 +453,6 @@ class QuantitativeTradingEngine:
         except Exception as exc:
             LOGGER.warning("[NETWORK] Could not determine public outbound IP: %s", exc)
             return "unavailable"
-
-    def _authenticate_coinbase_secret_api_key(self, dependency_prompt=None, path_prompt=None):
-        path = "/api/v3/brokerage/accounts"
-        try:
-            token = self.create_coinbase_jwt(path, dependency_prompt, path_prompt)
-            request = Request(
-                f"{self.api_config['coinbase'].get('base_url', 'https://api.coinbase.com')}{path}",
-                headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-            )
-            with urlopen(request, timeout=20) as response:
-                payload = json.loads(response.read().decode("utf-8"))
-            account_count = len(payload.get("accounts", []))
-            LOGGER.info("[COINBASE AUTH] Authentication succeeded; accounts returned: %d", account_count)
-            return self._authentication_result(
-                authenticated=True,
-                auth_mode="secret_api_key",
-                message="Read-only Coinbase account request succeeded",
-                account_count=account_count,
-            )
-        except HTTPError as exc:
-            response_body = exc.read().decode("utf-8", errors="replace")[:500]
-            message = f"HTTP Error {exc.code}: {exc.reason}"
-            if response_body:
-                message = f"{message}; Coinbase response: {response_body}"
-            LOGGER.error("[COINBASE AUTH] Authentication failed with HTTP %s", exc.code)
-            result = self._authentication_result(
-                authenticated=False,
-                auth_mode="secret_api_key",
-                message=message,
-            )
-            if exc.code == 401:
-                result["outbound_ip"] = self._get_outbound_ip()
-                result["message"] += f"; detected outbound IP: {result['outbound_ip']}"
-            return result
-        except Exception as exc:  # Authentication diagnostics must not stop the engine.
-            LOGGER.error("[COINBASE AUTH] Authentication failed: %s", exc)
-            return self._authentication_result(
-                authenticated=False,
-                auth_mode="secret_api_key",
-                message=str(exc),
-            )
-
-    def _authenticate_coinbase_oauth(self):
-        access_token = self.oauth_tokens.get("access_token", "")
-        if not access_token:
-            LOGGER.error("[COINBASE AUTH] OAuth mode selected but no access token is configured")
-            return self._authentication_result(
-                authenticated=False,
-                auth_mode="oauth",
-                message="OAuth access token is not configured",
-            )
-        try:
-            request = Request(
-                f"{self.api_config['coinbase'].get('base_url', 'https://api.coinbase.com')}/v2/user",
-                headers={"Authorization": f"Bearer {access_token}"},
-            )
-            with urlopen(request, timeout=20) as response:
-                json.loads(response.read().decode("utf-8"))
-            LOGGER.info("[COINBASE AUTH] OAuth authentication succeeded")
-            return self._authentication_result(
-                authenticated=True,
-                auth_mode="oauth",
-                message="OAuth user request succeeded",
-            )
-        except Exception as exc:  # Authentication diagnostics must not stop the engine.
-            LOGGER.error("[COINBASE AUTH] OAuth authentication failed: %s", exc)
-            return self._authentication_result(
-                authenticated=False,
-                auth_mode="oauth",
-                message=str(exc),
-            )
-
-    def create_coinbase_oauth_authorization_url(self):
-        """Create a one-time local OAuth authorization URL for Coinbase."""
-        coinbase = self.api_config["coinbase"]
-        client_id = coinbase.get("oauth_client_id", "")
-        redirect_uri = coinbase.get("oauth_redirect_uri", "")
-        if not client_id or not redirect_uri:
-            raise ValueError("Coinbase OAuth client ID and redirect URI are required")
-
-        self.oauth_state = secrets.token_urlsafe(32)
-        query = urlencode(
-            {
-                "response_type": "code",
-                "client_id": client_id,
-                "redirect_uri": redirect_uri,
-                "scope": ",".join(coinbase.get("oauth_scopes", ["wallet:accounts:read", "offline_access"])),
-                "state": self.oauth_state,
-            }
-        )
-        return f"https://login.coinbase.com/oauth2/auth?{query}"
-
-    def complete_coinbase_oauth(self, code, state, error=""):
-        """Validate the callback and exchange the authorization code for tokens."""
-        if error:
-            raise ValueError(f"Coinbase OAuth authorization failed: {error}")
-        if not code or not state or not secrets.compare_digest(state, self.oauth_state or ""):
-            raise ValueError("Invalid or expired Coinbase OAuth state")
-
-        coinbase = self.api_config["coinbase"]
-        payload = urlencode(
-            {
-                "grant_type": "authorization_code",
-                "code": code,
-                "client_id": coinbase.get("oauth_client_id", ""),
-                "client_secret": coinbase.get("oauth_client_secret", ""),
-                "redirect_uri": coinbase.get("oauth_redirect_uri", ""),
-            }
-        ).encode("utf-8")
-        request = Request(
-            "https://login.coinbase.com/oauth2/token",
-            data=payload,
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
-            method="POST",
-        )
-        with urlopen(request, timeout=20) as response:
-            tokens = json.loads(response.read().decode("utf-8"))
-
-        self.oauth_tokens = {
-            "access_token": tokens.get("access_token", ""),
-            "refresh_token": tokens.get("refresh_token", ""),
-        }
-        self.oauth_state = None
-        return {"authenticated": bool(self.oauth_tokens["access_token"]), "scope": coinbase.get("oauth_scopes", [])}
 
     def initialize_node_cluster(self, lan_port=8080):
         LOGGER.info("[RUNTIME] Python interpreter: %s", sys.executable)

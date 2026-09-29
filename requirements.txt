@@ -1,1 +1,3 @@
-cdp-sdk>=1.48.1
+coinbase-advanced-py>=1.8.4
+matplotlib>=3.11
+numpy>=2.0

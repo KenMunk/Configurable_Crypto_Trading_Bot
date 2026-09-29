@@ -1,0 +1,62 @@
+{
+  "ticker": "BTC",
+  "product_id": "BTC-USD",
+  "strategy_horizon": "MACRO_TREND",
+  "execution_platform": "COINBASE_ADVANCED",
+  "period_granularity": "FIFTEEN_MINUTE",
+  "indicators": {
+    "fast_ema": {"type": "EMA", "period": "7.5h", "description": "Fast trend line (30 candles)."},
+    "slow_ema": {"type": "EMA", "period": "45h", "description": "Slow macro trend filter (180 candles)."},
+    "emergency_ema": {"type": "EMA", "period": "1h", "description": "Short momentum screen (4 candles)."}
+  },
+  "strategy": {
+    "direction": "LONG_ONLY",
+    "market_regime": "TREND_FOLLOWING",
+    "entry_signal": {
+      "description": "Fast EMA above slow EMA, emergency EMA confirming momentum, trend at least 1% strong.",
+      "all": [
+        "fast_ema > slow_ema",
+        "emergency_ema > fast_ema",
+        "(fast_ema - slow_ema) / slow_ema >= 0.01"
+      ]
+    },
+    "exit_signal": {
+      "description": "Exit when the fast EMA falls below the slow EMA, at the hard stop, or at the profit target.",
+      "any": ["fast_ema < slow_ema"],
+      "hard_stop_trigger": true,
+      "profit_lock_target": 0.08
+    }
+  },
+  "friction_model": {
+    "exchange_fee_coverage_enabled": true,
+    "commission_rate_source": "exchange_api",
+    "fee_buffer_multiplier": 1.0,
+    "fallback_commission_rate": 0.005,
+    "tax_buffer_rate": 0.313,
+    "slippage_buffer": 0.0025,
+    "liquidity_fee_buffer": 0.5,
+    "rebalancing_cost_adjustment": true
+  },
+  "capital_allocation": {
+    "starting_capital": 10000,
+    "target_position_fraction": 0.25,
+    "value_harvesting_rate": 0.10,
+    "allocation_policy": "convert_harvested_profit_to_configured_trading_currency"
+  },
+  "execution": {
+    "order_style": "LIMIT_WITH_FRICTION_MARGIN",
+    "live_execution_active": false,
+    "max_orders_per_day": 12,
+    "rebalance_interval_minutes": 15,
+    "primary_exchange": "COINBASE_ADVANCED"
+  },
+  "safeguards": {
+    "live_execution_active": false,
+    "use_hard_stop": true,
+    "hard_stop_percentage": 0.03,
+    "minimum_net_profit_gate": 0.05,
+    "max_drawdown_limit": 0.12,
+    "volatility_cap": 0.08,
+    "risk_budget_per_trade": 0.02
+  }
+}

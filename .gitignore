@@ -158,7 +158,7 @@ env.bak/
 venv.bak/
 
 # Private runtime configuration and strategy models
-config/
+config/*
 !config/.gitkeep
 !config/.example/
 
@@ -221,3 +221,9 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Coinbase CDP API key files (never commit real keys)
+cdp_api_key*.json
+
+# Cached historical market data
+data/

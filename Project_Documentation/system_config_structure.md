@@ -36,10 +36,10 @@ This keeps model files focused on strategy decisions and keeps shared infrastruc
   "exchange_connections": {
     "coinbase": {
       "enabled": true,
-      "auth_mode": "secret_api_key",
       "api_key_name": "",
       "api_key_secret": "",
-      "required_permissions": ["wallet:accounts:read"],
+      "key_file": "",
+      "required_permissions": ["view"],
       "allow_trading": false,
       "base_url": "https://api.coinbase.com",
       "fee_refresh_interval": "WEEKLY",
@@ -85,9 +85,9 @@ This block defines each exchange the system may use.
 
 Each exchange object can contain:
 - `enabled`: whether the exchange is active for this system
-- `auth_mode`: Coinbase authentication method, such as `secret_api_key` or `oauth`
-- `api_key_name`: Coinbase Secret API Key name
-- `api_key_secret`: Ed25519 private key material, kept only in the local `.env`
+- `api_key_name`: Coinbase CDP Secret API key name (`organizations/{org_id}/apiKeys/{key_id}`)
+- `api_key_secret`: Ed25519 or ECDSA private key material, kept only in the local `.env`
+- `key_file`: optional path to the CDP key JSON, used when the name and secret are not set directly
 - `required_permissions`: permissions the application expects the key to have; this does not grant them
 - `allow_trading`: local guard that must be enabled before trade routing is permitted
 - `base_url`: API base URL for the exchange
@@ -105,15 +105,16 @@ trades.
 
 ### Coinbase authentication and diagnostics
 
-When `auth_mode` is `secret_api_key`, the local dashboard provides:
+Coinbase requests go through the official `coinbase-advanced-py` SDK. The local
+dashboard provides:
 
 - `GET /api/coinbase/authenticate`: performs a read-only account request
 
-The engine logs JWT generation and the final authentication result without
-printing secrets or bearer tokens. The simulator's `Test Coinbase Authentication`
+The SDK's `RESTClient` signs each request with a short-lived JWT. The engine logs
+the final authentication result without printing secrets or bearer tokens. The simulator's `Test Coinbase Authentication`
 button uses the same probe and displays the result.
 
-Before authentication, both tools check the required `cdp-sdk` package and the
+Before authentication, both tools check the required `coinbase-advanced-py` package and the
 active Python interpreter directory. Missing packages and PATH updates require
 user approval. On Windows, an approved PATH update is written to the current
 user environment and applied to the current process immediately.

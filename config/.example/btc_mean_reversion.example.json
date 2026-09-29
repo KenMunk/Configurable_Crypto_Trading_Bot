@@ -1,0 +1,80 @@
+{
+  "ticker": "BTC",
+  "product_id": "BTC-USD",
+  "strategy_horizon": "SHORT_TERM",
+  "execution_platform": "COINBASE_ADVANCED",
+  "period_granularity": "ONE_HOUR",
+  "indicators": {
+    "bands": {
+      "type": "BOLLINGER",
+      "period": "1d",
+      "std_dev": 2,
+      "description": "24-hour Bollinger Bands: price stretched below the lower band is oversold."
+    },
+    "rsi": {
+      "type": "RSI",
+      "period": 14,
+      "description": "Momentum confirmation: RSI under 30 is oversold."
+    },
+    "trend": {
+      "type": "ADX",
+      "period": 14,
+      "description": "Trend strength: mean reversion only in a ranging market (ADX under 20)."
+    },
+    "volatility": {
+      "type": "VOLATILITY",
+      "period": "7d",
+      "description": "Annualized 7-day historical volatility; stand aside when markets are disorderly."
+    },
+    "session_vwap": {
+      "type": "VWAP",
+      "anchor": "day",
+      "description": "Daily VWAP, plotted as the day's fair-value reference."
+    }
+  },
+  "strategy": {
+    "direction": "LONG_ONLY",
+    "market_regime": "MEAN_REVERSION",
+    "entry_signal": {
+      "description": "Buy an oversold dip in a ranging, orderly market.",
+      "all": [
+        "close < bands.lower",
+        "rsi < 30",
+        "trend.adx < 20",
+        "volatility < 0.8"
+      ]
+    },
+    "exit_signal": {
+      "description": "Take profit once price reverts to the middle band or momentum recovers.",
+      "any": [
+        "close > bands.middle",
+        "crosses_above(rsi, 60)"
+      ],
+      "hard_stop_trigger": true,
+      "profit_lock_target": 0.05
+    }
+  },
+  "friction_model": {
+    "exchange_fee_coverage_enabled": true,
+    "commission_rate_source": "exchange_api",
+    "fallback_commission_rate": 0.005,
+    "tax_buffer_rate": 0.313,
+    "slippage_buffer": 0.0025,
+    "liquidity_fee_buffer": 0.5
+  },
+  "capital_allocation": {
+    "starting_capital": 5000,
+    "target_position_fraction": 0.25
+  },
+  "execution": {
+    "live_execution_active": false,
+    "max_orders_per_day": 6
+  },
+  "safeguards": {
+    "live_execution_active": false,
+    "use_hard_stop": true,
+    "hard_stop_percentage": 0.04,
+    "minimum_net_profit_gate": 0.01,
+    "max_drawdown_limit": 0.15
+  }
+}
