@@ -412,15 +412,22 @@ Division by zero also gives an unknown value rather than an error.
 Each candle is processed in this order:
 
 1. **Taxes** for a finished calendar year are settled when a new year begins. They count as withdrawals, not losses, in every drawdown figure.
-2. **Flash crashes**, if `strategy.flash_crash_buy` is set: any resting limit buy the candle traded down to fills at its price and is held until the crash recovers. A crash that recovers within an hour is ignored by everything below; during a longer one, steps 3 and 4 are skipped until it recovers (see `config_file_structure.md`).
+2. **Flash crashes**, if `strategy.flash_crash_buy` is set: any resting limit buy the candle traded down to fills at its price and is held until the crash recovers. A crash that recovers within an hour is ignored by everything below; during a longer one, steps 3 and 4 are skipped until it recovers (see [flash_crash_buy](model_configuration.md#flash_crash_buy)).
 3. **Exits**, if a position is open, checked in priority order:
-   1. **Stops**: the hard stop (if `safeguards.use_hard_stop` and `exit_signal.hard_stop_trigger` are true, at `entry price x (1 - hard_stop_percentage)`) and, with `safeguards.drawdown_window`, the drawdown stop (at the price where the model's value would fall `max_drawdown_limit` below its high in the window). If the candle's low reaches either, the higher one fills, at its price or at the open if price gapped below it.
+   1. **Stops**:
+      - the hard stop, if `safeguards.use_hard_stop` and `exit_signal.hard_stop_trigger` are true, at `entry price x (1 - hard_stop_percentage)`
+      - the trailing stop, if `exit_signal.trailing_stop` is set
+      - with `safeguards.drawdown_window`, the drawdown stop, at the price where the model's value would fall `max_drawdown_limit` below its high in the window
+
+      If the candle's low reaches any of them, the highest one fills, at its price, or at the open if the price gapped below it.
    2. **Profit lock**: if the candle's high reaches `entry price x (1 + profit_lock_target)`, it sells at the target, or at the open if price gapped above it.
    3. **Exit rules**: if the exit rules hold at the candle's close, it sells at the close. The Trades tab shows the reason `EXIT_SIGNAL`.
 4. **Drawdown limit** without a window: if equity has fallen `max_drawdown_limit` from its peak, any position closes and trading pauses. After either kind of drawdown exit, trading resumes only once the entry signal has switched **off** and then fires again.
-5. **Entries**, if no position is open: the entry rules must hold at the close, `max_orders_per_day` must allow it, and the signal must pass the **friction screen** (see `config_file_structure.md`). The screen uses `exit_signal.profit_lock_target` as the expected gain, so a model without a profit target is not screened. Entries fill at the close, with the reason `ENTRY_SIGNAL`.
+5. **Entries**, if no position is open: the entry rules must hold at the close, `max_orders_per_day` must allow it, and the signal must pass the **friction screen** (see [the friction screen](model_configuration.md#5-the-friction-screen-worked-through)). The screen uses `exit_signal.profit_lock_target` as the expected gain, so a model without a profit target is not screened. Entries fill at the close, with the reason `ENTRY_SIGNAL`.
 
 Rules see only the current and past candles, so there is no look-ahead: a rule evaluated at a candle's close uses that close and earlier data.
+
+For fill prices, fees, exit reasons and the limits of a backtest, see [How trades are simulated](simulator.md#8-how-trades-are-simulated) in the simulator guide.
 
 ---
 

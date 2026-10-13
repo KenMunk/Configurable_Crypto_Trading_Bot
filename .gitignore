@@ -161,6 +161,9 @@ venv.bak/
 config/*
 !config/.gitkeep
 !config/.example/
+!config/README.md
+# Profiles loaded by `python engine.py`, whose base directory is quant_system/
+quant_system/config/
 
 # Spyder project settings
 .spyderproject

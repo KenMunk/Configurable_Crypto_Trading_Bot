@@ -1,5 +1,7 @@
 # System Configuration Structure and Meaning
 
+> **Status: planned design.** No code reads a system configuration file yet. Today the system-wide settings (exchange credentials, the dashboard port and the trading switches) live in the local `.env` file. See [Setting up the .env file](trader.md#2-setting-up-the-env-file) in the trader guide.
+
 This document explains the shared system-level configuration used across all trading models. Unlike the model config files, the system config is not strategy-specific. It defines platform-wide settings that affect how the bot connects to exchanges, refreshes operational data, and enforces cross-model runtime policies.
 
 ## Purpose
