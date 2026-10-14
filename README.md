@@ -130,7 +130,8 @@ The code is split into small modules:
 | Module | Role |
 |---|---|
 | `simulator.py` | The simulator window: model selection, runs, results tabs. |
-| `backtest.py` | Candle download and caching, and the backtest itself: fills, stops, taxes, drawdown limits, flash crashes. |
+| `backtest.py` | Candle download, and the backtest itself: fills, stops, taxes, drawdown limits, flash crashes. |
+| `candle_store.py` | The candle cache: a SQLite table per product and candle size, with a column for each slow indicator kept between runs. |
 | `model_config.py` | Validates a profile and compiles its indicators and rules into per-candle signals. |
 | `indicators.py` | The indicator library: moving averages, oscillators, bands, volatility, trend and volume. |
 | `rules.py` | The rule language: formulas parsed against a whitelist and never executed as Python. |
@@ -202,7 +203,7 @@ The blueprint has five sections, which this summary follows:
   | 15-minute | 1,753,200 | 56 MB |
   | 1-minute | 26,298,000 | 842 MB |
 
-  Even the 1-minute data is under 1% of a 128 GB SSD. The simulator's own candle cache stores CSV text instead, which takes more space.
+  Even the 1-minute data is under 1% of a 128 GB SSD. The simulator's own candle cache stores 64-bit values in SQLite instead, which takes more space: about 19 MB for 10 years of 15-minute BTC-USD candles.
 - **The memory budget.** The node's whole runtime is planned at about 800 MB of its 8 GB:
   - Linux: 300 MB
   - Python: 50 MB
@@ -248,7 +249,8 @@ The blueprint's code listing is an early snapshot of `engine.py`. The current en
 Configurable_Crypto_Trading_Bot/
 ├── simulator.py              Simulator window (run this to backtest)
 ├── engine.py                 Trader runtime (status dashboard, Coinbase auth, ledger)
-├── backtest.py               Candle download and cache; the backtest engine
+├── backtest.py               Candle download; the backtest engine
+├── candle_store.py           Candle cache and stored indicators (SQLite)
 ├── model_config.py           Profile validation and compilation
 ├── indicators.py             Indicator library
 ├── rules.py                  Signal rule language
@@ -260,7 +262,7 @@ Configurable_Crypto_Trading_Bot/
 ├── config/
 │   ├── .example/             Public template profiles (tracked)
 │   └── *.json                Your private profiles (ignored by Git)
-├── data/                     Candle cache, created on first run (ignored by Git)
+├── data/                     Candle cache (candles.db), created on first run (ignored by Git)
 ├── ledger/                   Ledger database for the repository-root base directory
 ├── quant_system/             Default base directory of `python engine.py`
 │   ├── config/               Profiles the engine loads (ignored by Git)
@@ -295,7 +297,7 @@ The `data/` folder is created by the simulator's first run and is ignored by Git
 | `config/*.json` | Ignored | Your private model profiles |
 | `config/.example/` | Tracked | Public template profiles |
 | `quant_system/config/` | Ignored | The profiles loaded by `python engine.py` |
-| `data/` | Ignored | The cached candle history |
+| `data/` | Ignored | The cached candle history and stored indicators |
 | `cdp_api_key*.json` | Ignored | Coinbase key files, if you keep them in the repository folder |
 | `ledger/`, `quant_system/ledger/` | Tracked (currently empty) | SQLite ledgers; keep real trading records out of Git |
 

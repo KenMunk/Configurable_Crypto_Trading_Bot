@@ -7,6 +7,8 @@ Each profile names its indicators and picks a type from INDICATORS, for example
 Every indicator is computed once over the whole candle history as a numpy array.
 Values are NaN until the indicator has enough history (its warm-up), and rules
 treat NaN as "not yet known", so nothing trades on a half-formed indicator.
+Models evaluated on the same candles can share a MetricCache, so an indicator they
+define the same way is computed only once.
 See Project_Documentation/indicator_reference.md for the full reference.
 """
 
@@ -408,6 +410,28 @@ INDICATORS = {
     "MFI": (_mfi, {"period": 14}, None, False, "Money flow index (0-100)"),
 }
 PERIOD_PARAMETERS = {"period", "fast", "slow", "signal", "k_period", "d_period", "smooth", "atr_period"}
+# Indicators whose value on a candle depends only on that many of the latest candles of
+# their source, counting itself (per output where the outputs differ); their warm-up is
+# that many candles less one. The others (EMA-based, Wilder-smoothed, OBV and VWAP) carry
+# state from the whole history before them. Only these can be stored and later extended
+# from recent candles alone (see candle_store.py).
+WINDOW_LOOKBACK = {
+    "SMA": lambda p: p["period"],
+    "WMA": lambda p: p["period"],
+    "HMA": lambda p: p["period"] + max(int(math.sqrt(p["period"])), 1) - 1,
+    "VWMA": lambda p: p["period"],
+    "STOCHASTIC": lambda p: {"k": p["k_period"] + p["smooth"] - 1,
+                             "d": p["k_period"] + p["smooth"] + p["d_period"] - 2},
+    "ROC": lambda p: p["period"] + 1,
+    "MOMENTUM": lambda p: p["period"] + 1,
+    "CCI": lambda p: p["period"],
+    "WILLIAMS_R": lambda p: p["period"],
+    "BOLLINGER": lambda p: p["period"],
+    "DONCHIAN": lambda p: p["period"],
+    "STDDEV": lambda p: p["period"],
+    "VOLATILITY": lambda p: p["period"] + 1,
+    "MFI": lambda p: p["period"] + 1,
+}
 # Output fields on the price scale, for indicators whose other fields are not prices.
 PRICE_SCALE_FIELDS = {"BOLLINGER": ["upper", "middle", "lower"]}
 # Chart guides for oscillator panels: conventional reference levels, and fixed axis
@@ -425,16 +449,67 @@ PANEL_GUIDES = {
 }
 
 
+CANDLE_ARRAYS = ("open", "high", "low", "close", "volume")
+
+
+class MetricCache:
+    """Candle arrays and the indicator values computed from them.
+
+    Every model evaluated on the same candles can share one cache, so an indicator that
+    several profiles define the same way, whatever they name it, is computed only once.
+    Values are keyed by IndicatorContext.metric_key.
+    """
+
+    def __init__(self, candles=(), arrays=None):
+        if arrays is None:
+            arrays = {"time": np.array([c["start"] for c in candles], dtype=np.int64)}
+            for field in CANDLE_ARRAYS:
+                arrays[field] = np.array([c[field] for c in candles], dtype=float)
+        self.arrays = arrays
+        self.values = {}
+
+    def __len__(self):
+        return len(self.arrays["time"])
+
+    def tail(self, first):
+        """A new, empty cache for the candles from index `first` on."""
+        return MetricCache(arrays={field: values[first:] for field, values in self.arrays.items()})
+
+    def get(self, key, compute, lookback=None):
+        """The values of metric `key`, computed by `compute()` the first time they're asked for.
+
+        `compute(first)` computes the metric over the candles from index `first` on, and
+        `lookback` maps each output to the number of latest candles it depends on (None when
+        it depends on the whole history); a subclass can use them to store the metric.
+        """
+        if key not in self.values:
+            self.values[key] = self._compute(key, compute, lookback)
+        return self.values[key]
+
+    def _compute(self, key, compute, lookback):
+        return compute()
+
+
+def _format_parameter(value):
+    if isinstance(value, bool):
+        return str(value).lower()
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))  # 2 and 2.0 are the same metric
+    return str(value)
+
+
 class IndicatorContext:
-    """Candle arrays plus lazily computed indicators, resolving sources between them."""
+    """Candle arrays plus lazily computed indicators, resolving sources between them.
+
+    `candles` is a list of candle dicts, or a MetricCache shared with other contexts on
+    the same candles.
+    """
 
     def __init__(self, candles, definitions, granularity_seconds):
-        self.time = np.array([c["start"] for c in candles], dtype=np.int64)
-        self.open = np.array([c["open"] for c in candles], dtype=float)
-        self.high = np.array([c["high"] for c in candles], dtype=float)
-        self.low = np.array([c["low"] for c in candles], dtype=float)
-        self.close = np.array([c["close"] for c in candles], dtype=float)
-        self.volume = np.array([c["volume"] for c in candles], dtype=float)
+        self.metrics = candles if isinstance(candles, MetricCache) else MetricCache(candles)
+        arrays = self.metrics.arrays
+        self.time = arrays["time"]
+        self.open, self.high, self.low, self.close, self.volume = (arrays[field] for field in CANDLE_ARRAYS)
         self.granularity_seconds = granularity_seconds
         self.definitions = definitions
         self.values = {}
@@ -468,6 +543,53 @@ class IndicatorContext:
 
     source = series
 
+    def metric_key(self, name, _path=()):
+        """A name for a series that is the same in every profile defining it the same way.
+
+        It is the type and resolved parameters, periods in candles, with any indicator
+        source replaced by its own key: "SMA(period=2880, source=close)" whether a profile
+        calls it slow_sma or trend and gives its period as 2880 or "30d". An output of a
+        multi-output indicator adds its field, as in "BOLLINGER(...).upper".
+        """
+        if name in PRICE_FIELDS:
+            return name
+        indicator, _, field = name.partition(".")
+        if indicator not in self.definitions:
+            raise IndicatorError(f"Unknown series '{name}'")
+        if indicator in _path:
+            raise IndicatorError("Indicator sources form a loop: " + " -> ".join(_path + (indicator,)))
+        definition = self.definitions[indicator]
+        parts = []
+        for parameter, value in resolve_parameters(indicator, definition, self.granularity_seconds).items():
+            if parameter == "source":
+                value = self.metric_key(value, _path + (indicator,))
+            parts.append(f"{parameter}={_format_parameter(value)}")
+        key = f"{definition['type']}({', '.join(parts)})"
+        return f"{key}.{field}" if field else key
+
+    def lookback(self, name):
+        """How many of the latest candles each output of indicator `name` depends on.
+
+        Keyed by output field (None for a single-output indicator), counting the candles
+        its source depends on in turn; None when it depends on the whole history.
+        """
+        definition = self.definitions[name]
+        rule = WINDOW_LOOKBACK.get(definition["type"])
+        if rule is None:
+            return None
+        parameters = resolve_parameters(name, definition, self.granularity_seconds)
+        rows = rule(parameters)
+        if not isinstance(rows, dict):
+            rows = dict.fromkeys(indicator_outputs(definition["type"]) or [None], rows)
+        source = parameters.get("source")
+        if source is not None and source not in PRICE_FIELDS:
+            indicator, _, field = source.partition(".")
+            source_rows = self.lookback(indicator)
+            if source_rows is None or (field or None) not in source_rows:
+                return None
+            rows = {output: count + source_rows[field or None] - 1 for output, count in rows.items()}
+        return rows
+
     def _compute(self, name):
         if name in self._computing:
             raise IndicatorError("Indicator sources form a loop: " + " -> ".join(self._computing + [name]))
@@ -475,7 +597,14 @@ class IndicatorContext:
         try:
             definition = self.definitions[name]
             function, _, outputs, _, _ = INDICATORS[definition["type"]]
-            result = function(self, resolve_parameters(name, definition, self.granularity_seconds))
+            parameters = resolve_parameters(name, definition, self.granularity_seconds)
+
+            def compute(first=0):
+                context = self if not first else IndicatorContext(
+                    self.metrics.tail(first), self.definitions, self.granularity_seconds)
+                return function(context, parameters)
+
+            result = self.metrics.get(self.metric_key(name), compute, self.lookback(name))
             if outputs:
                 for field in outputs:
                     self.values[f"{name}.{field}"] = result[field]

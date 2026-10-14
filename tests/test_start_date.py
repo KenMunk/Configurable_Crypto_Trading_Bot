@@ -3,7 +3,7 @@ from datetime import datetime, timezone
 import pytest
 
 from backtest import run_backtest
-from simulator import format_test_start, parse_start_date
+from simulator import format_buy_and_hold, format_test_start, parse_start_date
 from tests.test_backtest import _candle, _profile
 
 STEP = 900
@@ -38,6 +38,40 @@ def test_waiting_for_a_fresh_signal_skips_the_trend_already_underway():
     assert result["waited_for_fresh_signal"] is True
     assert result["first_entry"] > 14 * STEP  # after the dip ended the first trend
     assert all(trade["entry_time"] > 14 * STEP for trade in result["trades"])
+
+
+def test_buy_and_hold_starts_at_the_models_first_buy():
+    start = 9 * STEP
+    result = run_backtest(_candles(), _profile(), start_time=start, wait_for_fresh_signal=True)
+
+    first_buy = result["first_entry"]
+    assert first_buy > start  # it waited out the first trend
+    assert result["buy_and_hold_start"] == first_buy
+    assert result["buy_and_hold_return"] == pytest.approx(110 / PRICES[first_buy // STEP] - 1)
+    assert result["buy_and_hold_from_test_start"] == pytest.approx(110 / PRICES[9] - 1)
+
+
+def test_buy_and_hold_starts_at_the_test_start_when_the_model_never_buys():
+    profile = _profile()
+    profile["strategy"]["entry_signal"] = {"all": ["close < 0"]}
+
+    result = run_backtest(_candles(), profile, start_time=9 * STEP)
+
+    assert result["first_entry"] is None
+    assert result["buy_and_hold_start"] == 9 * STEP
+    assert result["buy_and_hold_return"] == pytest.approx(110 / PRICES[9] - 1)
+
+
+def test_report_says_where_buy_and_hold_starts():
+    bought = run_backtest(_candles(), _profile(), start_time=9 * STEP, wait_for_fresh_signal=True)
+    lines = format_buy_and_hold(bought)
+    assert lines[0].startswith("Buy and hold return: +") and "at the model's first buy, 1970-01-01" in lines[0]
+    assert lines[1].startswith("Buy and hold from the test start: +")
+
+    profile = _profile()
+    profile["strategy"]["entry_signal"] = {"all": ["close < 0"]}
+    never = format_buy_and_hold(run_backtest(_candles(), profile, start_time=9 * STEP))
+    assert never == [f"Buy and hold return: {110 / PRICES[9] - 1:+.2%} (from the test start, because the model never bought)"]
 
 
 def test_start_before_the_data_uses_the_earliest_candle_and_after_it_is_an_error():

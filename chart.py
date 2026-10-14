@@ -57,6 +57,20 @@ def _quote_currency(result):
     return str(result.get("product_id") or "").partition("-")[2] or "quote currency"
 
 
+def _day(timestamp):
+    return f"{datetime.fromtimestamp(int(timestamp), timezone.utc):%Y-%m-%d}"
+
+
+def buy_and_hold_values(result):
+    """The value of buying at the model's first buy and holding: the starting capital until then."""
+    closes = np.asarray(result["series"]["close"], dtype=float)
+    times = np.asarray(result["series"]["time"])
+    start = int(np.searchsorted(times, result.get("buy_and_hold_start", times[0])))
+    values = result["starting_capital"] * closes / closes[start]
+    values[:start] = result["starting_capital"]
+    return values
+
+
 class PriceLogLocator(Locator):
     """Ticks for a log price axis that stay readable at every zoom level.
 
@@ -96,6 +110,9 @@ class _HoverChart:
         self.x_values = None
         self.hover_values = None
         self._hover_artists = []
+        self.floor = None
+        self.floor_fits = True
+        self._shown = None  # the arguments of the last show(), so a new floor can redraw it
         canvas.mpl_connect("draw_event", self._on_draw)
         canvas.mpl_connect("motion_notify_event", self._on_move)
         canvas.mpl_connect("figure_leave_event", lambda event: self._hide_hover())
@@ -118,6 +135,18 @@ class _HoverChart:
     def _panel_count(self, result):
         """How many stacked panels sit under the main chart; none by default."""
         return 0
+
+    def set_floor(self, floor):
+        """Start the main chart's value axis at `floor`, or fit it to the data when None.
+
+        The floor outlasts redraws for other models and runs. Setting it redraws the full
+        view, which becomes the toolbar's Home. Returns False when the floor is at or above
+        every value on the chart; the chart then shows all its values instead.
+        """
+        self.floor = floor
+        if self._shown is not None:
+            self.show(*self._shown)
+        return self.floor_fits
 
     def _begin(self, result):
         self.result = result
@@ -164,6 +193,13 @@ class _HoverChart:
         for text in legend.get_texts():
             text.set_color(SECONDARY_INK)
 
+        self.floor_fits = True
+        if self.floor is not None:
+            top = ax.get_ylim()[1]
+            self.floor_fits = bool(self.floor < top)
+            if self.floor_fits:
+                ax.set_ylim(self.floor, top)
+
         self.hover_values = hover_values
         # One crosshair line per panel, so the hovered moment lines up across all of them.
         self.crosshairs = [panel.axvline(self.x_values[0], color=BASELINE, linewidth=1,
@@ -181,6 +217,9 @@ class _HoverChart:
         self._hover_artists = [*self.crosshairs, self.hover_dot, self.tooltip]
         for artist in self._hover_artists:
             artist.set_in_layout(False)  # a visible tooltip must never resize the panels
+        toolbar = getattr(self.canvas, "toolbar", None)
+        if toolbar is not None:
+            toolbar.update()  # Home must return to this chart's view, not the previous chart's
         self.canvas.draw_idle()
 
     def tooltip_text(self, index):
@@ -241,6 +280,7 @@ class BacktestChart(_HoverChart):
         return len([meta for meta in result["indicators"] if meta["panel_outputs"]])
 
     def show(self, result):
+        self._shown = (result,)
         times = self._begin(result)
         self._focus_artists = []  # cleared along with the axes
         series = result["series"]
@@ -350,6 +390,10 @@ class BacktestChart(_HoverChart):
         ])
         low, high = np.nanmin(prices), np.nanmax(prices)
         padding = (high / low) ** 0.08
+        bottom = low / padding
+        # The floor still cuts off lines below it, but never the trade's own fills.
+        if self.floor is not None and self.floor < min(trade["entry_price"], trade["exit_price"]):
+            bottom = max(bottom, self.floor)
 
         # Mark which trade this is: a wash over the holding period and full-size markers.
         for artist in self._focus_artists:
@@ -364,7 +408,7 @@ class BacktestChart(_HoverChart):
         ]
         self.ax.set_xlim(mdates.date2num(np.datetime64(int(start), "s")),
                          mdates.date2num(np.datetime64(int(end), "s")))
-        self.ax.set_ylim(low / padding, high * padding)
+        self.ax.set_ylim(bottom, high * padding)
         # Fit each unbounded oscillator panel to its values in the zoomed window.
         for panel_ax, meta in zip(self.axes[1:], self.panels):
             if meta["bounds"]:
@@ -389,6 +433,7 @@ class ModelValueChart(_HoverChart):
         With several results, `primary` picks the one the hover dot follows and that is
         drawn slightly heavier; colors stay tied to each model's position in the list.
         """
+        self._shown = (result, primary)
         runs = result if isinstance(result, list) else [result]
         single = len(runs) == 1
         primary = min(primary, len(runs) - 1)
@@ -399,17 +444,20 @@ class ModelValueChart(_HoverChart):
         self.run_x = [mdates.date2num(run_times) for run_times in self.run_times]
         self.run_values = [np.asarray(run["series"]["equity"]) for run in runs]
 
-        # One buy-and-hold line per product and starting value, measured over that run's candles.
+        # One buy-and-hold line per product and starting value, bought at a model's first buy:
+        # the chosen model's where it trades that product, otherwise the first such model's.
         self.benchmarks = {}
-        for position, run in enumerate(runs):
+        for position in [primary] + [p for p in range(len(runs)) if p != primary]:
+            run = runs[position]
             key = (run["product_id"], run["starting_capital"])
             if key not in self.benchmarks:
-                closes = np.asarray(run["series"]["close"])
-                self.benchmarks[key] = (position, run["starting_capital"] * closes / closes[0])
+                self.benchmarks[key] = (position, buy_and_hold_values(run))
         for capital in sorted({run["starting_capital"] for run in runs}):
             ax.axhline(capital, color=MUTED_INK, linewidth=1, zorder=1, label=f"Starting capital ({capital:,.0f})")
         for (product, capital), (position, values) in self.benchmarks.items():
-            label = "Buy and hold" if len(self.benchmarks) == 1 else f"Buy and hold {product} ({capital:,.0f})"
+            label = ("Buy and hold" if len(self.benchmarks) == 1 else f"Buy and hold {product} ({capital:,.0f})")
+            if not single:
+                label += f" from {runs[position].get('model_name', f'model {position + 1}')}'s first buy"
             ax.plot(self.run_times[position], values, color=BENCHMARK_COLOR, linewidth=1, zorder=2, label=label)
 
         for position, run in enumerate(runs):
@@ -440,8 +488,9 @@ class ModelValueChart(_HoverChart):
             ax.annotate(f"End {self.model_values[-1]:,.0f}", xy=(times[-1], self.model_values[-1]), xytext=(6, 0),
                         textcoords="offset points", ha="left", va="center", fontsize=9, color=PRIMARY_INK, zorder=5)
             title = f"{primary_run['product_id']} model value over time"
+            bought = primary_run.get("buy_and_hold_start", primary_run["series"]["time"][0])
             subtitle = (f"Started at {start_value:,.2f}; model {primary_run['total_return']:+.2%}, "
-                        f"buy and hold {primary_run['buy_and_hold_return']:+.2%}")
+                        f"buy and hold {primary_run['buy_and_hold_return']:+.2%} from the first buy ({_day(bought)})")
         else:
             products = ", ".join(sorted({run["product_id"] for run in runs}))
             best = max(runs, key=lambda run: run["total_return"])

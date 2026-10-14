@@ -126,6 +126,8 @@ Approximate warm-up lengths:
 | VOLATILITY | `period + 1` |
 | OBV, anchored VWAP | none |
 
+Profiles in the same simulator run share their indicators. Two profiles that define an indicator with the same type and settings compute it once, even if they give it different names. Slow indicators are also stored between runs; see [Stored metrics](simulator.md#stored-metrics).
+
 ---
 
 ## 3. Price fields

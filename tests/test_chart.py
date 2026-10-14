@@ -6,6 +6,7 @@ matplotlib.use("Agg")
 
 import matplotlib.dates as mdates
 import numpy as np
+import pytest
 from matplotlib.backends.backend_agg import FigureCanvasAgg
 from matplotlib.figure import Figure
 
@@ -66,6 +67,54 @@ def test_focus_trade_zooms_price_chart_to_the_trade():
     assert low < min(trade["entry_price"], trade["exit_price"]) < high
 
 
+def test_floor_sets_the_lowest_value_shown_and_outlasts_a_redraw():
+    chart, result = _chart_with_result()
+    automatic_bottom = chart.ax.get_ylim()[0]
+    assert automatic_bottom < 85  # the lowest close
+
+    assert chart.set_floor(90) is True
+    assert chart.ax.get_ylim()[0] == 90
+    assert chart.ax.get_ylim()[1] > 105  # the top still fits the highest close
+
+    chart.show(result)  # e.g. another model chosen in Showing model
+    assert chart.ax.get_ylim()[0] == 90
+
+    chart.set_floor(None)
+    assert chart.ax.get_ylim()[0] == automatic_bottom
+
+
+def test_floor_above_every_value_is_reported_and_ignored():
+    chart, _ = _chart_with_result()
+    automatic = chart.ax.get_ylim()
+
+    assert chart.set_floor(10_000) is False
+    assert chart.ax.get_ylim() == automatic
+
+
+def test_floor_applies_to_a_trade_zoom_without_hiding_the_trade():
+    chart, result = _chart_with_result()
+    trade = result["trades"][0]
+    lowest_fill = min(trade["entry_price"], trade["exit_price"])
+
+    chart.set_floor(lowest_fill * 0.999)
+    chart.focus_trade(trade)
+    assert lowest_fill * 0.999 <= chart.ax.get_ylim()[0] < lowest_fill
+
+    chart.set_floor(lowest_fill * 1.01)  # above the exit: the zoom must still show it
+    chart.focus_trade(trade)
+    assert chart.ax.get_ylim()[0] < lowest_fill
+
+
+def test_model_value_chart_floor():
+    _, result = _chart_with_result()
+    figure = Figure(figsize=(8, 4), dpi=100)
+    chart = ModelValueChart(figure, FigureCanvasAgg(figure))
+    chart.set_floor(5_000)  # set before anything is shown
+    chart.show(result)
+
+    assert chart.ax.get_ylim()[0] == 5_000
+
+
 def test_model_value_chart_plots_value_against_buy_and_hold():
     _, result = _chart_with_result()
     figure = Figure(figsize=(8, 4), dpi=100)
@@ -82,6 +131,22 @@ def test_model_value_chart_plots_value_against_buy_and_hold():
     x_pixel, y_pixel = chart.ax.transData.transform((chart.x_values[3], chart.model_values[3]))
     chart._on_move(SimpleNamespace(inaxes=chart.ax, xdata=chart.x_values[3], x=x_pixel, y=y_pixel))
     assert "Model value  10,000.00 (+0.00%)" in chart.tooltip.get_text()
+
+
+def test_buy_and_hold_line_waits_for_the_models_first_buy():
+    _, result = _chart_with_result()
+    figure = Figure(figsize=(8, 4), dpi=100)
+    chart = ModelValueChart(figure, FigureCanvasAgg(figure))
+    chart.show(result)
+
+    times = result["series"]["time"]
+    bought = times.index(result["first_entry"])
+    assert bought > 0  # the indicators need a few candles first
+    closes = result["series"]["close"]
+    assert list(chart.benchmark_values[:bought + 1]) == [10_000] * (bought + 1)
+    assert chart.benchmark_values[-1] == pytest.approx(10_000 * closes[-1] / closes[bought])
+    assert chart.benchmark_values[-1] == pytest.approx(10_000 * (1 + result["buy_and_hold_return"]))
+    assert "from the first buy (1970-01-01)" in chart.ax.get_title(loc="right")
 
 
 def test_model_value_chart_labels_the_starting_and_ending_value():
@@ -116,7 +181,7 @@ def test_model_value_chart_compares_several_models():
     canvas.draw()
 
     labels = [line.get_label() for line in chart.ax.get_lines() if not line.get_label().startswith("_")]
-    assert labels[:2] == ["Starting capital (10,000)", "Buy and hold"]
+    assert labels[:2] == ["Starting capital (10,000)", "Buy and hold from steady's first buy"]
     assert labels[2].startswith("quick: ") and labels[3].startswith("steady: ")
     assert chart.model_values is chart.run_values[1]  # the hover follows the primary model
     assert "2 models" in chart.ax.get_title(loc="left")

@@ -7,19 +7,17 @@ Docs: https://docs.cdp.coinbase.com/api-reference/advanced-trade-api/rest-api/pr
 
 import bisect
 import collections
-import csv
-import json
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+from candle_store import CandleStore, MarketCandles, MarketMetrics
 from friction import FrictionModel
 from indicators import parse_period
 from model_config import CompiledModel
 
 LOOKBACK_YEARS = 10
 DEFAULT_CACHE_DIR = Path(__file__).parent / "data"
-CANDLE_FIELDS = ["start", "open", "high", "low", "close", "volume"]
 MAX_CANDLES_PER_REQUEST = 350  # API limit
 DEFAULT_STARTING_CAPITAL = 10_000.0
 DEFAULT_DRAWDOWN_WINDOW = "180d"  # reported as the worst drawdown within any 6 months
@@ -119,44 +117,32 @@ def fetch_candles(client, product_id, granularity, start, end, progress=None, pa
     return [candles[t] for t in sorted(candles)]
 
 
-def _cache_paths(cache_dir, product_id, granularity):
-    stem = Path(cache_dir) / f"{product_id}_{granularity}"
-    return stem.with_suffix(".csv"), stem.with_suffix(".meta.json")
+def _market_candles(store, product_id, granularity, candles):
+    return MarketCandles(candles, MarketMetrics(store, store.table_name(product_id, granularity)))
 
 
 def load_cached_candles(cache_dir, product_id, granularity):
-    """Return (candles, fetched_start, fetched_end) from the cache, or None if absent."""
-    csv_path, meta_path = _cache_paths(cache_dir, product_id, granularity)
-    if not csv_path.exists() or not meta_path.exists():
+    """Return (candles, fetched_start, fetched_end) from the cache, or None if absent.
+
+    The candles carry their market's metric cache, as load_candles describes.
+    """
+    store = CandleStore(cache_dir)
+    cached = store.load(product_id, granularity)
+    if cached is None:
         return None
-    meta = json.loads(meta_path.read_text(encoding="utf-8"))
-    with csv_path.open(newline="", encoding="utf-8") as handle:
-        candles = [
-            {"start": int(row["start"]), **{field: float(row[field]) for field in CANDLE_FIELDS[1:]}}
-            for row in csv.DictReader(handle)
-        ]
-    return candles, int(meta["fetched_start"]), int(meta["fetched_end"])
-
-
-def save_cached_candles(cache_dir, product_id, granularity, candles, fetched_start, fetched_end):
-    csv_path, meta_path = _cache_paths(cache_dir, product_id, granularity)
-    csv_path.parent.mkdir(parents=True, exist_ok=True)
-    with csv_path.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=CANDLE_FIELDS)
-        writer.writeheader()
-        writer.writerows(candles)
-    # The fetched range is kept separately because periods with no trades have no
-    # candles; without it a product younger than the lookback would refetch every run.
-    meta_path.write_text(
-        json.dumps({"fetched_start": fetched_start, "fetched_end": fetched_end}, indent=2),
-        encoding="utf-8",
-    )
+    candles, fetched_start, fetched_end = cached
+    return _market_candles(store, product_id, granularity, candles), fetched_start, fetched_end
 
 
 def load_candles(client, product_id, granularity, start, end, cache_dir=DEFAULT_CACHE_DIR, progress=None):
-    """Return candles for [start, end), fetching only the range the cache doesn't cover."""
+    """Return candles for [start, end), fetching only the range the cache doesn't cover.
+
+    The returned list carries `metrics`, which lets every model backtested on these candles
+    share its indicator values and keep slow ones in the market's table (see candle_store.py).
+    """
     granularity, _ = resolve_granularity(granularity)
-    cached = load_cached_candles(cache_dir, product_id, granularity)
+    store = CandleStore(cache_dir)
+    cached = store.load(product_id, granularity)
     if cached is None:
         candles, fetched_start, fetched_end = [], start, start
         missing = [(start, end)]
@@ -169,6 +155,7 @@ def load_candles(client, product_id, granularity, start, end, cache_dir=DEFAULT_
         total = sum(e - s for s, e in missing)
         done = 0
         merged = {candle["start"]: candle for candle in candles}
+        fetched = []
         for missing_start, missing_end in missing:
             span = missing_end - missing_start
 
@@ -179,10 +166,11 @@ def load_candles(client, product_id, granularity, start, end, cache_dir=DEFAULT_
             for candle in fetch_candles(client, product_id, granularity, missing_start, missing_end, report):
                 new_count += candle["start"] not in merged
                 merged[candle["start"]] = candle
+                fetched.append(candle)
             done += span
         candles = [merged[t] for t in sorted(merged)]
         fetched_start, fetched_end = min(fetched_start, start), max(fetched_end, end)
-        save_cached_candles(cache_dir, product_id, granularity, candles, fetched_start, fetched_end)
+        store.save(product_id, granularity, fetched, fetched_start, fetched_end)
 
     # Counts describe the window being simulated, not everything in the cache.
     candles = [candle for candle in candles if start <= candle["start"] < end]
@@ -195,7 +183,7 @@ def load_candles(client, product_id, granularity, start, end, cache_dir=DEFAULT_
         else:
             message = f"{len(candles):,} candles ({from_cache:,} from cache, {new_count:,} new)"
         progress(1.0, message)
-    return candles
+    return _market_candles(store, product_id, granularity, candles)
 
 
 def _format_day(timestamp):
@@ -315,9 +303,13 @@ def run_backtest(candles, profile, starting_capital=None, progress=None, frictio
     With `start_time` (a unix timestamp), the test begins at the first candle at or after
     it: the model holds its starting capital in cash and looks for an entry from there.
     Indicators still warm up on the history before it, so they are fully formed on the
-    first day, while returns, buy and hold, drawdown, taxes and the charted series all
-    start at `start_time`. With `wait_for_fresh_signal`, an entry signal already true at
-    the start is not taken; the model waits for it to switch off and fire again.
+    first day, while returns, drawdown, taxes and the charted series all start at
+    `start_time`. With `wait_for_fresh_signal`, an entry signal already true at the start
+    is not taken; the model waits for it to switch off and fire again.
+
+    Buy and hold is measured from the close of the candle where the model first buys on
+    its entry signal, so both start investing at the same moment; a model that never
+    buys is compared with buying at the start.
 
     Entry and exit rules (see model_config.py) are evaluated on each candle's close and
     filled at that close. Hard stops and profit locks trigger intrabar on the candle's low/high and
@@ -352,7 +344,14 @@ def run_backtest(candles, profile, starting_capital=None, progress=None, frictio
 
     # Indicators and signals are computed on the full history, so the earlier candles
     # serve as warm-up; the test itself covers only the candles from the start time on.
-    indicator_series, entry_signals, exit_signals = model.evaluate(market_candles)
+    # Candles from load_candles carry a metric cache that every model on them shares.
+    metrics = getattr(candles, "metrics", None)
+    if metrics is not None:
+        filtered = any(episode["brief"] for episode in crash_episodes)
+        variant = f"flash_crash_filter={flash_levels[0][0]}" if filtered else None
+        indicator_series, entry_signals, exit_signals = model.evaluate(metrics.cache(market_candles, variant))
+    else:
+        indicator_series, entry_signals, exit_signals = model.evaluate(market_candles)
     first = 0
     if start_time is not None:
         first = bisect.bisect_left([candle["start"] for candle in candles], start_time)
@@ -639,21 +638,27 @@ def run_backtest(candles, profile, starting_capital=None, progress=None, frictio
     # The final, unfinished year's tax isn't due yet; estimate it for the report.
     open_year_taxable = realized_by_year.get(tax_year, 0.0) - loss_carryforward
     estimated_tax_due = max(open_year_taxable, 0.0) * friction.tax_rate
+    # The strategy's first signal entry; flash-crash fills are opportunistic and reported separately.
+    first_entry = next((trade["entry_time"] for trade in trades if trade["entry_reason"] == "ENTRY_SIGNAL"),
+                       entry["time"] if entry else None)
+    benchmark_index = 0
+    if first_entry is not None:
+        benchmark_index = bisect.bisect_left([candle["start"] for candle in market_candles], first_entry)
     return {
         "product_id": profile.get("product_id"),
         "requested_start": start_time,
         "waited_for_fresh_signal": wait_for_fresh_signal,
         "warmup_candles": first,
-        # The strategy's first signal entry; flash-crash fills are opportunistic and reported separately.
-        "first_entry": next((trade["entry_time"] for trade in trades if trade["entry_reason"] == "ENTRY_SIGNAL"),
-                            entry["time"] if entry else None),
+        "first_entry": first_entry,
         "period_start": candles[0]["start"],
         "period_end": last["start"],
         "candle_count": total,
         "starting_capital": float(starting_capital),
         "ending_equity": ending_equity,
         "total_return": ending_equity / starting_capital - 1,
-        "buy_and_hold_return": last["close"] / candles[0]["close"] - 1,
+        "buy_and_hold_start": market_candles[benchmark_index]["start"],
+        "buy_and_hold_return": last["close"] / market_candles[benchmark_index]["close"] - 1,
+        "buy_and_hold_from_test_start": last["close"] / market_candles[0]["close"] - 1,
         "max_drawdown": max_drawdown,
         "max_window_drawdown": max_window_drawdown,
         "drawdown_window": window_setting,

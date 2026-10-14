@@ -181,7 +181,10 @@ class CompiledModel:
         return compiled
 
     def evaluate(self, candles):
-        """Return (series by name, entry signal array, exit signal array) for the candles."""
+        """Return (series by name, entry signal array, exit signal array) for the candles.
+
+        `candles` may be a MetricCache shared with other models on the same candles.
+        """
         context = IndicatorContext(candles, self.definitions, self.granularity_seconds)
         series = {name: context.series(name) for name in self.series_names}
         entry = evaluate_rules(self.entry_rules, series, len(candles))

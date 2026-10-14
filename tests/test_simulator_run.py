@@ -129,6 +129,8 @@ def test_comparison_rows_format_headline_results():
 
     row = comparison_rows([result])[0]
 
+    assert row["display"]["first_buy"] == "never"  # this result has no first_entry
+    assert row["sort"]["first_buy"] == float("inf")
     assert row["display"]["end"] == "921,352.40"
     assert row["display"]["return"] == "+9113.50%"
     assert row["display"]["max_drawdown"] == "60.0%"

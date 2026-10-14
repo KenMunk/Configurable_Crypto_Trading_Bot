@@ -1,4 +1,5 @@
 import json
+import math
 import queue
 import threading
 from datetime import datetime, timezone
@@ -137,6 +138,18 @@ def format_friction(result):
     return lines
 
 
+def format_buy_and_hold(result):
+    """Report lines for the buy-and-hold benchmark, which buys when the model first buys."""
+    if result.get("first_entry") is None:
+        return [f"Buy and hold return: {result['buy_and_hold_return']:+.2%} "
+                f"(from the test start, because the model never bought)"]
+    return [
+        f"Buy and hold return: {result['buy_and_hold_return']:+.2%} (buying at the model's first buy, "
+        f"{_format_time(result.get('buy_and_hold_start', result['first_entry']))})",
+        f"Buy and hold from the test start: {result.get('buy_and_hold_from_test_start', float('nan')):+.2%}",
+    ]
+
+
 def format_backtest_result(result, recent_trades=10):
     """Render a backtest result as text for the metrics panel."""
     lines = [
@@ -148,7 +161,7 @@ def format_backtest_result(result, recent_trades=10):
         f"Starting capital: {result['starting_capital']:,.2f}",
         f"Ending equity: {result['ending_equity']:,.2f}",
         f"Total return: {result['total_return']:+.2%}",
-        f"Buy and hold return: {result['buy_and_hold_return']:+.2%}",
+        *format_buy_and_hold(result),
         f"Max drawdown: {result['max_drawdown']:.2%} (tax payments count as withdrawals, not losses)",
         f"Worst drawdown within any {result['drawdown_window']}: {result['max_window_drawdown']:.2%}",
         f"Trades: {result['trade_count']:,} (win rate {result['win_rate']:.1%})",
@@ -295,6 +308,7 @@ COMPARISON_COLUMNS = [
     ("start", "Start", 90, "e"),
     ("end", "End", 110, "e"),
     ("return", "Return", 90, "e"),
+    ("first_buy", "First buy", 120, "w"),
     ("buy_and_hold", "Buy & hold", 90, "e"),
     ("max_drawdown", "Max drawdown", 110, "e"),
     ("window_drawdown", "Worst in window", 125, "e"),
@@ -326,6 +340,23 @@ def parse_start_date(text, now=None):
     if moment > (now or datetime.now(timezone.utc)):
         raise ValueError(f"Start date {text} is in the future")
     return int(moment.timestamp())
+
+
+def parse_floor(text):
+    """The chart floor as a positive number, or None when blank.
+
+    Accepts thousands separators and a leading dollar sign, such as "1,000" or "$500".
+    """
+    cleaned = (text or "").strip().lstrip("$").replace(",", "").strip()
+    if not cleaned:
+        return None
+    try:
+        value = float(cleaned)
+    except ValueError:
+        raise ValueError(f"Floor {text.strip()!r} must be a number, such as 1000") from None
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError("Floor must be a number above zero, because the charts use a log scale")
+    return value
 
 
 def format_test_start(result):
@@ -370,6 +401,7 @@ def comparison_rows(results):
             "start": result["starting_capital"],
             "end": result["ending_equity"],
             "return": result["total_return"],
+            "first_buy": result.get("first_entry"),
             "buy_and_hold": result["buy_and_hold_return"],
             "max_drawdown": result["max_drawdown"],
             "window_drawdown": result["max_window_drawdown"],
@@ -381,6 +413,9 @@ def comparison_rows(results):
             "blocked": result["screened_signals"],
         }
         display = dict(values)
+        display["first_buy"] = _short_time(values["first_buy"]) if values["first_buy"] is not None else "never"
+        if values["first_buy"] is None:
+            values["first_buy"] = float("inf")  # models that never bought sort last
         for key in ("start", "end", "fees", "taxes"):
             display[key] = f"{values[key]:,.2f}"
         for key in ("return", "buy_and_hold"):
@@ -422,16 +457,23 @@ class SimulationWindow:
         # The worker thread reports through this queue; only the Tk thread touches widgets.
         self.progress_queue = queue.Queue()
         self.simulation_thread = None
+        self.full_screen = False
+        self.floor_notes = []  # (chart, note variable) for each chart tab's floor control
 
         self._build_ui()
+        self.root.bind("<F11>", lambda _event: self._set_full_screen(not self.full_screen))
+        self.root.bind("<Escape>", lambda _event: self._set_full_screen(False))
 
     def _build_ui(self):
         main = ttk.Frame(self.root, padding=12)
         main.pack(fill="both", expand=True)
 
-        ttk.Label(main, text="Models (select one or more; Ctrl/Shift-click for several)",
+        # Everything above the results; full screen hides it so the charts get the room.
+        self.controls = ttk.Frame(main)
+        self.controls.pack(fill="x")
+        ttk.Label(self.controls, text="Models (select one or more; Ctrl/Shift-click for several)",
                   font=("Segoe UI", 10, "bold")).pack(anchor="w")
-        models_row = ttk.Frame(main)
+        models_row = ttk.Frame(self.controls)
         models_row.pack(fill="x", pady=(6, 12))
         self.model_list = tk.Listbox(models_row, selectmode="extended", height=6, exportselection=False,
                                      activestyle="none")
@@ -447,7 +489,7 @@ class SimulationWindow:
         ttk.Button(model_buttons, text="Refresh", command=self._refresh_models).pack(fill="x", pady=(4, 0))
         self._refresh_models()
 
-        start_row = ttk.Frame(main)
+        start_row = ttk.Frame(self.controls)
         start_row.pack(fill="x", pady=(0, 10))
         ttk.Label(start_row, text="Start testing from (UTC, optional):").pack(side="left")
         self.start_date_var = tk.StringVar(value="")
@@ -458,7 +500,7 @@ class SimulationWindow:
         ttk.Label(start_row, text="e.g. 2020-01-01. Blank tests all 10 years. The earlier history still warms up "
                                   "the indicators.", foreground="#555555").pack(side="left", padx=(12, 0))
 
-        action_row = ttk.Frame(main)
+        action_row = ttk.Frame(self.controls)
         action_row.pack(fill="x", pady=(0, 12))
         ttk.Button(action_row, text="Load Profile", command=self._load_profile).pack(side="left")
         self.run_button = ttk.Button(action_row, text="Run Simulation", command=self._run_simulation)
@@ -467,8 +509,8 @@ class SimulationWindow:
             side="left", padx=(8, 0)
         )
 
-        ttk.Label(main, text="Progress", font=("Segoe UI", 10, "bold")).pack(anchor="w")
-        progress_frame = ttk.Frame(main)
+        ttk.Label(self.controls, text="Progress", font=("Segoe UI", 10, "bold")).pack(anchor="w")
+        progress_frame = ttk.Frame(self.controls)
         progress_frame.pack(fill="x", pady=(6, 12))
         progress_frame.columnconfigure(1, weight=1)
         self.progress_bars = {}
@@ -499,8 +541,11 @@ class SimulationWindow:
         )
         ttk.Label(main, text="Status", font=("Segoe UI", 10, "bold")).pack(side="bottom", anchor="w")
 
-        picker_row = ttk.Frame(main)
+        picker_row = self.picker_row = ttk.Frame(main)
         picker_row.pack(fill="x", pady=(0, 6))
+        self.full_screen_button = ttk.Button(picker_row, text="Full screen (F11)",
+                                             command=lambda: self._set_full_screen(not self.full_screen))
+        self.full_screen_button.pack(side="right")
         ttk.Label(picker_row, text="Showing model:").pack(side="left")
         self.selected_model_var = tk.StringVar(value="")
         self.model_picker = ttk.Combobox(picker_row, textvariable=self.selected_model_var, state="readonly", width=40)
@@ -513,8 +558,8 @@ class SimulationWindow:
         self.results_tabs.pack(fill="both", expand=True, pady=(0, 10))
 
         self.comparison_tab = self._add_comparison_tab()
-        self.chart_tab, self.chart = self._add_chart_tab("Chart", BacktestChart)
-        self.value_tab, self.value_chart = self._add_chart_tab("Model value", ModelValueChart)
+        self.chart_tab, self.chart = self._add_chart_tab("Chart", BacktestChart, "Lowest price shown:")
+        self.value_tab, self.value_chart = self._add_chart_tab("Model value", ModelValueChart, "Lowest value shown:")
         self.trades_tab = self._add_trades_tab()
 
         self.metrics_tab = ttk.Frame(self.results_tabs)
@@ -522,15 +567,65 @@ class SimulationWindow:
         self.metrics_text = tk.Text(self.metrics_tab, wrap="word", bg="#f5f5f5")
         self.metrics_text.pack(fill="both", expand=True)
 
-    def _add_chart_tab(self, title, chart_class):
+    def _add_chart_tab(self, title, chart_class, floor_label):
         tab = ttk.Frame(self.results_tabs)
         self.results_tabs.add(tab, text=title)
         figure = Figure(figsize=(9, 5), dpi=100)
         canvas = FigureCanvasTkAgg(figure, master=tab)
         toolbar = NavigationToolbar2Tk(canvas, tab, pack_toolbar=False)
+        chart = chart_class(figure, canvas)
+
+        floor_row = ttk.Frame(tab)
+        floor_row.pack(side="top", fill="x", pady=(6, 4))
+        ttk.Label(floor_row, text=floor_label).pack(side="left")
+        floor_var = tk.StringVar(value="")
+        note_var = tk.StringVar()
+        entry = ttk.Entry(floor_row, textvariable=floor_var, width=14)
+        entry.pack(side="left", padx=(6, 0))
+        apply = lambda *_: self._apply_floor(chart, floor_var, note_var)
+        entry.bind("<Return>", apply)
+        ttk.Button(floor_row, text="Apply", command=apply).pack(side="left", padx=(6, 0))
+        ttk.Button(floor_row, text="Clear", command=lambda: (floor_var.set(""), apply())).pack(
+            side="left", padx=(4, 0))
+        ttk.Label(floor_row, textvariable=note_var, foreground="#555555").pack(side="left", padx=(12, 0))
+        self.floor_notes.append((chart, note_var))
+        self._describe_floor(chart, note_var)
+
         toolbar.pack(side="bottom", fill="x")
         canvas.get_tk_widget().pack(fill="both", expand=True)
-        return tab, chart_class(figure, canvas)
+        return tab, chart
+
+    def _apply_floor(self, chart, floor_var, note_var):
+        try:
+            floor = parse_floor(floor_var.get())
+        except ValueError as exc:
+            note_var.set(str(exc))
+            return
+        chart.set_floor(floor)
+        self._describe_floor(chart, note_var)
+
+    @staticmethod
+    def _describe_floor(chart, note_var):
+        if chart.floor is None:
+            note_var.set("Blank fits the chart to its data. Values below the floor are cut off.")
+        elif chart.result is None:
+            note_var.set(f"Charts will start at {chart.floor:,.2f}")
+        elif chart.floor_fits:
+            note_var.set(f"Showing values from {chart.floor:,.2f} up")
+        else:
+            note_var.set(f"{chart.floor:,.2f} is above every value on this chart, so all values are shown")
+
+    def _set_full_screen(self, on):
+        """Fill the screen with the results; the controls above them return on leaving."""
+        if on == self.full_screen:
+            return
+        self.full_screen = on
+        self.root.attributes("-fullscreen", on)
+        if on:
+            self.controls.pack_forget()
+        else:
+            self.controls.pack(fill="x", before=self.picker_row)
+        self.full_screen_button.configure(text="Exit full screen (Esc)" if on else "Full screen (F11)")
 
     def _add_comparison_tab(self):
         tab = ttk.Frame(self.results_tabs, padding=(0, 6, 0, 0))
@@ -601,6 +696,8 @@ class SimulationWindow:
         self.metrics_text.insert("1.0", f"Model: {result['model_name']}\n\n" + format_backtest_result(result))
         self.chart.show(result)
         self.value_chart.show(self.results, primary=index)
+        for chart, note_var in self.floor_notes:
+            self._describe_floor(chart, note_var)
         self._show_trades(result)
 
     def _refresh_models(self):
