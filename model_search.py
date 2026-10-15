@@ -755,7 +755,8 @@ def evaluator_worker(settings, friction_inputs, train_start, holdout_start, task
     product_id, fitness = settings["market"]["product"], settings["fitness"]
     markets = {}
     for gran in settings["market"]["granularities"]:
-        loaded = load_cached_candles(DEFAULT_CACHE_DIR, product_id, gran)
+        # Read-only: refresh_market, before the workers start, is the only writer.
+        loaded = load_cached_candles(DEFAULT_CACHE_DIR, product_id, gran, read_only=True)
         if loaded is None:
             continue
         candles = list(loaded[0])

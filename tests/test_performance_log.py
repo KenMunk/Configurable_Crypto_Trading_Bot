@@ -1,10 +1,17 @@
 import csv
+import os
+import threading
+import time
 from datetime import datetime, timezone
 
 import pytest
 
+import performance_log
 from backtest import run_backtest
-from performance_log import COLUMNS, describe_update, profile_fingerprint, update_performance_log
+from performance_log import (
+    COLUMNS, describe_update, gather_shards, performance_row, profile_fingerprint, update_performance_log,
+    write_shard,
+)
 from tests.test_backtest import _candle, _profile
 
 PRICES = [100] * 6 + [101, 102, 103, 104, 105] + [100, 95, 90, 85]
@@ -99,3 +106,63 @@ def test_describe_update():
     outcome = {"added": ["a"], "updated": ["b", "c"], "unchanged": []}
     assert describe_update(outcome, "data/model_performance.csv") == "model_performance.csv: 1 added, 2 updated"
     assert describe_update({"added": [], "updated": [], "unchanged": ["a"]}) == "model_performance.csv: 1 unchanged"
+
+
+def test_shards_are_gathered_into_the_log_and_deleted(tmp_path):
+    path, shards = tmp_path / "model_performance.csv", tmp_path / "shards"
+    update_performance_log([_run("a")], path, now=FIRST)
+    write_shard([performance_row(*_run("a", PRICES[:-1] + [80]))], shards / "run1" / "1.csv")
+    write_shard([performance_row(*_run("b"))], shards / "run2" / "1.csv")
+
+    outcome = gather_shards(shards, path, now=LATER)
+
+    assert outcome == {"added": ["b"], "updated": ["a"], "unchanged": []}
+    rows = _rows(path)
+    assert rows["a"]["first_recorded_utc"] == "2026-10-14 12:00:00 UTC"
+    assert rows["a"]["last_changed_utc"] == "2026-10-15 09:30:00 UTC"
+    assert not list(shards.rglob("*.csv"))
+    assert gather_shards([shards / "run1" / "1.csv"], path) == {"added": [], "updated": [], "unchanged": []}
+
+
+def test_a_failed_gather_keeps_its_shards(tmp_path, monkeypatch):
+    path, shard = tmp_path / "model_performance.csv", tmp_path / "shards" / "1.csv"
+    write_shard([performance_row(*_run("a"))], shard)
+    monkeypatch.setattr("performance_log.os.replace", _refuse)
+
+    with pytest.raises(PermissionError):
+        gather_shards([shard], path)
+
+    assert shard.exists() and not path.exists()
+    assert not (tmp_path / "model_performance.csv.lock").exists()
+
+
+def _refuse(*args):
+    raise PermissionError("the file is open in another program")
+
+
+def test_concurrent_updates_each_keep_their_rows(tmp_path):
+    path = tmp_path / "model_performance.csv"
+    entries = [_run(name) for name in "abcdefgh"]
+    threads = [threading.Thread(target=update_performance_log, args=([entry], path)) for entry in entries]
+
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert sorted(_rows(path)) == list("abcdefgh")
+
+
+def test_a_held_lock_is_waited_for_and_a_stale_one_taken_over(tmp_path, monkeypatch):
+    path = tmp_path / "model_performance.csv"
+    lock = tmp_path / "model_performance.csv.lock"
+    lock.write_text("1234", encoding="utf-8")
+    monkeypatch.setattr(performance_log, "LOCK_TIMEOUT_SECONDS", 0.2)
+
+    with pytest.raises(TimeoutError):
+        update_performance_log([_run("a")], path)
+
+    stale = time.time() - performance_log.STALE_LOCK_SECONDS - 1
+    os.utime(lock, (stale, stale))
+    assert update_performance_log([_run("a")], path)["added"] == ["a"]
+    assert not lock.exists()

@@ -280,3 +280,85 @@ def test_flash_crash_profiles_see_the_crash_and_share_the_stored_columns(tmp_pat
 
     assert _columns(tmp_path)[6:] == ["CCI(period=20)"]
     _assert_close(with_flash["series"]["indicators"]["cci"], _column(tmp_path, "CCI(period=20)"))
+
+
+def _read_only(tmp_path):
+    return load_cached_candles(tmp_path, PRODUCT, GRANULARITY, read_only=True)[0]
+
+
+def test_a_read_only_store_never_creates_or_imports_a_database(tmp_path):
+    (tmp_path / f"{TABLE}.csv").write_text("start,open,high,low,close,volume\n0,1,1,1,1,1\n", encoding="utf-8")
+    (tmp_path / f"{TABLE}.meta.json").write_text(json.dumps({"fetched_start": 0, "fetched_end": 900}),
+                                                 encoding="utf-8")
+    store = CandleStore(tmp_path, read_only=True)
+
+    assert store.load(PRODUCT, GRANULARITY) is None
+    assert not (tmp_path / "candles.db").exists()
+    with pytest.raises(PermissionError):
+        store.save(PRODUCT, GRANULARITY, _candles(10), 0, 9000)
+    _save(tmp_path, _candles(10))
+    assert store.load("ETH-USD", GRANULARITY) is None  # the database exists, but not this market
+
+
+def test_a_read_only_store_holds_metric_columns_back_for_the_writer(tmp_path, store_every_metric):
+    candles = _candles(300)
+    _save(tmp_path, candles)
+    loaded = _read_only(tmp_path)
+
+    _assert_close(_evaluate(loaded), _fresh(candles))
+
+    assert _columns(tmp_path)[6:] == []  # nothing written
+    pending = loaded.metrics.store.take_pending_metrics()
+    assert [(table, list(columns)) for table, columns, _ in pending] == [(TABLE, ["CCI(period=20)"])]
+    assert loaded.metrics.store.take_pending_metrics() == []
+    CandleStore(tmp_path).apply_metrics(pending)
+    _assert_close(_column(tmp_path, "CCI(period=20)"), _fresh(candles))
+
+
+def test_a_read_only_reader_extends_a_stored_metric_through_the_writer(tmp_path, monkeypatch, store_every_metric):
+    candles = _candles(400)
+    _save(tmp_path, candles[:300])
+    _evaluate(_loaded(tmp_path))
+    _save(tmp_path, candles[300:])
+    expected = _fresh(candles)
+    lengths = _spy(monkeypatch, "CCI")
+
+    loaded = _read_only(tmp_path)
+    _assert_close(_evaluate(loaded), expected)
+    pending = loaded.metrics.store.take_pending_metrics()
+    assert [extend for _, _, extend in pending] == [True]
+    CandleStore(tmp_path).apply_metrics(pending)
+
+    _assert_close(_column(tmp_path, "CCI(period=20)"), expected)
+    _evaluate(_loaded(tmp_path))
+    assert lengths == [100 + CHECKED_CANDLES + 19]  # read back complete afterwards
+
+
+def test_an_extension_that_no_longer_joins_the_stored_range_is_skipped(tmp_path, store_every_metric):
+    candles = _candles(400)
+    _save(tmp_path, candles)
+    _evaluate(_loaded(tmp_path))
+    times = np.array([candle["start"] for candle in candles])
+    # A run whose window starts later replaced the column; an older reader's extension follows.
+    CandleStore(tmp_path).write_metrics(TABLE, {"CCI(period=20)": (times[100:200], np.ones(100))})
+
+    CandleStore(tmp_path).write_metrics(TABLE, {"CCI(period=20)": (times[300:], np.ones(100))}, extend=True)
+
+    assert _query(tmp_path, "SELECT computed_from, computed_through FROM metric_columns") == [
+        (int(times[100]), int(times[199]))]
+    assert np.isnan(_column(tmp_path, "CCI(period=20)")[300:]).all()
+
+
+def test_readers_see_the_last_commit_while_a_write_is_under_way(tmp_path):
+    candles = _candles(20)
+    _save(tmp_path, candles[:10])
+    writer = sqlite3.connect(tmp_path / "candles.db", isolation_level=None)
+    try:
+        writer.execute("BEGIN IMMEDIATE")
+        writer.execute(f'INSERT INTO "{TABLE}" (start, close) VALUES (999999, 1)')
+        assert writer.execute("PRAGMA journal_mode").fetchone() == ("wal",)
+
+        assert len(_read_only(tmp_path)) == 10  # not blocked, and the uncommitted candle isn't seen
+    finally:
+        writer.execute("ROLLBACK")
+        writer.close()

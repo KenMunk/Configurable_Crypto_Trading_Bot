@@ -3,7 +3,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from simulator import SimulationWindow, comparison_rows, group_by_market, model_names
+import parallel_backtest
+from simulator import SimulationWindow, comparison_rows, group_by_market, model_names, parse_workers
 from tests.test_backtest import FakeCandleClient, _profile
 
 
@@ -13,7 +14,7 @@ def _minute_profile(**changes):
     return profile
 
 
-def _worker_events(auth_result, tmp_path, monkeypatch, models=None):
+def _worker_events(auth_result, tmp_path, monkeypatch, models=None, workers=1):
     downloads = []
     monkeypatch.setattr("simulator.load_candles", _fake_load_candles(tmp_path, downloads))
     monkeypatch.setattr("simulator.fetch_friction_inputs", lambda client, profiles: {})  # no network in tests
@@ -28,7 +29,7 @@ def _worker_events(auth_result, tmp_path, monkeypatch, models=None):
 
     window.auth_engine = SimpleNamespace(authenticate_coinbase=authenticate_coinbase)
     client = FakeCandleClient()
-    window._simulation_worker(client, models or [("model_a", _minute_profile())])
+    window._simulation_worker(client, models or [("model_a", _minute_profile())], workers=workers)
 
     events = []
     while not window.progress_queue.empty():
@@ -146,3 +147,38 @@ def test_comparison_rows_format_headline_results():
     assert row["display"]["flash"] == "2"
     assert row["sort"]["end"] == 921_352.4
     assert row["result"] is result
+
+
+def test_parallel_workers_run_the_models_at_once_and_log_each(tmp_path, monkeypatch):
+    auth = {"authenticated": True, "account_count": 1, "message": "ok"}
+    end = 1_800_000_000 // 60 * 60
+    monkeypatch.setattr(parallel_backtest, "lookback_window", lambda seconds: (end - 30 * 60, end))
+    monkeypatch.setattr("simulator.run_parallel",
+                        lambda *args, **kwargs: parallel_backtest.run_parallel(*args, cache_dir=tmp_path, **kwargs))
+    broken = _minute_profile()
+    broken["strategy"]["entry_signal"] = {"all": ["no_such_indicator > 1"]}
+    models = [("a", _minute_profile()), ("b", _minute_profile()), ("broken", broken)]
+
+    events, _, client, downloads = _worker_events(auth, tmp_path, monkeypatch, models, workers=2)
+
+    assert events[-1][0] == "done"
+    assert [result["model_name"] for result in events[-1][1]] == ["a", "b"]
+    assert events[-1][2].startswith("model_performance.csv: 2 added; FAILED broken:")
+    assert downloads == []  # the parallel run's own candle writer downloads, not the serial path
+    assert len(client.requests) == 1  # one download for the market all three share
+    phases = {event[1] for event in events if event[0] == "progress"}
+    assert {"api", "data", "simulation"} <= phases
+
+
+def test_parse_workers_defaults_to_every_cpu_but_two_and_never_exceeds_it(monkeypatch):
+    monkeypatch.setattr(parallel_backtest, "cpu_count", lambda: 8)
+
+    assert parse_workers("auto") == parse_workers("") == parse_workers(" MAX ") == 6
+    assert parse_workers(" 4 ") == 4
+    assert parse_workers("64") == 6
+    for text in ("two", "0", "-1"):
+        with pytest.raises(ValueError):
+            parse_workers(text)
+    for cpus in (1, 2, 3):
+        monkeypatch.setattr(parallel_backtest, "cpu_count", lambda: cpus)
+        assert parse_workers("auto") == 1  # a small computer still gets one worker

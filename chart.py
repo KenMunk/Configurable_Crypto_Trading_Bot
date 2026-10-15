@@ -430,16 +430,18 @@ class BacktestChart(_HoverChart):
 class ModelValueChart(_HoverChart):
     """Portfolio value over time for one or more models, against buying and holding."""
 
-    def show(self, result, primary=0):
+    def show(self, result, primary=0, slots=None):
         """Plot one backtest result, or a list of them to compare models on one chart.
 
         With several results, `primary` picks the one the hover dot follows and that is
-        drawn slightly heavier; colors stay tied to each model's position in the list.
+        drawn slightly heavier. Colors are tied to each model's position in the list, or to
+        its entry in `slots`, so a model keeps its color when only some models are shown.
         """
-        self._shown = (result, primary)
+        self._shown = (result, primary, slots)
         runs = result if isinstance(result, list) else [result]
         single = len(runs) == 1
         primary = min(primary, len(runs) - 1)
+        slots = list(slots) if slots is not None else list(range(len(runs)))
         self.runs = runs
         times = self._begin(runs[primary])
         ax = self.ax
@@ -472,8 +474,8 @@ class ModelValueChart(_HoverChart):
 
         for position, run in enumerate(runs):
             values = self.run_values[position]
-            color = MODEL_COLORS[position % len(MODEL_COLORS)]
-            dashes = OVERLAY_DASHES[(position // len(MODEL_COLORS)) % len(OVERLAY_DASHES)]
+            color = MODEL_COLORS[slots[position] % len(MODEL_COLORS)]
+            dashes = OVERLAY_DASHES[(slots[position] // len(MODEL_COLORS)) % len(OVERLAY_DASHES)]
             label = ("Model value" if single else
                      f"{run.get('model_name', f'Model {position + 1}')}: {values[-1]:,.0f} ({run['total_return']:+.0%})")
             ax.plot(self.run_times[position], values, color=color, **({"linestyle": dashes} if dashes else {}),
@@ -513,7 +515,7 @@ class ModelValueChart(_HoverChart):
             subtitle=subtitle,
             ylabel=f"Value ({_quote_currency(primary_run)}, log scale)",
             hover_values=self.model_values,
-            hover_color=MODEL_COLORS[primary % len(MODEL_COLORS)],
+            hover_color=MODEL_COLORS[slots[primary] % len(MODEL_COLORS)],
             legend_columns=2,
             # Several model lines fill the top of the chart; the lower right stays clear.
             legend_location="upper left" if single else "lower right",

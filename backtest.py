@@ -121,12 +121,13 @@ def _market_candles(store, product_id, granularity, candles):
     return MarketCandles(candles, MarketMetrics(store, store.table_name(product_id, granularity)))
 
 
-def load_cached_candles(cache_dir, product_id, granularity):
+def load_cached_candles(cache_dir, product_id, granularity, read_only=False):
     """Return (candles, fetched_start, fetched_end) from the cache, or None if absent.
 
-    The candles carry their market's metric cache, as load_candles describes.
+    The candles carry their market's metric cache, as load_candles describes. With
+    `read_only`, nothing is written to the database (see CandleStore).
     """
-    store = CandleStore(cache_dir)
+    store = CandleStore(cache_dir, read_only=read_only)
     cached = store.load(product_id, granularity)
     if cached is None:
         return None

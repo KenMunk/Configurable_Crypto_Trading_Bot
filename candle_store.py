@@ -19,6 +19,11 @@ means the metric has no value there (its warm-up); outside it, the cell was not 
 Stored values match a fresh computation to within floating-point rounding. Before missing
 candles are filled in, the last stored values are recomputed and compared, and if they
 differ the whole column is recomputed instead.
+
+Concurrent runs (see parallel_backtest.py) give the database a single writer. The database
+is kept in WAL mode, so readers never block it or each other. A store opened with
+`read_only` never writes: it reads candles and stored metrics, and holds back the metric
+columns it would have stored (take_pending_metrics) for the writer to apply.
 """
 
 import bisect
@@ -41,6 +46,8 @@ STORE_SECONDS_PER_CANDLE = 1e-6
 # Stored values just before the missing ones that are recomputed and compared before a
 # stored metric is extended.
 CHECKED_CANDLES = 50
+# How long a connection waits for another one's write to finish before giving up.
+BUSY_TIMEOUT_SECONDS = 60
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS candle_tables (
@@ -77,11 +84,13 @@ def _read_csv_cache(cache_dir, table):
 
 
 class CandleStore:
-    """The candle database in `cache_dir`."""
+    """The candle database in `cache_dir`; with `read_only`, a reader that never writes to it."""
 
-    def __init__(self, cache_dir):
+    def __init__(self, cache_dir, read_only=False):
         self.cache_dir = Path(cache_dir)
         self.path = self.cache_dir / DATABASE_NAME
+        self.read_only = read_only
+        self._pending_metrics = []  # write_metrics calls a read-only store held back
 
     @staticmethod
     def table_name(product_id, granularity):
@@ -89,11 +98,20 @@ class CandleStore:
 
     @contextlib.contextmanager
     def _connect(self):
-        """A connection that commits if the block succeeds and is always closed."""
-        self.cache_dir.mkdir(parents=True, exist_ok=True)
-        connection = sqlite3.connect(self.path)
+        """A connection that commits if the block succeeds and is always closed.
+
+        A read-only store's connection refuses writes (query_only) and leaves the schema alone.
+        """
+        if not self.read_only:
+            self.cache_dir.mkdir(parents=True, exist_ok=True)
+        connection = sqlite3.connect(self.path, timeout=BUSY_TIMEOUT_SECONDS)
         try:
-            connection.executescript(SCHEMA)
+            if self.read_only:
+                connection.execute("PRAGMA query_only = ON")
+            else:
+                # WAL persists in the file: readers see the last commit while a write is under way.
+                connection.execute("PRAGMA journal_mode = WAL")
+                connection.executescript(SCHEMA)
             with connection:
                 yield connection
         finally:
@@ -103,12 +121,19 @@ class CandleStore:
         """Return (candles, fetched_start, fetched_end) for the market, or None if it has none.
 
         A CSV cache written by an earlier version is imported the first time; its files are
-        left in place but no longer read.
+        left in place but no longer read. A read-only store doesn't import it.
         """
         table = self.table_name(product_id, granularity)
+        if self.read_only and not self.path.exists():
+            return None  # connecting would create an empty database file
         with self._connect() as connection:
+            if self.read_only and not connection.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'candle_tables'").fetchone():
+                return None
             fetched = connection.execute(
                 "SELECT fetched_start, fetched_end FROM candle_tables WHERE table_name = ?", (table,)).fetchone()
+            if fetched is None and self.read_only:
+                return None
             if fetched is None:
                 imported = _read_csv_cache(self.cache_dir, table)
                 if imported is None:
@@ -128,6 +153,8 @@ class CandleStore:
         product younger than the lookback would refetch every run. A candle already in the
         table is kept as it is, with its stored metric values: a closed candle doesn't change.
         """
+        if self.read_only:
+            raise PermissionError(f"{self.path} is open read-only; candles are saved by the run's writer")
         with self._connect() as connection:
             self._insert(connection, self.table_name(product_id, granularity), candles, fetched_start, fetched_end)
 
@@ -162,8 +189,14 @@ class CandleStore:
         """Store metric values; `columns` maps each column name to (start times, values).
 
         A new column is added to the table. An existing one has its values replaced, or with
-        `extend`, these values continue its computed range.
+        `extend`, these values continue its computed range. An extension that no longer joins
+        the stored range (another run replaced the column meanwhile) is skipped.
+
+        A read-only store holds the call back instead; see take_pending_metrics.
         """
+        if self.read_only:
+            self._pending_metrics.append((table, columns, extend))
+            return
         with self._connect() as connection:
             existing = {row[1] for row in connection.execute(f"PRAGMA table_info({_quote(table)})")}
             for column, (starts, values) in columns.items():
@@ -171,9 +204,14 @@ class CandleStore:
                 if column not in existing:
                     connection.execute(f"ALTER TABLE {_quote(table)} ADD COLUMN {_quote(column)} REAL")
                 elif extend:
-                    first = connection.execute(
-                        "SELECT computed_from FROM metric_columns WHERE table_name = ? AND column_name = ?",
-                        (table, column)).fetchone()[0]
+                    stored = connection.execute(
+                        "SELECT computed_from, computed_through FROM metric_columns "
+                        "WHERE table_name = ? AND column_name = ?", (table, column)).fetchone()
+                    before = connection.execute(
+                        f"SELECT MAX(start) FROM {_quote(table)} WHERE start < ?", (first,)).fetchone()[0]
+                    if stored is None or (before is not None and stored[1] < before):
+                        continue
+                    first = stored[0]
                 else:
                     connection.execute(
                         f"UPDATE {_quote(table)} SET {_quote(column)} = NULL WHERE {_quote(column)} IS NOT NULL")
@@ -182,6 +220,19 @@ class CandleStore:
                                        zip(values.tolist(), starts.tolist()))
                 connection.execute("INSERT OR REPLACE INTO metric_columns VALUES (?, ?, ?, ?)",
                                    (table, column, first, last))
+
+    def take_pending_metrics(self):
+        """The write_metrics calls a read-only store held back, as (table, columns, extend), clearing them.
+
+        A writable store for the same database applies them with apply_metrics.
+        """
+        pending, self._pending_metrics = self._pending_metrics, []
+        return pending
+
+    def apply_metrics(self, pending):
+        """Store metric columns held back by read-only stores (see take_pending_metrics)."""
+        for table, columns, extend in pending:
+            self.write_metrics(table, columns, extend=extend)
 
 
 def _by_output(result):

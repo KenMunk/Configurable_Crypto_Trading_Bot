@@ -107,19 +107,41 @@ The list shows every `.json` file in `config/`, named after the file (`btc_macro
 | **Run Simulation** | Backtests every selected profile. The button is disabled while a run is in progress. |
 | **Test Coinbase Authentication** | Makes a read-only account request with your key and shows the full result in the **Metrics** tab. |
 
+Next to the buttons, the **Mode** button switches between running models at once and one after another. Click it to toggle:
+
+- **Mode: parallel (multi-process)**, the default, runs several models at once on worker processes. **Workers** sets how many.
+- **Mode: single-threaded** runs the models one after another, in the window's own background thread. **Workers** is grayed out.
+
+To see what parallel mode saves, run the same models once in each mode and compare the **Time spent** lines under the progress bars (see [Progress](#progress)).
+
+In parallel mode, **Workers** sets how many models run at once. The default, `auto`, starts one worker process per CPU but two. One spare CPU keeps the window and the candle writer (the price history downloads) responsive, and the other runs the gatherer, which consolidates the results the workers return. On a 12-CPU computer that leaves 10 workers; on one or two CPUs it is still one worker. The hint beside the box shows that number for your computer. A number above it is lowered to it. At `1`, models run one after another, as in single-threaded mode. A run of a single model always runs on its own. See [Running models in parallel](#running-models-in-parallel).
+
 ### Progress
 
 | Bar | Tracks |
 |---|---|
 | **API check** | The authentication test, then the fee lookups. |
 | **Data gathering (10 years)** | Candle downloads or cache loads, one product and candle size at a time. |
-| **Simulation** | Each model in turn: its indicators, then every candle of its test. |
+| **Simulation** | Each model in turn: its indicators, then every candle of its test. With parallel workers, it moves on as each model finishes, such as `3 of 12 models done (btc_15m_04)`. |
 
 Under each bar, a line shows its percentage and what it is doing, such as `BTC-USD FIFTEEN_MINUTE: 350,640 candles loaded from cache`. Before a run, it reads `waiting`.
 
+**Time spent**, below the bars, counts up while a run is under way, such as `12.3 s so far (8 models, parallel, 8 workers)`. When the results appear, it shows the run's total time, its model count and its mode. The time runs from clicking **Run Simulation** to the results, so it includes the API check and data gathering, which take the same time in either mode. A run that stops with an error shows its time but isn't used for the comparison.
+
+The line under it compares the last successful run in each mode, once both modes have run, such as `Last single-threaded run: 10.5 s for 8 models; last parallel run (8 workers): 5.4 s for 8 models. Parallel was 1.9x as fast, saving 5.1 s`. The speed-up is given only when both runs tested the same models; otherwise the line says to run both modes on the same selection. Times are kept until the window closes. For a fair comparison, run each mode once first so that both use cached candles.
+
 ### Showing model
 
-This drop-down picks which model the **Chart**, **Trades** and **Metrics** tabs show. After a run, it starts on the best performer. The **Comparison** and **Model value** tabs always show every model.
+This drop-down picks which model the **Chart**, **Trades** and **Metrics** tabs show. After a run, it starts on the best performer. It lists the models in the charts' view. After a run, the view holds every model, or with more than 8 the 8 best by return, one for each distinct line color, so the Model value chart starts out readable.
+
+To change which models are in view, use any of these:
+
+- **The list beside the Model value chart.** See [Model value](#model-value).
+
+- **Choose models...** opens a list of every model with its return. Type in **Search** to narrow the list: a model is listed when its name contains every word you type, such as `btc 15m`. Click, Ctrl-click or Shift-click to choose models. **Select listed** and **Clear listed** choose or drop every listed model. Models you chose before a search stay chosen while the search hides them. Click **Apply** or press **Enter** to show them; **Cancel** or **Esc** leaves the view as it was.
+- **Select rows in the [Comparison](#comparison) tab** and click **Chart selected models**, or press **Enter**.
+
+Either way, **Model value** draws only the models in view, and **Showing model** lists only them. Each model keeps its line color however the view changes. A line beside the buttons says how many models are in view, such as `Charts show 5 of 40 models`. **Show all** brings every model back. The model on show stays if it is still in view; otherwise the best model in view by return takes its place. All three ways change the same view, so the Chart tab, the Model value tab and the gray rows in the Comparison tab always agree.
 
 ### Full screen
 
@@ -149,6 +171,34 @@ When you click **Run Simulation**, the simulator works through these steps:
 8. **Results.** The tabs fill in, and the **Showing model** picker selects the best model by return. The status line reports the return and trade count (or, with several models, the best one) and what the performance log recorded.
 
 There is no cancel button. Closing the window stops a run. A download interrupted that way is not saved, and the next run fetches that range again.
+
+### Running models in parallel
+
+In parallel mode with **Workers** at `auto` or above 1, or from the command line, models are backtested at the same time on separate worker processes. Each run gives every shared file a single writer, so runs never collide:
+
+| Role | How many | Reads | Writes |
+|---|---|---|---|
+| **Candle writer** thread | 1 | Coinbase | `data/candles.db`: it downloads each market's missing candles before any model on that market starts, then stores the slow indicator columns the workers computed. |
+| **Workers** (processes) | as set | `data/candles.db`, read-only | Only their own shard: one small CSV per model under `data/performance_shards/<run>/`. |
+| **Gatherer** thread | 1 | the shards | `data/model_performance.csv`: it merges shards as they finish, then deletes them. |
+
+Workers are processes rather than threads because the backtest loop is plain Python, which threads would run one at a time. Each worker reads a market's candles once and reuses them for every model it runs on that market. Each worker holds its own copy of those candles, so memory grows with the worker count.
+
+The results are the same as a one-after-another run. Parallel runs pay off with many models: each worker spends a second or two starting up and reading candles, so 8 models took 5 s on 4 workers against 10 s one after another, and the gap grows with more models. A model that fails is left out of the results, and the status line names it and the error. The other models still finish and are logged.
+
+The same runs work without the window:
+
+```bash
+python parallel_backtest.py config/btc_15m_*.json                # auto: one worker per CPU but two
+python parallel_backtest.py config/btc_15m_*.json --workers 4
+python parallel_backtest.py config/*.json --start 2021-01-01 --fresh-signal
+python parallel_backtest.py config/*.json --offline --no-log     # cached candles, fallback fees, no log
+python parallel_backtest.py --gather                             # merge shards a failed merge left behind
+```
+
+`--workers` takes `auto` (the default) or a number, lowered to one per CPU but two. The CPU count is the logical cores Python may use (`os.process_cpu_count()`), so on a processor with hyper-threading it is twice the physical cores. A run never starts more workers than it has models. It prints a table of each model's return, buy and hold, maximum drawdown and trade count. Without `--offline`, it needs the same `.env` key as the window.
+
+**Several runs at once.** The database is kept in WAL mode, so a reader never waits for a writer, and every connection waits up to 60 seconds for another's write to finish. You can therefore run the window, a command-line run and `model_search.py` at the same time; their downloads queue up rather than fail. The performance log is protected by a lock file; see [Model performance log](#model-performance-log).
 
 ---
 
@@ -215,7 +265,9 @@ All times are in UTC.
 
 ### Comparison
 
-The Comparison tab has one row per model, sorted by return with the best first. A line above the table gives the number of models and the best one, and, with a start date, when the test started. Click a column heading to sort by it, and click again to reverse. Number columns sort largest first, and text columns A to Z. Double-click a model to open its chart.
+The Comparison tab has one row per model, sorted by return with the best first. A line above the table gives the number of models and the best one, and, with a start date, when the test started. Click a column heading to sort by it, and click again to reverse. Number columns sort largest first, and text columns A to Z.
+
+To chart some of the models, select their rows (Ctrl-click or Shift-click for several) and click **Chart selected models** above the table, or press **Enter**. The charts then show only those models (see [Showing model](#showing-model)), with the selected row highest in the table on show. With several models selected, the **Model value** tab opens; with one, the **Chart** tab. Rows not in the charts' view are shown in gray. Double-click a model to open its chart; a gray model is added to the view.
 
 | Column | Meaning |
 |---|---|
@@ -258,7 +310,17 @@ For how indicators are drawn and how to hide some, see [Charts and tooltips](ind
 
 ### Model value
 
-The Model value tab draws every model's value over time on one chart, with these reference lines:
+The Model value tab draws the value over time of every model in view on one chart: after a run, every model, or the 8 best by return when there are more (see [Showing model](#showing-model)).
+
+**Models on the chart**, the list on the left, picks which models it draws. It lists every model of the run, best return first, with its return:
+
+- **Click** a model to chart it alone. **Ctrl-click** adds or removes one, and **Shift-click** selects a range. The chart redraws a moment after your last click, so several quick clicks redraw it once.
+- Models on the chart are highlighted, each name in its line color, so the list is also a key to the chart. A model keeps its color while it stays on the chart; one that joins takes a free color.
+- **Search** narrows the list to names containing every word you type. Models the search hides stay on the chart.
+- **Best 8** charts the 8 best models by return. **All listed** adds every listed model, and **Drop listed** removes them; with a search, they act on its matches only.
+- The line under the buttons counts the models on the chart. Above 8, colors repeat as dashed lines, and the line warns that the chart is getting hard to read. At least one model always stays on the chart.
+
+The chart has these reference lines:
 
 - a horizontal line at the starting capital, one for each different starting capital
 - a gray **buy and hold** line for each product and starting capital. It stays at the starting capital until the model could first buy, then follows the price from that candle's close. An open circle marks where it starts, and the legend gives the date. With several models, it uses the start of the model chosen in **Showing model** (or, for another product or starting capital, of the first model with that product and starting capital), and the legend names that model.
@@ -337,6 +399,8 @@ Numbers are plain values without thousands separators or % signs, so they sort a
 A few more details:
 
 - **The file is never half written.** Each update is written to `model_performance.csv.tmp` and then swapped into place.
+- **Simultaneous runs never lose rows.** Every update holds `model_performance.csv.lock` while it reads, merges and replaces the file, so the window, `parallel_backtest.py` and `model_search.py` can record at the same time. A lock older than two minutes is left over from a crashed run, and the next update takes it over.
+- **Parallel runs keep their results until they are merged.** If the file is locked by Excel when a [parallel run](#running-models-in-parallel) finishes, the status line says how many results were kept in `data/performance_shards/`. Close the file and run `python parallel_backtest.py --gather` to merge them.
 - **Models that aren't in a run are kept.** Running a subset of your models updates only their rows.
 - **Renaming a profile file starts a new row**, because rows are keyed by the name. Delete the old row by hand if you no longer want it.
 - **Files from an earlier version** with fewer columns are upgraded in place: the next run of a model fills in the new columns for its row, and the other rows keep them blank until their model is run again.

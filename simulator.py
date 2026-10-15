@@ -8,6 +8,7 @@ import json
 import math
 import queue
 import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -22,6 +23,7 @@ from backtest import (
     starting_capital_of,
 )
 from friction import FrictionModel, fetch_friction_inputs
+from parallel_backtest import max_workers, parse_workers, run_parallel
 from performance_log import DEFAULT_PATH as PERFORMANCE_LOG, describe_update, update_performance_log
 from model_config import CompiledModel, ProfileError, is_legacy_profile
 from engine import QuantitativeTradingEngine, ensure_coinbase_sdk, load_environment_config
@@ -33,7 +35,7 @@ try:
     from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
     from matplotlib.figure import Figure
 
-    from chart import BacktestChart, ModelValueChart
+    from chart import MODEL_COLORS, BacktestChart, ModelValueChart
 except ImportError:  # pragma: no cover - GUI is optional in headless env
     tk = None
     ttk = None
@@ -248,6 +250,44 @@ TRADE_COLUMNS = [
 ]
 
 
+def format_elapsed(seconds):
+    """A run's duration to a tenth of a second, such as "8.4 s", "2 min 05.3 s" or "1 h 02 min"."""
+    tenths = round(seconds * 10)
+    hours, tenths = divmod(tenths, 36_000)
+    minutes, tenths = divmod(tenths, 600)
+    if hours:
+        return f"{hours} h {minutes:02d} min"
+    if minutes:
+        return f"{minutes} min {tenths / 10:04.1f} s"
+    return f"{tenths / 10:.1f} s"
+
+
+def describe_mode(workers, model_count):
+    """How a run of `model_count` models on `workers` executes (see _simulation_worker)."""
+    if workers > 1 and model_count > 1:
+        return f"parallel, {min(workers, model_count)} workers"
+    return "single-threaded" + (" (one model)" if workers > 1 else "")
+
+
+def compare_timings(timings):
+    """A line comparing the last single-threaded and parallel runs, or "" until both modes have run.
+
+    `timings` maps "single" and "parallel" to {"seconds", "models" (names), "mode"}.
+    """
+    single, parallel = timings.get("single"), timings.get("parallel")
+    if not single or not parallel:
+        return ""
+    line = (f"Last single-threaded run: {format_elapsed(single['seconds'])} for {len(single['models'])} models; "
+            f"last parallel run ({parallel['mode'].removeprefix('parallel, ')}): "
+            f"{format_elapsed(parallel['seconds'])} for {len(parallel['models'])} models")
+    if sorted(single["models"]) != sorted(parallel["models"]):
+        return line + " (different models: run both modes on the same selection to compare)"
+    ratio = single["seconds"] / max(parallel["seconds"], 1e-9)
+    if ratio >= 1:
+        return line + f". Parallel was {ratio:.1f}x as fast, saving {format_elapsed(single['seconds'] - parallel['seconds'])}"
+    return line + f". Single-threaded was {1 / ratio:.1f}x as fast"
+
+
 def _format_duration(seconds):
     days, remainder = divmod(int(seconds), 86_400)
     hours, remainder = divmod(remainder, 3_600)
@@ -370,6 +410,35 @@ def parse_start_date(text, now=None):
     return int(moment.timestamp())
 
 
+def default_view(results, limit=None):
+    """Positions of the models charted after a run: all of them, or the best `limit` by return.
+
+    The limit defaults to one model per distinct line color, so a run of many models opens
+    on a readable chart.
+    """
+    limit = limit or len(MODEL_COLORS)
+    best = sorted(range(len(results)), key=lambda position: results[position]["total_return"], reverse=True)
+    return sorted(best[:limit])
+
+
+def assign_colors(slots, positions):
+    """Each model's color slot: a model keeps its slot while it stays in view; one joining takes the lowest free one."""
+    kept = {position: slot for position, slot in slots.items() if position in positions}
+    taken = set(kept.values())
+    for position in positions:
+        if position not in kept:
+            slot = next(slot for slot in range(len(positions) + len(taken) + 1) if slot not in taken)
+            kept[position] = slot
+            taken.add(slot)
+    return kept
+
+
+def matching_models(names, text):
+    """Positions of the names containing every word of `text`, ignoring case; all of them when blank."""
+    words = str(text).lower().split()
+    return [position for position, name in enumerate(names) if all(word in name.lower() for word in words)]
+
+
 def parse_floor(text):
     """The chart floor as a positive number, or None when blank.
 
@@ -484,6 +553,10 @@ class SimulationWindow:
 
         self.model_paths = []
         self.results = []
+        self.in_view = []  # positions in self.results of the models the charts show
+        self.color_slots = {}  # position -> color slot, stable while the model stays in view
+        self._view_job = None  # a pending view change from the Model value list
+        self.current = None  # the position the Chart, Trades and Metrics tabs show
         self.result_var = tk.StringVar(value="Simulation status: idle")
         self.auth_status_var = tk.StringVar(value="Coinbase authentication: not tested")
         self.runtime_config = load_environment_config()
@@ -545,6 +618,20 @@ class SimulationWindow:
         ttk.Button(action_row, text="Test Coinbase Authentication", command=self._authenticate_coinbase).pack(
             side="left", padx=(8, 0)
         )
+        self.parallel_var = tk.BooleanVar(value=True)
+        self.mode_text = tk.StringVar()
+        self.mode_button = ttk.Checkbutton(action_row, textvariable=self.mode_text, variable=self.parallel_var,
+                                           style="Toolbutton", command=self._update_mode, width=31)
+        self.mode_button.pack(side="left", padx=(16, 0))
+        self.workers_label = ttk.Label(action_row, text="Workers:")
+        self.workers_label.pack(side="left", padx=(8, 0))
+        self.workers_var = tk.StringVar(value="auto")
+        self.workers_box = ttk.Spinbox(action_row, values=["auto", *range(1, max_workers() + 1)],
+                                       textvariable=self.workers_var, width=5)
+        self.workers_box.pack(side="left", padx=(6, 0))
+        ttk.Label(action_row, text=f"auto uses {max_workers()}, one per CPU but two",
+                  foreground="#555555").pack(side="left", padx=(8, 0))
+        self._update_mode()
 
         ttk.Label(self.controls, text="Progress", font=("Segoe UI", 10, "bold")).pack(anchor="w")
         progress_frame = ttk.Frame(self.controls)
@@ -568,6 +655,14 @@ class SimulationWindow:
             )
             self.progress_bars[phase] = bar
             self.progress_vars[phase] = detail
+        ttk.Label(progress_frame, text="Time spent", width=24).grid(row=6, column=0, sticky="w")
+        self.time_var = tk.StringVar(value="not run yet")
+        ttk.Label(progress_frame, textvariable=self.time_var).grid(row=6, column=1, sticky="w")
+        self.timing_compare_var = tk.StringVar(value="Run once in each mode, on the same models, to compare them")
+        ttk.Label(progress_frame, textvariable=self.timing_compare_var, foreground="#555555").grid(
+            row=7, column=1, sticky="w")
+        self.timings = {}  # "single" / "parallel" -> the last run in that mode, for compare_timings
+        self.run_timing = None  # the run under way: started, mode, models
 
         # Status is packed from the bottom first so the expanding tabs never push it off-screen.
         ttk.Label(main, textvariable=self.auth_status_var, foreground="#1a5d1a").pack(
@@ -587,16 +682,21 @@ class SimulationWindow:
         self.selected_model_var = tk.StringVar(value="")
         self.model_picker = ttk.Combobox(picker_row, textvariable=self.selected_model_var, state="readonly", width=40)
         self.model_picker.pack(side="left", padx=(6, 0))
-        self.model_picker.bind("<<ComboboxSelected>>", lambda _event: self._show_model(self.model_picker.current()))
-        ttk.Label(picker_row, text="(Chart, Trades and Metrics follow this choice; Comparison and Model value show all)",
-                  foreground="#555555").pack(side="left", padx=(8, 0))
+        self.model_picker.bind("<<ComboboxSelected>>",
+                               lambda _event: self._show_model(self.in_view[self.model_picker.current()]))
+        ttk.Button(picker_row, text="Choose models...", command=self._choose_models).pack(side="left", padx=(12, 0))
+        ttk.Button(picker_row, text="Show all", command=lambda: self._set_view(range(len(self.results)))).pack(
+            side="left", padx=(4, 0))
+        self.view_var = tk.StringVar(value="")
+        ttk.Label(picker_row, textvariable=self.view_var, foreground="#555555").pack(side="left", padx=(8, 0))
 
         self.results_tabs = ttk.Notebook(main)
         self.results_tabs.pack(fill="both", expand=True, pady=(0, 10))
 
         self.comparison_tab = self._add_comparison_tab()
         self.chart_tab, self.chart = self._add_chart_tab("Chart", BacktestChart, "Lowest price shown:")
-        self.value_tab, self.value_chart = self._add_chart_tab("Model value", ModelValueChart, "Lowest value shown:")
+        self.value_tab, self.value_chart = self._add_chart_tab("Model value", ModelValueChart, "Lowest value shown:",
+                                                               model_list=True)
         self.trades_tab = self._add_trades_tab()
 
         self.metrics_tab = ttk.Frame(self.results_tabs)
@@ -604,7 +704,14 @@ class SimulationWindow:
         self.metrics_text = tk.Text(self.metrics_tab, wrap="word", bg="#f5f5f5")
         self.metrics_text.pack(fill="both", expand=True)
 
-    def _add_chart_tab(self, title, chart_class, floor_label):
+    def _update_mode(self):
+        """Show the mode on the toggle button; the worker count only matters in parallel mode."""
+        parallel = self.parallel_var.get()
+        self.mode_text.set("Mode: parallel (multi-process)" if parallel else "Mode: single-threaded")
+        for widget in (self.workers_label, self.workers_box):
+            widget.state(["!disabled"] if parallel else ["disabled"])
+
+    def _add_chart_tab(self, title, chart_class, floor_label, model_list=False):
         tab = ttk.Frame(self.results_tabs)
         self.results_tabs.add(tab, text=title)
         figure = Figure(figsize=(9, 5), dpi=100)
@@ -628,9 +735,85 @@ class SimulationWindow:
         self.floor_notes.append((chart, note_var))
         self._describe_floor(chart, note_var)
 
+        if model_list:
+            self._add_view_list(tab)
         toolbar.pack(side="bottom", fill="x")
         canvas.get_tk_widget().pack(fill="both", expand=True)
         return tab, chart
+
+    def _add_view_list(self, tab):
+        """A list beside the Model value chart for picking the models it draws, best return first."""
+        panel = ttk.Frame(tab, padding=(0, 0, 8, 0))
+        panel.pack(side="left", fill="y")
+        ttk.Label(panel, text="Models on the chart", font=("Segoe UI", 9, "bold")).pack(anchor="w")
+        self.view_search_var = tk.StringVar()
+        search = ttk.Entry(panel, textvariable=self.view_search_var, width=30)
+        search.pack(fill="x", pady=(4, 0))
+        ttk.Label(panel, text="Search; click, Ctrl-click or Shift-click", foreground="#555555").pack(anchor="w")
+        list_frame = ttk.Frame(panel)
+        list_frame.pack(fill="both", expand=True, pady=(4, 0))
+        # A light highlight, so each charted model's name keeps its line color (a key to the chart).
+        self.view_list = tk.Listbox(list_frame, selectmode="extended", exportselection=False, activestyle="none",
+                                    width=32, selectbackground="#dbe7f5")
+        scroll = ttk.Scrollbar(list_frame, orient="vertical", command=self.view_list.yview)
+        self.view_list.configure(yscrollcommand=scroll.set)
+        self.view_list.pack(side="left", fill="both", expand=True)
+        scroll.pack(side="left", fill="y")
+        buttons = ttk.Frame(panel)
+        buttons.pack(fill="x", pady=(4, 0))
+        ttk.Button(buttons, text=f"Best {len(MODEL_COLORS)}", width=7,
+                   command=lambda: self._set_view(default_view(self.results))).pack(side="left")
+        ttk.Button(buttons, text="All listed", width=9, command=lambda: self._view_listed(True)).pack(
+            side="left", padx=(4, 0))
+        ttk.Button(buttons, text="Drop listed", width=10, command=lambda: self._view_listed(False)).pack(
+            side="left", padx=(4, 0))
+        self.view_list_note = tk.StringVar(value="Run a simulation to list its models")
+        ttk.Label(panel, textvariable=self.view_list_note, foreground="#555555", wraplength=230).pack(
+            anchor="w", pady=(4, 0))
+        self.view_listed = []  # positions in self.results, in list order
+        self.view_search_var.trace_add("write", lambda *_: self._refresh_view_list())
+        self.view_list.bind("<<ListboxSelect>>", lambda _event: self._view_list_picked())
+
+    def _refresh_view_list(self):
+        """List the models matching the search, best return first, with those in view selected."""
+        names = [result["model_name"] for result in self.results]
+        self.view_listed = sorted(matching_models(names, self.view_search_var.get()),
+                                  key=lambda position: self.results[position]["total_return"], reverse=True)
+        self.view_list.delete(0, "end")
+        for row, position in enumerate(self.view_listed):
+            self.view_list.insert("end", f"{names[position]}   {self.results[position]['total_return']:+.1%}")
+            if position in self.in_view:
+                self.view_list.select_set(row)
+                self.view_list.itemconfigure(row, selectforeground=MODEL_COLORS[
+                    self.color_slots.get(position, 0) % len(MODEL_COLORS)])
+        self.view_list_note.set(f"{len(self.in_view)} of {len(names)} on the chart"
+                                + ("; drawing many at once makes the chart hard to read"
+                                   if len(self.in_view) > len(MODEL_COLORS) else ""))
+
+    def _view_list_picked(self):
+        """Apply the list's selection a moment after the last click, so a run of clicks redraws once."""
+        chosen = (set(self.in_view) - set(self.view_listed)) | {
+            self.view_listed[row] for row in self.view_list.curselection()}
+        if self._view_job is not None:
+            self.root.after_cancel(self._view_job)
+            self._view_job = None
+        if not chosen:
+            self.view_list_note.set("Choose at least one model")
+            return
+        self._view_job = self.root.after(300, lambda: self._apply_view_list(chosen))
+
+    def _apply_view_list(self, chosen):
+        self._view_job = None
+        self._set_view(chosen)
+
+    def _view_listed(self, on):
+        """Add every listed model to the chart, or drop them (keeping at least one model)."""
+        listed = set(self.view_listed)
+        chosen = set(self.in_view) | listed if on else set(self.in_view) - listed
+        if not chosen:
+            self.view_list_note.set("Choose at least one model")
+            return
+        self._set_view(chosen)
 
     def _apply_floor(self, chart, floor_var, note_var):
         try:
@@ -669,15 +852,22 @@ class SimulationWindow:
         self.results_tabs.add(tab, text="Comparison")
         self.comparison_summary_var = tk.StringVar(value="Run a simulation to compare the selected models")
         ttk.Label(tab, textvariable=self.comparison_summary_var).pack(anchor="w", pady=(0, 6))
-        ttk.Label(tab, text="Click a column heading to sort. Double-click a model to open its chart.",
-                  foreground="#555555").pack(anchor="w", pady=(0, 6))
+        hint_row = ttk.Frame(tab)
+        hint_row.pack(fill="x", pady=(0, 6))
+        self.chart_selected_button = ttk.Button(hint_row, text="Chart selected models",
+                                                command=self._chart_selected_rows, state="disabled")
+        self.chart_selected_button.pack(side="left")
+        ttk.Label(hint_row, text="Click a column heading to sort. Ctrl/Shift-click to select several models, then "
+                                 "chart them (or press Enter). Double-click a model to open its chart. Gray rows "
+                                 "are not in the charts.", foreground="#555555").pack(side="left", padx=(8, 0))
         table_frame = ttk.Frame(tab)
         table_frame.pack(fill="both", expand=True)
         table_frame.columnconfigure(0, weight=1)
         table_frame.rowconfigure(0, weight=1)
         self.comparison_table = ttk.Treeview(
-            table_frame, columns=[key for key, *_ in COMPARISON_COLUMNS], show="headings", selectmode="browse"
+            table_frame, columns=[key for key, *_ in COMPARISON_COLUMNS], show="headings", selectmode="extended"
         )
+        self.comparison_table.tag_configure("hidden", foreground="#999999")
         for key, heading, width, anchor in COMPARISON_COLUMNS:
             self.comparison_table.heading(key, text=heading, command=lambda key=key: self._sort_comparison(key))
             self.comparison_table.column(key, width=width, anchor=anchor, stretch=key == "model")
@@ -686,6 +876,9 @@ class SimulationWindow:
         self.comparison_table.grid(row=0, column=0, sticky="nsew")
         horizontal.grid(row=1, column=0, sticky="ew")
         self.comparison_table.bind("<Double-1>", self._open_compared_model)
+        self.comparison_table.bind("<Return>", lambda _event: self._chart_selected_rows())
+        self.comparison_table.bind("<<TreeviewSelect>>", lambda _event: self.chart_selected_button.state(
+            ["!disabled"] if self.comparison_table.selection() else ["disabled"]))
         self.comparison_rows = {}
         self.comparison_sort = ("return", True)
         return tab
@@ -717,23 +910,139 @@ class SimulationWindow:
             self.comparison_table.move(item, "", position)
         self.comparison_sort = (key, descending)
 
-    def _open_compared_model(self, _event):
-        selection = self.comparison_table.selection()
-        if selection:
-            result = self.comparison_rows[selection[0]]["result"]
-            self._show_model(self.results.index(result))
+    def _position_of(self, item):
+        """The position in self.results of a comparison table row."""
+        result = self.comparison_rows[item]["result"]
+        return next(position for position, candidate in enumerate(self.results) if candidate is result)
+
+    def _open_compared_model(self, event):
+        item = self.comparison_table.identify_row(event.y)
+        if item:
+            self._show_model(self._position_of(item))
             self.results_tabs.select(self.chart_tab)
 
+    def _chart_selected_rows(self):
+        """Chart the models selected in the comparison table; the top selected row is the one shown."""
+        selection = [item for item in self.comparison_table.get_children() if item in self.comparison_table.selection()]
+        if not selection:
+            return
+        positions = [self._position_of(item) for item in selection]
+        self._set_view(positions, current=positions[0])
+        self.results_tabs.select(self.value_tab if len(positions) > 1 else self.chart_tab)
+
+    def _set_view(self, positions, current=None):
+        """Show only these models (positions in self.results) in the charts and the Showing model list.
+
+        The model on show stays if it is still in view; otherwise `current`, or the best of
+        the view by return, takes its place.
+        """
+        positions = sorted(set(positions))
+        if not positions:
+            return
+        self.in_view = positions
+        self.color_slots = assign_colors(self.color_slots, positions)
+        if current is None:
+            current = self.current if self.current in positions else max(
+                positions, key=lambda position: self.results[position]["total_return"])
+        self.model_picker["values"] = [self.results[position]["model_name"] for position in positions]
+        shown = len(positions) == len(self.results)
+        self.view_var.set(f"Charts show all {len(positions)} models" if shown else
+                          f"Charts show {len(positions)} of {len(self.results)} models")
+        for item in self.comparison_rows:
+            self.comparison_table.item(item, tags=() if self._position_of(item) in positions else ("hidden",))
+        self.current = None  # so _show_model redraws even if the model on show didn't change
+        self._show_model(current)
+        self._refresh_view_list()
+
+    def _choose_models(self):
+        """A dialog to pick the models in view, with a search box for long lists."""
+        if not self.results:
+            return
+        names = [result["model_name"] for result in self.results]
+        chosen = set(self.in_view)
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Choose models to chart")
+        dialog.transient(self.root)
+        dialog.geometry("420x520")
+        frame = ttk.Frame(dialog, padding=10)
+        frame.pack(fill="both", expand=True)
+        search_row = ttk.Frame(frame)
+        search_row.pack(fill="x")
+        ttk.Label(search_row, text="Search:").pack(side="left")
+        search_var = tk.StringVar()
+        search = ttk.Entry(search_row, textvariable=search_var)
+        search.pack(side="left", fill="x", expand=True, padx=(6, 0))
+        ttk.Label(frame, text="Click to select; Ctrl/Shift-click for several. Choices outside the search are kept.",
+                  foreground="#555555", wraplength=390).pack(anchor="w", pady=(6, 6))
+        list_frame = ttk.Frame(frame)
+        list_frame.pack(fill="both", expand=True)
+        listbox = tk.Listbox(list_frame, selectmode="extended", exportselection=False, activestyle="none")
+        scroll = ttk.Scrollbar(list_frame, orient="vertical", command=listbox.yview)
+        listbox.configure(yscrollcommand=scroll.set)
+        listbox.pack(side="left", fill="both", expand=True)
+        scroll.pack(side="left", fill="y")
+        count_var = tk.StringVar()
+        listed = []
+
+        def refresh(*_):
+            listed[:] = matching_models(names, search_var.get())
+            listbox.delete(0, "end")
+            for row, position in enumerate(listed):
+                listbox.insert("end", f"{names[position]}   ({self.results[position]['total_return']:+.1%})")
+                if position in chosen:
+                    listbox.select_set(row)
+            count_var.set(f"{len(chosen)} of {len(names)} chosen")
+
+        def picked(*_):
+            chosen.difference_update(listed)
+            chosen.update(listed[row] for row in listbox.curselection())
+            count_var.set(f"{len(chosen)} of {len(names)} chosen")
+
+        def mark(on):
+            (chosen.update if on else chosen.difference_update)(listed)
+            refresh()
+
+        def apply():
+            if not chosen:
+                count_var.set("Choose at least one model")
+                return
+            self._set_view(chosen)
+            dialog.destroy()
+
+        search_var.trace_add("write", refresh)
+        listbox.bind("<<ListboxSelect>>", picked)
+        buttons = ttk.Frame(frame)
+        buttons.pack(fill="x", pady=(8, 0))
+        ttk.Button(buttons, text="Select listed", command=lambda: mark(True)).pack(side="left")
+        ttk.Button(buttons, text="Clear listed", command=lambda: mark(False)).pack(side="left", padx=(4, 0))
+        ttk.Label(buttons, textvariable=count_var, foreground="#555555").pack(side="left", padx=(8, 0))
+        ttk.Button(buttons, text="Cancel", command=dialog.destroy).pack(side="right")
+        ttk.Button(buttons, text="Apply", command=apply).pack(side="right", padx=(0, 4))
+        dialog.bind("<Return>", lambda _event: apply())
+        dialog.bind("<Escape>", lambda _event: dialog.destroy())
+        refresh()
+        search.focus_set()
+        return dialog
+
     def _show_model(self, index):
-        """Point the Chart, Trades and Metrics tabs, and the Model value highlight, at one model."""
+        """Point the Chart, Trades and Metrics tabs, and the Model value highlight, at one model.
+
+        A model outside the charts' view is added to it.
+        """
         if not 0 <= index < len(self.results):
             return
+        if index not in self.in_view:
+            self._set_view([*self.in_view, index], current=index)
+            return
+        self.current = index
         result = self.results[index]
-        self.model_picker.current(index)
+        self.model_picker.current(self.in_view.index(index))
         self.metrics_text.delete("1.0", tk.END)
         self.metrics_text.insert("1.0", f"Model: {result['model_name']}\n\n" + format_backtest_result(result))
         self.chart.show(result)
-        self.value_chart.show(self.results, primary=index)
+        self.value_chart.show([self.results[position] for position in self.in_view],
+                              primary=self.in_view.index(index),
+                              slots=[self.color_slots[position] for position in self.in_view])
         for chart, note_var in self.floor_notes:
             self._describe_floor(chart, note_var)
         self._show_trades(result)
@@ -900,6 +1209,7 @@ class SimulationWindow:
         try:
             models = self._selected_models()
             start_time = parse_start_date(self.start_date_var.get())
+            workers = parse_workers(self.workers_var.get()) if self.parallel_var.get() else 1
             problems = [f"{name}: {report.splitlines()[1][2:]}" for name, profile in models
                         for valid, report in [describe_profile(profile)] if not valid]
             if problems:
@@ -925,19 +1235,24 @@ class SimulationWindow:
         self.metrics_text.delete("1.0", tk.END)
         self.run_button.state(["disabled"])
         self.result_var.set("Simulation status: testing the Coinbase API")
+        mode = describe_mode(workers, len(models))
+        self.run_timing = {"started": time.monotonic(), "mode": mode, "models": [name for name, _ in models],
+                           "kind": "parallel" if mode.startswith("parallel") else "single"}
+        self._show_time()
 
         self.simulation_thread = threading.Thread(
-            target=self._simulation_worker, args=(client, models, start_time, self.fresh_signal_var.get()),
+            target=self._simulation_worker, args=(client, models, start_time, self.fresh_signal_var.get(), workers),
             daemon=True,
         )
         self.simulation_thread.start()
         self.root.after(100, self._poll_progress)
 
-    def _simulation_worker(self, client, models, start_time=None, wait_for_fresh_signal=False):
+    def _simulation_worker(self, client, models, start_time=None, wait_for_fresh_signal=False, workers=1):
         """Test the API, then gather data, simulate each (name, profile) in turn and log the results.
 
-        With `start_time`, every model starts testing there (see run_backtest). Runs off the
-        Tk thread, so it only posts events for _poll_progress to apply.
+        With `start_time`, every model starts testing there (see run_backtest). With more
+        than one of `workers` and of models, the models run at once (see _parallel_run).
+        Runs off the Tk thread, so it only posts events for _poll_progress to apply.
         """
         post = self.progress_queue.put
         try:
@@ -952,6 +1267,9 @@ class SimulationWindow:
             inputs = fetch_friction_inputs(client, [profile for _, profile in models])
             frictions = {name: FrictionModel(profile, inputs) for name, profile in models}
             post(("friction", auth, frictions[models[0][0]].describe()))
+            if workers > 1 and len(models) > 1:
+                self._parallel_run(client, models, inputs, start_time, wait_for_fresh_signal, workers)
+                return
 
             # Models on the same product and candle size share one download.
             markets = list(group_by_market(models))
@@ -992,9 +1310,29 @@ class SimulationWindow:
         except Exception as exc:  # Reported in the window; the worker must not die silently.
             post(("error", exc))
 
+    def _parallel_run(self, client, models, friction_inputs, start_time, wait_for_fresh_signal, workers):
+        """Run the models on worker processes (see parallel_backtest.py) and post the results.
+
+        Each model reports when it finishes rather than as it goes. A model that fails is
+        left out of the results and named in the status line.
+        """
+        post = self.progress_queue.put
+        post(("status", f"Simulation status: running {len(models)} models on "
+                        f"{min(workers, len(models))} parallel workers"))
+        run = run_parallel(client, models, workers=workers, start_time=start_time,
+                           wait_for_fresh_signal=wait_for_fresh_signal, friction_inputs=friction_inputs,
+                           performance_path=self.performance_log_path,
+                           progress=lambda phase, fraction, message: post(("progress", phase, fraction, message)))
+        results = [result for result in run["results"] if result is not None]
+        failed = "; ".join(f"{name}: {error}" for name, error in run["errors"].items())
+        if not results:
+            post(("error", RuntimeError(f"Every model failed - {failed}")))
+            return
+        post(("done", results, run["logged"] + (f"; FAILED {failed}" if failed else "")))
+
     def _poll_progress(self):
         """Apply the worker's queued events to the window; checks again every 100 ms until the run ends."""
-        finished = False
+        finished = succeeded = False
         while True:
             try:
                 event = self.progress_queue.get_nowait()
@@ -1025,10 +1363,10 @@ class SimulationWindow:
                 self.result_var.set(event[1])
             elif kind == "done":
                 self.results, logged = event[1], event[2]
-                self.model_picker["values"] = [result["model_name"] for result in self.results]
                 best = max(range(len(self.results)), key=lambda i: self.results[i]["total_return"])
                 self._show_comparison(self.results)
-                self._show_model(best)
+                self.color_slots = {}
+                self._set_view(default_view(self.results), current=best)
                 if len(self.results) == 1:
                     result = self.results[0]
                     self.results_tabs.select(self.chart_tab)
@@ -1039,17 +1377,41 @@ class SimulationWindow:
                     self.result_var.set(
                         f"Simulation status: complete, {len(self.results)} models; best "
                         f"{self.results[best]['model_name']} {self.results[best]['total_return']:+.2%}; {logged}")
-                finished = True
+                finished = succeeded = True
             elif kind == "error":
                 self.result_var.set(f"Simulation status: error - {event[1]}")
                 if messagebox is not None:
                     messagebox.showerror("Simulation Run Error", str(event[1]))
                 finished = True
 
+        self._show_time(finished=finished, succeeded=succeeded)
         if finished:
             self.run_button.state(["!disabled"])
         else:
             self.root.after(100, self._poll_progress)
+
+    def _show_time(self, finished=False, succeeded=False):
+        """Update the Time spent line: running time during a run, then the total once it ends.
+
+        The time runs from clicking Run Simulation to the results appearing, so it includes
+        the API check and data gathering, which take the same time in either mode.
+        """
+        timing = self.run_timing
+        if timing is None:
+            return
+        seconds = time.monotonic() - timing["started"]
+        models = f"{len(timing['models'])} model{'s' if len(timing['models']) != 1 else ''}"
+        if not finished:
+            self.time_var.set(f"{format_elapsed(seconds)} so far ({models}, {timing['mode']})")
+            return
+        self.run_timing = None
+        if not succeeded:
+            self.time_var.set(f"{format_elapsed(seconds)} until the run stopped with an error ({timing['mode']})")
+            return
+        self.time_var.set(f"{format_elapsed(seconds)} for {models} ({timing['mode']})")
+        self.timings[timing["kind"]] = {"seconds": seconds, "models": timing["models"], "mode": timing["mode"]}
+        self.timing_compare_var.set(compare_timings(self.timings) or
+                                    "Run the same models in the other mode to compare the times")
 
 
 def main():
