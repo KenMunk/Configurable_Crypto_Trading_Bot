@@ -132,6 +132,7 @@ The code is split into small modules:
 | `simulator.py` | The simulator window: model selection, runs, results tabs. |
 | `backtest.py` | Candle download, and the backtest itself: fills, stops, taxes, drawdown limits, flash crashes. |
 | `candle_store.py` | The candle cache: a SQLite table per product and candle size, with a column for each slow indicator kept between runs. |
+| `performance_log.py` | The model performance log: one CSV row per model with its latest results, updated when a run's results change. |
 | `model_config.py` | Validates a profile and compiles its indicators and rules into per-candle signals. |
 | `indicators.py` | The indicator library: moving averages, oscillators, bands, volatility, trend and volume. |
 | `rules.py` | The rule language: formulas parsed against a whitelist and never executed as Python. |
@@ -251,6 +252,7 @@ Configurable_Crypto_Trading_Bot/
 ├── engine.py                 Trader runtime (status dashboard, Coinbase auth, ledger)
 ├── backtest.py               Candle download; the backtest engine
 ├── candle_store.py           Candle cache and stored indicators (SQLite)
+├── performance_log.py        Model performance log (data/model_performance.csv)
 ├── model_config.py           Profile validation and compilation
 ├── indicators.py             Indicator library
 ├── rules.py                  Signal rule language
@@ -262,7 +264,7 @@ Configurable_Crypto_Trading_Bot/
 ├── config/
 │   ├── .example/             Public template profiles (tracked)
 │   └── *.json                Your private profiles (ignored by Git)
-├── data/                     Candle cache (candles.db), created on first run (ignored by Git)
+├── data/                     Candle cache (candles.db) and model performance log, created on first run (ignored by Git)
 ├── ledger/                   Ledger database for the repository-root base directory
 ├── quant_system/             Default base directory of `python engine.py`
 │   ├── config/               Profiles the engine loads (ignored by Git)
@@ -297,7 +299,7 @@ The `data/` folder is created by the simulator's first run and is ignored by Git
 | `config/*.json` | Ignored | Your private model profiles |
 | `config/.example/` | Tracked | Public template profiles |
 | `quant_system/config/` | Ignored | The profiles loaded by `python engine.py` |
-| `data/` | Ignored | The cached candle history and stored indicators |
+| `data/` | Ignored | The cached candle history, stored indicators, and `model_performance.csv` |
 | `cdp_api_key*.json` | Ignored | Coinbase key files, if you keep them in the repository folder |
 | `ledger/`, `quant_system/ledger/` | Tracked (currently empty) | SQLite ledgers; keep real trading records out of Git |
 

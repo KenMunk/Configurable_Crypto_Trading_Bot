@@ -162,14 +162,14 @@ def test_a_flash_crash_is_bought_with_the_reserve_and_never_sold_into():
     assert result["max_window_drawdown"] < 0.10
 
 
-def _holding_through(crash_closes, recovery_close=None):
+def _holding_through(crash_closes, recovery_close=None, window="180d"):
     """Hold a position into a crash whose candles close at `crash_closes`, then optionally recover."""
     candles = [_candle(i * STEP, p) for i, p in enumerate([100] * 6 + [101, 105])]
     for close in crash_closes:
         candles.append(_candle(len(candles) * STEP, close, low=close * 0.9, open_=candles[-1]["close"]))
     if recovery_close is not None:
         candles.append(_candle(len(candles) * STEP, recovery_close))
-    profile = _limited()
+    profile = _limited(window=window)
     profile["strategy"]["exit_signal"]["any"] = ["close < 0"]  # only stops can exit
     profile["strategy"]["flash_crash_buy"] = {"enabled": True, "reserve": 100,
                                               "levels": [{"drop": 0.3, "allocation": 0.5},
@@ -177,12 +177,12 @@ def _holding_through(crash_closes, recovery_close=None):
     return run_backtest(candles, profile), candles
 
 
-def test_a_crash_that_recovers_within_an_hour_is_ignored_and_the_reserve_sells_on_recovery():
+def test_a_crash_that_recovers_within_an_hour_is_held_through_at_its_real_prices():
     result, candles = _holding_through([50, 45], recovery_close=104)  # 30 minutes down, then back
 
-    assert result["flash_crash_events"][0]["brief"] is True
-    assert result["open_position"] is True  # no stop fired; the crash was treated as bad data
-    assert result["max_window_drawdown"] < 0.02  # valuation ignored the crash prices too
+    assert result["flash_crash_events"][0]["minutes"] == 45
+    assert result["open_position"] is True  # nothing sold during the crash
+    assert result["max_window_drawdown"] > 0.10  # the crash prices count in the model's value
     fills = result["flash_crash_buys"]
     assert [fill["entry_price"] for fill in fills] == pytest.approx([105 * 0.7, 105 * 0.4])
     assert all(fill["exit_time"] == candles[-1]["start"] for fill in fills)  # sold at the recovery close
@@ -191,11 +191,17 @@ def test_a_crash_that_recovers_within_an_hour_is_ignored_and_the_reserve_sells_o
 def test_a_crash_that_holds_longer_than_an_hour_is_held_through_until_it_recovers():
     result, candles = _holding_through([50, 48, 47, 46, 45, 44], recovery_close=100)  # 90 minutes down
 
-    event = result["flash_crash_events"][0]
-    assert event["brief"] is False and event["minutes"] == 105
+    assert result["flash_crash_events"][0]["minutes"] == 105
     assert result["open_position"] is True  # nothing sold during the crash
     assert result["max_window_drawdown"] > 0.10  # the real loss shows while it lasted
     assert all(fill["exit_time"] == candles[-1]["start"] for fill in result["flash_crash_buys"])
+
+
+def test_the_drawdown_limit_without_a_window_waits_for_the_crash_to_recover():
+    result, _ = _holding_through([50, 48, 47, 46, 45, 44], recovery_close=100, window=None)
+
+    assert result["open_position"] is True  # not sold at a crash close, though it was 50% down
+    assert result["drawdown_pauses"] == []  # back within the limit by the recovery close
 
 
 def test_a_crash_that_never_recovers_keeps_everything_held():

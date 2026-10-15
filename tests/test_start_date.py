@@ -40,18 +40,28 @@ def test_waiting_for_a_fresh_signal_skips_the_trend_already_underway():
     assert all(trade["entry_time"] > 14 * STEP for trade in result["trades"])
 
 
-def test_buy_and_hold_starts_at_the_models_first_buy():
-    start = 9 * STEP
+def test_buy_and_hold_starts_when_the_model_could_first_buy():
+    # Without a start date, the 5-candle slow EMA needs candles 0-4 before the entry rule
+    # can be evaluated, so buy and hold starts on candle 4, before the first buy.
+    result = run_backtest(_candles(), _profile())
+
+    assert result["ready_to_trade"] == 4 * STEP
+    assert result["buy_and_hold_start"] == 4 * STEP
+    assert result["first_entry"] > 4 * STEP
+    assert result["buy_and_hold_return"] == pytest.approx(110 / PRICES[4] - 1)
+    assert result["buy_and_hold_from_test_start"] == pytest.approx(110 / PRICES[0] - 1)
+
+
+def test_waiting_for_a_signal_after_the_warm_up_counts_against_the_model():
+    start = 9 * STEP  # already warmed up, so buy and hold starts with the test
     result = run_backtest(_candles(), _profile(), start_time=start, wait_for_fresh_signal=True)
 
-    first_buy = result["first_entry"]
-    assert first_buy > start  # it waited out the first trend
-    assert result["buy_and_hold_start"] == first_buy
-    assert result["buy_and_hold_return"] == pytest.approx(110 / PRICES[first_buy // STEP] - 1)
-    assert result["buy_and_hold_from_test_start"] == pytest.approx(110 / PRICES[9] - 1)
+    assert result["first_entry"] > start
+    assert result["buy_and_hold_start"] == start
+    assert result["buy_and_hold_return"] == pytest.approx(110 / PRICES[9] - 1)
 
 
-def test_buy_and_hold_starts_at_the_test_start_when_the_model_never_buys():
+def test_a_model_that_never_buys_is_compared_from_when_it_could_have():
     profile = _profile()
     profile["strategy"]["entry_signal"] = {"all": ["close < 0"]}
 
@@ -63,15 +73,20 @@ def test_buy_and_hold_starts_at_the_test_start_when_the_model_never_buys():
 
 
 def test_report_says_where_buy_and_hold_starts():
-    bought = run_backtest(_candles(), _profile(), start_time=9 * STEP, wait_for_fresh_signal=True)
-    lines = format_buy_and_hold(bought)
-    assert lines[0].startswith("Buy and hold return: +") and "at the model's first buy, 1970-01-01" in lines[0]
-    assert lines[1].startswith("Buy and hold from the test start: +")
+    warmed = format_buy_and_hold(run_backtest(_candles(), _profile()))
+    assert warmed[0].startswith("Buy and hold return: +")
+    assert warmed[0].endswith("(from 1970-01-01 01:00 UTC, the first candle the model could buy on)")
+    assert warmed[1].startswith("Model vs buy and hold: ")
+    assert warmed[2] == "First buy: 1970-01-01 01:30 UTC"
+    assert warmed[3].startswith("Buy and hold from the test start: +")
 
     profile = _profile()
     profile["strategy"]["entry_signal"] = {"all": ["close < 0"]}
     never = format_buy_and_hold(run_backtest(_candles(), profile, start_time=9 * STEP))
-    assert never == [f"Buy and hold return: {110 / PRICES[9] - 1:+.2%} (from the test start, because the model never bought)"]
+    assert never == [
+        f"Buy and hold return: {110 / PRICES[9] - 1:+.2%} (from the test start, 1970-01-01 02:15 UTC)",
+        f"Model vs buy and hold: {1 / (110 / PRICES[9]) - 1:+.2%} (smaller ending value than buying and holding)",
+    ]
 
 
 def test_start_before_the_data_uses_the_earliest_candle_and_after_it_is_an_error():

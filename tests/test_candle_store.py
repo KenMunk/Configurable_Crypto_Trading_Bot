@@ -266,7 +266,7 @@ def test_models_on_the_same_candles_compute_a_shared_metric_once(tmp_path, monke
     assert results[0]["trades"] == results[1]["trades"]
 
 
-def test_indicators_on_candles_with_a_brief_crash_removed_get_their_own_columns(tmp_path, store_every_metric):
+def test_flash_crash_profiles_see_the_crash_and_share_the_stored_columns(tmp_path, store_every_metric):
     candles = _candles(400)
     crash = dict(candles[200], low=candles[199]["close"] * 0.4)  # a 60% wick that recovers within the candle
     candles[200] = crash
@@ -274,9 +274,9 @@ def test_indicators_on_candles_with_a_brief_crash_removed_get_their_own_columns(
     flash = _cci_profile()
     flash["strategy"]["flash_crash_buy"] = {"levels": [{"drop": 0.5, "allocation": 0.5}]}
 
-    _same_result(run_backtest(_loaded(tmp_path), flash), run_backtest(candles, flash))
+    with_flash = run_backtest(_loaded(tmp_path), flash)
+    _same_result(with_flash, run_backtest(candles, flash))
     _same_result(run_backtest(_loaded(tmp_path), _cci_profile()), run_backtest(candles, _cci_profile()))
 
-    assert _columns(tmp_path)[6:] == ["CCI(period=20) [flash_crash_filter=0.5]", "CCI(period=20)"]
-    assert not np.allclose(_column(tmp_path, _columns(tmp_path)[6])[200:220],
-                           _column(tmp_path, "CCI(period=20)")[200:220])
+    assert _columns(tmp_path)[6:] == ["CCI(period=20)"]
+    _assert_close(with_flash["series"]["indicators"]["cci"], _column(tmp_path, "CCI(period=20)"))

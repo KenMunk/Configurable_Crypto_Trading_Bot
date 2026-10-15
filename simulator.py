@@ -16,6 +16,7 @@ from backtest import (
     starting_capital_of,
 )
 from friction import FrictionModel, fetch_friction_inputs
+from performance_log import DEFAULT_PATH as PERFORMANCE_LOG, describe_update, update_performance_log
 from model_config import CompiledModel, ProfileError, is_legacy_profile
 from engine import QuantitativeTradingEngine, ensure_coinbase_sdk, load_environment_config
 
@@ -138,16 +139,31 @@ def format_friction(result):
     return lines
 
 
+def versus_buy_and_hold(result):
+    """How much bigger (+) or smaller (-) the model's ending value is than buying and holding."""
+    held = 1 + result["buy_and_hold_return"]
+    return (1 + result["total_return"]) / held - 1 if held > 0 else float("nan")
+
+
 def format_buy_and_hold(result):
-    """Report lines for the buy-and-hold benchmark, which buys when the model first buys."""
-    if result.get("first_entry") is None:
-        return [f"Buy and hold return: {result['buy_and_hold_return']:+.2%} "
-                f"(from the test start, because the model never bought)"]
-    return [
-        f"Buy and hold return: {result['buy_and_hold_return']:+.2%} (buying at the model's first buy, "
-        f"{_format_time(result.get('buy_and_hold_start', result['first_entry']))})",
-        f"Buy and hold from the test start: {result.get('buy_and_hold_from_test_start', float('nan')):+.2%}",
+    """Report lines for the buy-and-hold benchmark, where it starts, and the model's first buy."""
+    start = result.get("buy_and_hold_start", result["period_start"])
+    if start == result["period_start"]:
+        where = f"from the test start, {_format_time(start)}"
+    else:
+        where = f"from {_format_time(start)}, the first candle the model could buy on"
+    versus = versus_buy_and_hold(result)
+    lines = [
+        f"Buy and hold return: {result['buy_and_hold_return']:+.2%} ({where})",
+        f"Model vs buy and hold: {versus:+.2%} "
+        f"({'bigger' if versus >= 0 else 'smaller'} ending value than buying and holding)",
     ]
+    if result.get("requested_start") is None:  # with a start date, format_test_start reports it
+        first = result.get("first_entry")
+        lines.append(f"First buy: {_format_time(first)}" if first is not None else "First buy: none; the model never bought")
+    if start != result["period_start"]:
+        lines.append(f"Buy and hold from the test start: {result['buy_and_hold_from_test_start']:+.2%}")
+    return lines
 
 
 def format_backtest_result(result, recent_trades=10):
@@ -175,9 +191,8 @@ def format_backtest_result(result, recent_trades=10):
         lines += ["", f"Flash-crash events: {len(events):,}"]
         for event in events:
             lasted = "never recovered" if event["minutes"] is None else f"recovered after {event['minutes']:,.0f} min"
-            handling = "ignored as bad data" if event["brief"] else "held through"
             lines.append(f"- {_format_time(event['start_time'])}: from {event['reference']:,.2f} down to "
-                         f"{event['low']:,.2f}, {lasted}; {handling}")
+                         f"{event['low']:,.2f}, {lasted}; held through")
     flash = result["flash_crash_buys"]
     if flash:
         lines += ["", f"Flash-crash buys: {len(flash):,} fills, net {sum(t['pnl'] for t in flash):+,.2f}"]
@@ -309,7 +324,9 @@ COMPARISON_COLUMNS = [
     ("end", "End", 110, "e"),
     ("return", "Return", 90, "e"),
     ("first_buy", "First buy", 120, "w"),
+    ("bh_start", "B&H start", 120, "w"),
     ("buy_and_hold", "Buy & hold", 90, "e"),
+    ("versus", "vs Buy & hold", 105, "e"),
     ("max_drawdown", "Max drawdown", 110, "e"),
     ("window_drawdown", "Worst in window", 125, "e"),
     ("flash", "Flash buys", 80, "e"),
@@ -402,7 +419,9 @@ def comparison_rows(results):
             "end": result["ending_equity"],
             "return": result["total_return"],
             "first_buy": result.get("first_entry"),
+            "bh_start": result.get("buy_and_hold_start", result.get("period_start")),
             "buy_and_hold": result["buy_and_hold_return"],
+            "versus": versus_buy_and_hold(result),
             "max_drawdown": result["max_drawdown"],
             "window_drawdown": result["max_window_drawdown"],
             "flash": len(result["flash_crash_buys"]),
@@ -416,10 +435,14 @@ def comparison_rows(results):
         display["first_buy"] = _short_time(values["first_buy"]) if values["first_buy"] is not None else "never"
         if values["first_buy"] is None:
             values["first_buy"] = float("inf")  # models that never bought sort last
+        display["bh_start"] = _short_time(values["bh_start"]) if values["bh_start"] is not None else "test start"
+        if values["bh_start"] is None:
+            values["bh_start"] = 0
         for key in ("start", "end", "fees", "taxes"):
             display[key] = f"{values[key]:,.2f}"
         for key in ("return", "buy_and_hold"):
             display[key] = f"{values[key]:+.2%}"
+        display["versus"] = f"{values['versus']:+.1%}"
         display["max_drawdown"] = f"{values['max_drawdown']:.1%}"
         display["window_drawdown"] = f"{values['window_drawdown']:.2%} / {result['drawdown_window']}"
         display["flash"] = f"{values['flash']:,}"
@@ -458,6 +481,7 @@ class SimulationWindow:
         self.progress_queue = queue.Queue()
         self.simulation_thread = None
         self.full_screen = False
+        self.performance_log_path = PERFORMANCE_LOG
         self.floor_notes = []  # (chart, note variable) for each chart tab's floor control
 
         self._build_ui()
@@ -943,7 +967,13 @@ class SimulationWindow:
                 result["model_name"] = name
                 result["granularity"] = granularity
                 results.append(result)
-            post(("done", results))
+            path = self.performance_log_path
+            try:
+                logged = describe_update(update_performance_log(
+                    [(result, profile) for result, (_, profile) in zip(results, models)], path), path)
+            except OSError as exc:  # e.g. the CSV is open in Excel; the results still show
+                logged = f"{path.name} not updated ({exc})"
+            post(("done", results, logged))
         except Exception as exc:  # Reported in the window; the worker must not die silently.
             post(("error", exc))
 
@@ -978,7 +1008,7 @@ class SimulationWindow:
             elif kind == "status":
                 self.result_var.set(event[1])
             elif kind == "done":
-                self.results = event[1]
+                self.results, logged = event[1], event[2]
                 self.model_picker["values"] = [result["model_name"] for result in self.results]
                 best = max(range(len(self.results)), key=lambda i: self.results[i]["total_return"])
                 self._show_comparison(self.results)
@@ -987,12 +1017,12 @@ class SimulationWindow:
                     result = self.results[0]
                     self.results_tabs.select(self.chart_tab)
                     self.result_var.set(f"Simulation status: complete ({result['total_return']:+.2%} over "
-                                        f"{result['trade_count']:,} trades)")
+                                        f"{result['trade_count']:,} trades); {logged}")
                 else:
                     self.results_tabs.select(self.comparison_tab)
                     self.result_var.set(
                         f"Simulation status: complete, {len(self.results)} models; best "
-                        f"{self.results[best]['model_name']} {self.results[best]['total_return']:+.2%}")
+                        f"{self.results[best]['model_name']} {self.results[best]['total_return']:+.2%}; {logged}")
                 finished = True
             elif kind == "error":
                 self.result_var.set(f"Simulation status: error - {event[1]}")

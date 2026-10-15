@@ -217,6 +217,65 @@ class Rule:
             return np.minimum(*args)
         return np.maximum(*args)
 
+    # --- readiness --------------------------------------------------------------------
+
+    def ready(self, series):
+        """True where the rule can be evaluated: every value it reads has warmed up.
+
+        Unlike evaluate(), "and" and "or" don't treat an unknown side as false here, so a
+        rule is ready only once all of its parts have values.
+        """
+        length = len(series["close"])
+        return np.broadcast_to(np.asarray(self._ready(self.tree.body, series), dtype=bool), (length,)).copy()
+
+    def _ready(self, node, series):
+        name = self._series_name(node)
+        if name in ("True", "False") or isinstance(node, ast.Constant):
+            return True
+        if name is not None:
+            return ~np.isnan(np.asarray(series[name], dtype=float))
+        if isinstance(node, ast.UnaryOp):
+            return self._ready(node.operand, series)
+        if isinstance(node, ast.BoolOp):
+            parts = node.values
+        elif isinstance(node, ast.BinOp):
+            parts = [node.left, node.right]
+        elif isinstance(node, ast.Compare):
+            parts = [node.left, *node.comparators]
+        else:
+            return self._call_ready(node, series)
+        result = True
+        for part in parts:
+            result = np.logical_and(result, self._ready(part, series))
+        return result
+
+    def _call_ready(self, node, series):
+        function = node.func.id
+        ready, periods = True, 1
+        for argument, kind in zip(node.args, FUNCTIONS[function][1]):
+            if kind.startswith("periods"):
+                periods = parse_period(argument.value, self.granularity_seconds)
+            else:
+                ready = np.logical_and(ready, self._ready(argument, series))
+        if function in ("abs", "min", "max"):
+            return ready
+        known = np.broadcast_to(np.asarray(ready, dtype=float), (len(series["close"]),))
+        if function in ("crosses_above", "crosses_below"):
+            return (known == 1) & (shift(known, 1) == 1)
+        if function == "previous":
+            return shift(known, periods) == 1
+        if function in ("change", "pct_change"):
+            return (known == 1) & (shift(known, periods) == 1)
+        return rolling_min(known, periods) == 1  # highest() and lowest() read the whole window
+
+
+def rules_ready(compiled, series, length):
+    """True where every rule of a compiled signal can be evaluated."""
+    ready = np.ones(length, dtype=bool)
+    for rule in compiled["all"] + compiled["any"]:
+        ready &= rule.ready(series)
+    return ready
+
 
 def evaluate_rules(compiled, series, length):
     """True where every "all" rule holds and, if any are listed, at least one "any" rule."""

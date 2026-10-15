@@ -198,24 +198,19 @@ def _start_of_year(year):
     return int(datetime(year, 1, 1, tzinfo=timezone.utc).timestamp())
 
 
-FLASH_CRASH_BRIEF_SECONDS = 3_600  # a crash that recovers within an hour is treated as bad data
-
-
 def find_flash_crashes(candles, drop, granularity_seconds):
-    """Find flash crashes and return (episodes, candles as the strategy should see them).
+    """Find the flash crashes in `candles`.
 
     A crash starts when a candle trades `drop` or more below the previous close, and it
-    recovers at the first close back above that level. One that recovers within an hour
-    is treated as a bad data point: in the returned candles its prices are replaced by the
-    pre-crash close, so indicators, stops and valuation ignore it. A longer crash is left
-    as it happened. The input list is not modified.
+    recovers at the first close back above that level. Crashes are only located here: the
+    candles are left as they traded, so the strategy sees every crash's real prices.
     """
     if not drop:
-        return [], candles
-    episodes, clean = [], list(candles)
+        return []
+    episodes = []
     i = 1
     while i < len(candles):
-        reference = clean[i - 1]["close"]
+        reference = candles[i - 1]["close"]
         threshold = reference * (1 - drop)
         if candles[i]["low"] > threshold:
             i += 1
@@ -225,25 +220,14 @@ def find_flash_crashes(candles, drop, granularity_seconds):
             j += 1
         recovered = j < len(candles)
         lasted = (candles[j]["start"] + granularity_seconds - candles[i]["start"]) if recovered else None
-        brief = recovered and lasted <= FLASH_CRASH_BRIEF_SECONDS
         last = j if recovered else len(candles) - 1
         episodes.append({
             "start": i, "end": j if recovered else None, "reference": reference, "threshold": threshold,
-            "low": min(candle["low"] for candle in candles[i:last + 1]), "brief": brief,
+            "low": min(candle["low"] for candle in candles[i:last + 1]),
             "start_time": candles[i]["start"], "minutes": lasted / 60 if recovered else None,
         })
-        if brief:
-            for k in range(i, j + 1):
-                fixed = dict(candles[k])
-                for key in ("open", "close"):
-                    if fixed[key] <= threshold:
-                        fixed[key] = reference
-                if fixed["low"] <= threshold:
-                    fixed["low"] = min(fixed["open"], fixed["close"])
-                fixed["high"] = max(fixed["high"], fixed["open"], fixed["close"])
-                clean[k] = fixed
         i = j + 1 if recovered else len(candles)
-    return episodes, clean
+    return episodes
 
 
 def flash_crash_levels_of(profile):
@@ -307,9 +291,10 @@ def run_backtest(candles, profile, starting_capital=None, progress=None, frictio
     `start_time`. With `wait_for_fresh_signal`, an entry signal already true at the start
     is not taken; the model waits for it to switch off and fire again.
 
-    Buy and hold is measured from the close of the candle where the model first buys on
-    its entry signal, so both start investing at the same moment; a model that never
-    buys is compared with buying at the start.
+    Buy and hold is measured from the close of the first candle on which the model could
+    buy, once every entry rule's indicators and lookbacks have warmed up (or its first buy,
+    if that came sooner). The indicator warm-up then doesn't count against the model,
+    while its choice to wait in cash after that does.
 
     Entry and exit rules (see model_config.py) are evaluated on each candle's close and
     filled at that close. Hard stops and profit locks trigger intrabar on the candle's low/high and
@@ -336,22 +321,16 @@ def run_backtest(candles, profile, starting_capital=None, progress=None, frictio
     if strategy.get("direction", "LONG_ONLY") != "LONG_ONLY":
         raise ValueError("Only LONG_ONLY strategies can be simulated so far")
 
-    # Flash crashes that recover within an hour are removed from what the strategy sees;
-    # longer ones stay. The raw candles still drive the flash-crash buys.
     flash_levels = flash_crash_levels_of(profile)
-    crash_episodes, market_candles = find_flash_crashes(
-        candles, flash_levels[0][0] if flash_levels else None, granularity_seconds)
+    crash_episodes = find_flash_crashes(candles, flash_levels[0][0] if flash_levels else None, granularity_seconds)
 
     # Indicators and signals are computed on the full history, so the earlier candles
     # serve as warm-up; the test itself covers only the candles from the start time on.
     # Candles from load_candles carry a metric cache that every model on them shares.
     metrics = getattr(candles, "metrics", None)
-    if metrics is not None:
-        filtered = any(episode["brief"] for episode in crash_episodes)
-        variant = f"flash_crash_filter={flash_levels[0][0]}" if filtered else None
-        indicator_series, entry_signals, exit_signals = model.evaluate(metrics.cache(market_candles, variant))
-    else:
-        indicator_series, entry_signals, exit_signals = model.evaluate(market_candles)
+    indicator_series, entry_signals, exit_signals = model.evaluate(
+        metrics.cache(candles) if metrics is not None else candles)
+    entry_ready = model.entry_ready(indicator_series)
     first = 0
     if start_time is not None:
         first = bisect.bisect_left([candle["start"] for candle in candles], start_time)
@@ -359,7 +338,6 @@ def run_backtest(candles, profile, starting_capital=None, progress=None, frictio
             raise ValueError(f"The start date {_format_day(start_time)} is after the last candle "
                              f"({_format_day(candles[-1]['start'])})")
     candles = candles[first:]
-    market_candles = market_candles[first:]
     # Which flash crash, if any, each candle of the test belongs to.
     episode_at = [None] * len(candles)
     for episode in crash_episodes:
@@ -368,6 +346,7 @@ def run_backtest(candles, profile, starting_capital=None, progress=None, frictio
             episode_at[full_index - first] = episode
         episode["filled"] = set()
     entry_signals = entry_signals[first:].tolist()
+    entry_ready = entry_ready[first:]
     exit_signals = exit_signals[first:].tolist() if exit_signals is not None else None
     indicator_series = {name: values[first:] for name, values in indicator_series.items()}
     waiting_for_fresh_signal = wait_for_fresh_signal
@@ -509,7 +488,7 @@ def run_backtest(candles, profile, starting_capital=None, progress=None, frictio
             flash_lots.append({"episode": episode, "drop": drop, "time": candle["start"], "price": limit_price,
                                "cost": spend, "fee": fee, "units": (spend - fee) / limit_price})
 
-    def sell_the_rebound(candle, episode, mark_price):
+    def sell_the_rebound(candle, episode):
         """Sell the lots bought in a flash crash at the close of the candle it recovered in."""
         nonlocal cash, fees_paid
         for lot in [lot for lot in flash_lots if lot["episode"] is episode]:
@@ -528,17 +507,15 @@ def run_backtest(candles, profile, starting_capital=None, progress=None, frictio
                 "position_cost": lot["cost"], "pnl": pnl, "fees": lot["fee"] + fee,
                 "return": (proceeds - fee) / lot["cost"] - 1,
                 "entry_reason": f"FLASH_CRASH_BUY_{lot['drop']:.0%}", "exit_reason": "FLASH_REBOUND_SELL",
-                "equity_after": cash + (units + sum(held["units"] for held in flash_lots)) * mark_price,
+                "equity_after": cash + (units + sum(held["units"] for held in flash_lots)) * candle["close"],
             })
 
     total = len(candles)
     report_every = max(1, total // 100)
     equity_series = []
 
-    for index, raw_candle in enumerate(candles):
+    for index, candle in enumerate(candles):
         entry_signal = entry_signals[index]
-        # The strategy trades on the market as it should be seen: a brief flash crash is ignored.
-        candle = market_candles[index]
         episode = episode_at[index]
 
         day = candle["start"] // 86_400
@@ -549,12 +526,14 @@ def run_backtest(candles, profile, starting_capital=None, progress=None, frictio
             tax_year += 1
             next_tax_settlement = _start_of_year(tax_year + 1)
         if episode is not None:
-            buy_the_crash(raw_candle, episode)
-        # During a crash that lasts over an hour, keep holding: nothing is sold until it recovers.
-        holding_through_crash = episode is not None and not episode["brief"] and index != (
-            episode["end"] - first if episode["end"] is not None else None)
+            buy_the_crash(candle, episode)
+        # The model never sells into a flash crash. No stop or profit target fires on a crash
+        # candle, the one it recovers in included, since that candle traded in the crash; exit
+        # rules and the drawdown limit resume at the recovery candle's close.
+        recovered_now = episode is not None and episode["end"] is not None and index == episode["end"] - first
+        holding_through_crash = episode is not None and not recovered_now
 
-        if entry is not None and not holding_through_crash:
+        if entry is not None and episode is None:
             stops = []
             if use_hard_stop and hard_stop_pct:
                 stops.append((entry["price"] * (1 - hard_stop_pct), "HARD_STOP"))
@@ -578,12 +557,12 @@ def run_backtest(candles, profile, starting_capital=None, progress=None, frictio
                     drawdown_pauses.append({"paused_at": candle["start"], "resumed_at": None})
             elif profit_lock and candle["high"] >= target_price:
                 sell(candle, max(target_price, candle["open"]), "PROFIT_LOCK")
-            elif exit_signals is not None and exit_signals[index]:
-                sell(candle, candle["close"], "EXIT_SIGNAL")
+        if entry is not None and not holding_through_crash and exit_signals is not None and exit_signals[index]:
+            sell(candle, candle["close"], "EXIT_SIGNAL")
         if entry is not None:
             entry["highest"] = max(entry["highest"], candle["high"])
-        if episode is not None and episode["end"] is not None and index == episode["end"] - first:
-            sell_the_rebound(raw_candle, episode, candle["close"])
+        if recovered_now:
+            sell_the_rebound(candle, episode)
 
         equity = cash + (units + sum(lot["units"] for lot in flash_lots)) * candle["close"]
         peak_equity = max(peak_equity, equity)
@@ -591,7 +570,7 @@ def run_backtest(candles, profile, starting_capital=None, progress=None, frictio
         limit_peak_equity = max(limit_peak_equity, equity)
         record_equity(index, equity)
         max_window_drawdown = max(max_window_drawdown, 1 - equity / window_peak(index))
-        if (not window_limited and not paused and max_drawdown_limit
+        if (not window_limited and not paused and max_drawdown_limit and not holding_through_crash
                 and 1 - equity / limit_peak_equity >= max_drawdown_limit):
             # Pause until the next prime opportunity: the entry signal has to switch off
             # (the trend that failed has ended) and then fire afresh before trading resumes.
@@ -632,7 +611,7 @@ def run_backtest(candles, profile, starting_capital=None, progress=None, frictio
         if progress is not None and (index % report_every == 0 or index == total - 1):
             progress((index + 1) / total, f"{index + 1:,} / {total:,} candles, {len(trades):,} trades")
 
-    last = market_candles[-1]
+    last = candles[-1]
     ending_equity = cash + (units + sum(lot["units"] for lot in flash_lots)) * last["close"]
     wins = [trade for trade in trades if trade["pnl"] > 0]
     # The final, unfinished year's tax isn't due yet; estimate it for the report.
@@ -641,24 +620,29 @@ def run_backtest(candles, profile, starting_capital=None, progress=None, frictio
     # The strategy's first signal entry; flash-crash fills are opportunistic and reported separately.
     first_entry = next((trade["entry_time"] for trade in trades if trade["entry_reason"] == "ENTRY_SIGNAL"),
                        entry["time"] if entry else None)
-    benchmark_index = 0
+    # Buy and hold starts on the first candle the model could have bought on, or at its
+    # first buy if that came sooner (an "or" rule can fire before all its parts warm up).
+    ready_index = int(entry_ready.argmax()) if entry_ready.any() else None
+    starts = [] if ready_index is None else [ready_index]
     if first_entry is not None:
-        benchmark_index = bisect.bisect_left([candle["start"] for candle in market_candles], first_entry)
+        starts.append(bisect.bisect_left([candle["start"] for candle in candles], first_entry))
+    benchmark_index = min(starts, default=0)
     return {
         "product_id": profile.get("product_id"),
         "requested_start": start_time,
         "waited_for_fresh_signal": wait_for_fresh_signal,
         "warmup_candles": first,
         "first_entry": first_entry,
+        "ready_to_trade": candles[ready_index]["start"] if ready_index is not None else None,
         "period_start": candles[0]["start"],
         "period_end": last["start"],
         "candle_count": total,
         "starting_capital": float(starting_capital),
         "ending_equity": ending_equity,
         "total_return": ending_equity / starting_capital - 1,
-        "buy_and_hold_start": market_candles[benchmark_index]["start"],
-        "buy_and_hold_return": last["close"] / market_candles[benchmark_index]["close"] - 1,
-        "buy_and_hold_from_test_start": last["close"] / market_candles[0]["close"] - 1,
+        "buy_and_hold_start": candles[benchmark_index]["start"],
+        "buy_and_hold_return": last["close"] / candles[benchmark_index]["close"] - 1,
+        "buy_and_hold_from_test_start": last["close"] / candles[0]["close"] - 1,
         "max_drawdown": max_drawdown,
         "max_window_drawdown": max_window_drawdown,
         "drawdown_window": window_setting,
@@ -672,7 +656,7 @@ def run_backtest(candles, profile, starting_capital=None, progress=None, frictio
         "screened_signals": screened_signals,
         "flash_crash_buys": [trade for trade in trades if trade["entry_reason"].startswith("FLASH_CRASH_BUY")],
         "flash_crash_events": [
-            {key: episode[key] for key in ("start_time", "reference", "low", "brief", "minutes")}
+            {key: episode[key] for key in ("start_time", "reference", "low", "minutes")}
             for episode in crash_episodes if episode["end"] is None or episode["end"] >= first],
         "open_flash_lots": len(flash_lots),
         "friction": friction.describe(candles[0]["close"], starting_capital * position_fraction),

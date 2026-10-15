@@ -62,7 +62,7 @@ def _day(timestamp):
 
 
 def buy_and_hold_values(result):
-    """The value of buying at the model's first buy and holding: the starting capital until then."""
+    """The value of buying at the benchmark's start and holding: the starting capital until then."""
     closes = np.asarray(result["series"]["close"], dtype=float)
     times = np.asarray(result["series"]["time"])
     start = int(np.searchsorted(times, result.get("buy_and_hold_start", times[0])))
@@ -444,8 +444,8 @@ class ModelValueChart(_HoverChart):
         self.run_x = [mdates.date2num(run_times) for run_times in self.run_times]
         self.run_values = [np.asarray(run["series"]["equity"]) for run in runs]
 
-        # One buy-and-hold line per product and starting value, bought at a model's first buy:
-        # the chosen model's where it trades that product, otherwise the first such model's.
+        # One buy-and-hold line per product and starting value, starting where a model could
+        # first buy: the chosen model's where it trades that product, otherwise the first such model's.
         self.benchmarks = {}
         for position in [primary] + [p for p in range(len(runs)) if p != primary]:
             run = runs[position]
@@ -455,10 +455,17 @@ class ModelValueChart(_HoverChart):
         for capital in sorted({run["starting_capital"] for run in runs}):
             ax.axhline(capital, color=MUTED_INK, linewidth=1, zorder=1, label=f"Starting capital ({capital:,.0f})")
         for (product, capital), (position, values) in self.benchmarks.items():
-            label = ("Buy and hold" if len(self.benchmarks) == 1 else f"Buy and hold {product} ({capital:,.0f})")
+            run = runs[position]
+            start = run.get("buy_and_hold_start", run["series"]["time"][0])
+            label = "Buy and hold" if len(self.benchmarks) == 1 else f"Buy and hold {product} ({capital:,.0f})"
+            label += f" from {_day(start)}"
             if not single:
-                label += f" from {runs[position].get('model_name', f'model {position + 1}')}'s first buy"
+                label += f" ({run.get('model_name', f'model {position + 1}')}'s start)"
             ax.plot(self.run_times[position], values, color=BENCHMARK_COLOR, linewidth=1, zorder=2, label=label)
+            # An open circle marks where buy and hold starts, since every model's start can differ.
+            at = int(np.searchsorted(np.asarray(run["series"]["time"]), start))
+            ax.plot([self.run_times[position][at]], [values[at]], marker="o", markersize=7, color=BENCHMARK_COLOR,
+                    markerfacecolor=SURFACE, markeredgewidth=1.5, linestyle="none", zorder=5, label="_nolegend_")
 
         for position, run in enumerate(runs):
             values = self.run_values[position]
@@ -490,7 +497,7 @@ class ModelValueChart(_HoverChart):
             title = f"{primary_run['product_id']} model value over time"
             bought = primary_run.get("buy_and_hold_start", primary_run["series"]["time"][0])
             subtitle = (f"Started at {start_value:,.2f}; model {primary_run['total_return']:+.2%}, "
-                        f"buy and hold {primary_run['buy_and_hold_return']:+.2%} from the first buy ({_day(bought)})")
+                        f"buy and hold {primary_run['buy_and_hold_return']:+.2%} from {_day(bought)}")
         else:
             products = ", ".join(sorted({run["product_id"] for run in runs}))
             best = max(runs, key=lambda run: run["total_return"])

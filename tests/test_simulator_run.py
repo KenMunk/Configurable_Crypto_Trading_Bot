@@ -1,6 +1,8 @@
 import queue
 from types import SimpleNamespace
 
+import pytest
+
 from simulator import SimulationWindow, comparison_rows, group_by_market, model_names
 from tests.test_backtest import FakeCandleClient, _profile
 
@@ -17,6 +19,7 @@ def _worker_events(auth_result, tmp_path, monkeypatch, models=None):
     monkeypatch.setattr("simulator.fetch_friction_inputs", lambda client, profiles: {})  # no network in tests
     window = SimulationWindow.__new__(SimulationWindow)  # the worker needs no Tk widgets
     window.progress_queue = queue.Queue()
+    window.performance_log_path = tmp_path / "model_performance.csv"
     tested_clients = []
 
     def authenticate_coinbase(client=None, **kwargs):
@@ -59,6 +62,8 @@ def test_simulation_tests_the_api_before_gathering_data(tmp_path, monkeypatch):
     assert first_data > kinds.index("auth")
     assert kinds[-1] == "done"
     assert [result["model_name"] for result in events[-1][1]] == ["model_a"]
+    assert events[-1][2] == "model_performance.csv: 1 added"
+    assert (tmp_path / "model_performance.csv").read_text(encoding="utf-8").splitlines()[1].startswith("model_a,")
 
 
 def test_simulation_stops_when_the_api_test_fails(tmp_path, monkeypatch):
@@ -130,6 +135,9 @@ def test_comparison_rows_format_headline_results():
     row = comparison_rows([result])[0]
 
     assert row["display"]["first_buy"] == "never"  # this result has no first_entry
+    assert row["display"]["bh_start"] == "test start"  # nor a buy_and_hold_start
+    assert row["display"]["versus"] == "-33.0%"  # 92.135x against buy and hold's 137.5x
+    assert row["sort"]["versus"] == pytest.approx(92.135 / 137.5 - 1)
     assert row["sort"]["first_buy"] == float("inf")
     assert row["display"]["end"] == "921,352.40"
     assert row["display"]["return"] == "+9113.50%"

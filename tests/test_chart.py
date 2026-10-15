@@ -124,7 +124,7 @@ def test_model_value_chart_plots_value_against_buy_and_hold():
     canvas.draw()
 
     labels = [line.get_label() for line in chart.ax.get_lines() if not line.get_label().startswith("_")]
-    assert labels == ["Starting capital (10,000)", "Buy and hold", "Model value"]
+    assert labels == ["Starting capital (10,000)", "Buy and hold from 1970-01-01", "Model value"]
     assert chart.model_values[-1] == result["ending_equity"]
     assert chart.benchmark_values[-1] == 10_000 * (1 + result["buy_and_hold_return"])
 
@@ -133,20 +133,22 @@ def test_model_value_chart_plots_value_against_buy_and_hold():
     assert "Model value  10,000.00 (+0.00%)" in chart.tooltip.get_text()
 
 
-def test_buy_and_hold_line_waits_for_the_models_first_buy():
+def test_buy_and_hold_line_starts_where_the_model_could_first_buy_and_is_marked():
     _, result = _chart_with_result()
     figure = Figure(figsize=(8, 4), dpi=100)
     chart = ModelValueChart(figure, FigureCanvasAgg(figure))
     chart.show(result)
 
     times = result["series"]["time"]
-    bought = times.index(result["first_entry"])
-    assert bought > 0  # the indicators need a few candles first
+    start = times.index(result["buy_and_hold_start"])
+    assert start > 0  # the indicators need a few candles first
     closes = result["series"]["close"]
-    assert list(chart.benchmark_values[:bought + 1]) == [10_000] * (bought + 1)
-    assert chart.benchmark_values[-1] == pytest.approx(10_000 * closes[-1] / closes[bought])
+    assert list(chart.benchmark_values[:start + 1]) == [10_000] * (start + 1)
+    assert chart.benchmark_values[-1] == pytest.approx(10_000 * closes[-1] / closes[start])
     assert chart.benchmark_values[-1] == pytest.approx(10_000 * (1 + result["buy_and_hold_return"]))
-    assert "from the first buy (1970-01-01)" in chart.ax.get_title(loc="right")
+    assert chart.ax.get_title(loc="right").endswith("from 1970-01-01")
+    start_marker = [line for line in chart.ax.get_lines() if line.get_markerfacecolor() == "#fcfcfb"]
+    assert len(start_marker) == 1 and list(start_marker[0].get_ydata()) == [10_000]
 
 
 def test_model_value_chart_labels_the_starting_and_ending_value():
@@ -181,7 +183,7 @@ def test_model_value_chart_compares_several_models():
     canvas.draw()
 
     labels = [line.get_label() for line in chart.ax.get_lines() if not line.get_label().startswith("_")]
-    assert labels[:2] == ["Starting capital (10,000)", "Buy and hold from steady's first buy"]
+    assert labels[:2] == ["Starting capital (10,000)", "Buy and hold from 1970-01-01 (steady's start)"]
     assert labels[2].startswith("quick: ") and labels[3].startswith("steady: ")
     assert chart.model_values is chart.run_values[1]  # the hover follows the primary model
     assert "2 models" in chart.ax.get_title(loc="left")

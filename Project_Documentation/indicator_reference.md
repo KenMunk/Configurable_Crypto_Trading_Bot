@@ -414,7 +414,7 @@ Division by zero also gives an unknown value rather than an error.
 Each candle is processed in this order:
 
 1. **Taxes** for a finished calendar year are settled when a new year begins. They count as withdrawals, not losses, in every drawdown figure.
-2. **Flash crashes**, if `strategy.flash_crash_buy` is set: any resting limit buy the candle traded down to fills at its price and is held until the crash recovers. A crash that recovers within an hour is ignored by everything below; during a longer one, steps 3 and 4 are skipped until it recovers (see [flash_crash_buy](model_configuration.md#flash_crash_buy)).
+2. **Flash crashes**, if `strategy.flash_crash_buy` is set: any resting limit buy the candle traded down to fills at its price and is held until the crash recovers. Until the crash recovers, nothing below sells: stops and profit locks are skipped on every crash candle, including the one it recovers in, and exit rules and the drawdown limit wait for the recovery candle's close (see [flash_crash_buy](model_configuration.md#flash_crash_buy)).
 3. **Exits**, if a position is open, checked in priority order:
    1. **Stops**:
       - the hard stop, if `safeguards.use_hard_stop` and `exit_signal.hard_stop_trigger` are true, at `entry price x (1 - hard_stop_percentage)`

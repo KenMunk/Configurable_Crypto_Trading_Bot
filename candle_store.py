@@ -205,17 +205,16 @@ class StoredMetricCache(MetricCache):
 
     The values it gives are the ones the metric computed over just these candles gives, as
     with a plain MetricCache: stored values that fall within a metric's warm-up on these
-    candles are not used. `variant` names how the candles were changed from the stored
-    ones (by the flash-crash filter), and is added to the column names.
+    candles are not used.
     """
 
-    def __init__(self, candles, store, table, variant=None):
+    def __init__(self, candles, store, table):
         super().__init__(candles)
-        self.store, self.table, self.variant = store, table, variant
+        self.store, self.table = store, table
 
-    def _column(self, key, output):
-        name = f"{key}.{output}" if output else key
-        return f"{name} [{self.variant}]" if self.variant else name
+    @staticmethod
+    def _column(key, output):
+        return f"{key}.{output}" if output else key
 
     def _compute(self, key, compute, lookback):
         if lookback is None or len(self) < max(lookback.values()):
@@ -275,20 +274,16 @@ class StoredMetricCache(MetricCache):
 
 
 class MarketMetrics:
-    """The metric caches for one market's candles, shared by every model run on them.
-
-    Models share the cache of the candles they evaluate: the raw candles, or the candles
-    with brief flash crashes removed, as `variant` describes.
-    """
+    """The metric caches for one market's candles, shared by every model run on them."""
 
     def __init__(self, store, table):
         self.store, self.table = store, table
         self._caches = {}
 
-    def cache(self, candles, variant=None):
-        key = (variant, len(candles), candles[0]["start"], candles[-1]["start"])
+    def cache(self, candles):
+        key = (len(candles), candles[0]["start"], candles[-1]["start"])
         if key not in self._caches:
-            self._caches[key] = StoredMetricCache(candles, self.store, self.table, variant)
+            self._caches[key] = StoredMetricCache(candles, self.store, self.table)
         return self._caches[key]
 
 

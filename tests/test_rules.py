@@ -23,6 +23,24 @@ def _rule(text):
     return Rule(text, NAMES, FIFTEEN_MINUTES)
 
 
+def test_ready_marks_where_every_part_of_a_rule_has_warmed_up():
+    nan = np.nan
+    series = _series(close=np.arange(10), fast=[nan] * 2 + [1] * 8, slow=[nan] * 5 + [1] * 5)
+
+    def ready(text):
+        return _rule(text).ready(series).tolist()
+
+    assert ready("close > 0") == [True] * 10
+    assert ready("fast > 0") == [False] * 2 + [True] * 8
+    assert ready("fast > 0 or slow > 0") == [False] * 5 + [True] * 5  # "or" waits for both sides
+    assert ready("not (slow > 0)") == [False] * 5 + [True] * 5
+    assert ready("change(fast, 3) > 0") == [False] * 5 + [True] * 5
+    assert ready("previous(slow) > 0") == [False] * 6 + [True] * 4
+    assert ready("highest(close, 4) > 0") == [False] * 3 + [True] * 7
+    assert ready("crosses_above(fast, 0)") == [False] * 3 + [True] * 7
+    assert ready("lowest((fast > 0) and (close > 1), 2) >= 1") == [False] * 3 + [True] * 7
+
+
 def test_comparisons_arithmetic_and_boolean_logic():
     series = _series(close=[1, 2, 3, 4], fast=[1, 3, 2, 5], slow=[2, 2, 2, 2], rsi=[10, 50, 80, 60])
 

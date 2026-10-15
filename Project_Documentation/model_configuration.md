@@ -327,9 +327,11 @@ How a flash crash plays out:
 - **The crash starts** when a candle trades down to the shallowest level. It lasts until the first candle that closes back above that level.
 - **Fills:** each level fills at most once per crash, at its own price, and pays the **maker** fee because the order was resting on the book. Levels fill independently of the main strategy's position and don't count towards `max_orders_per_day`.
 - **The sale:** what the levels bought is held until the crash recovers. It is then sold at the recovery candle's close, paying the taker fee and slippage.
-- **The model never sells into a crash.** What happens depends on how long the crash lasts:
-  - **Recovers within an hour** (April 2017's recovered in about 15 minutes): the crash is treated as a bad data point. For the strategy, the crash candles' prices below the level are replaced by the pre-crash close. Indicators, stops, the model's value and the drawdown figures all ignore the crash.
-  - **Lasts longer than an hour:** the model keeps holding. No stop, profit target or exit rule sells during the crash, and the real prices count in its value and drawdown. Normal trading resumes from the recovery candle. If the crash never recovers, everything stays held.
+- **The model never sells into a crash**, however long it lasts (April 2017's recovered within its 15-minute candle):
+  - No stop or profit target fires on a crash candle, including the candle it recovers in, because that candle traded in the crash. Stops resume from the next candle.
+  - No exit rule or drawdown limit sells until the recovery candle's close.
+  - The crash is never removed from the data. Its real prices count in the indicators, the model's value and the drawdown figures.
+  - If the crash never recovers, everything stays held.
 
 Without `flash_crash_buy`, there is no crash handling: a stop fills at whatever price a candle gapped to, as a stop-market order would.
 

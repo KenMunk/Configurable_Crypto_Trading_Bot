@@ -26,7 +26,7 @@ from indicators import (
     price_scale_outputs,
     resolve_parameters,
 )
-from rules import FUNCTIONS, Rule, RuleError, evaluate_rules
+from rules import FUNCTIONS, Rule, RuleError, evaluate_rules, rules_ready
 
 LEGACY_INDICATOR_KEYS = ("fast_window_periods", "slow_window_periods", "emergency_ema_periods")
 
@@ -191,6 +191,10 @@ class CompiledModel:
         exit_signal = (evaluate_rules(self.exit_rules, series, len(candles))
                        if self.exit_rules["all"] or self.exit_rules["any"] else None)
         return series, entry, exit_signal
+
+    def entry_ready(self, series):
+        """True on each candle where every entry rule can be evaluated, past all warm-ups."""
+        return rules_ready(self.entry_rules, series, len(series["close"]))
 
     def indicator_meta(self):
         """Per-indicator labels and outputs, for charts, tooltips and reports."""
