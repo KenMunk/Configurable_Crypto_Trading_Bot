@@ -1,0 +1,80 @@
+{
+  "market": {
+    "product": "BTC-USD",
+    "prefix": "search",
+    "template_profile": "config/.example/btc_growth_09.example.json",
+    "granularities": ["ONE_DAY"],
+    "reference_fallback_granularity": "ONE_DAY"
+  },
+  "windows": {
+    "train_start": "2018-01-01",
+    "holdout_start": "2024-01-01"
+  },
+  "search": {
+    "population": 50,
+    "keep": 10,
+    "elites": 10,
+    "generators": 2,
+    "evaluators": 1,
+    "batch_size": 50,
+    "min_generations": 3,
+    "max_generations": 10,
+    "patience": 3,
+    "tolerance": 0.01,
+    "seed": 1
+  },
+  "fitness": {
+    "drawdown_weight": 1.0,
+    "min_trades": 2,
+    "trade_penalty": 0.1
+  },
+  "breeding": {
+    "mutate": 0.5,
+    "crossover": 0.2,
+    "tournament_size": 2,
+    "max_atoms": 4,
+    "confirm_sizes": [2],
+    "mutations_per_child": [1],
+    "neighbor_span": 2
+  },
+  "analysis": {
+    "top_fraction": 0.25,
+    "shrink": 5.0,
+    "weight_floor": 0.5,
+    "weight_cap": 2.0,
+    "reference_half_weight_models": 100,
+    "report_min_support": 5,
+    "report_min_atom_support": 5,
+    "reference_min_support": 3
+  },
+  "options": {
+    "entry_n": [1, 2],
+    "exit_n": [1, 2],
+    "entry_ratio": [1.0],
+    "exit_ratio": [0.0],
+    "exit_mode": ["same", "own"],
+    "confirm": [0],
+    "entry_persist_h": [0],
+    "exit_persist_h": [0],
+    "lock": [0],
+    "trail": [0],
+    "stop": [0, 0.1],
+    "target": [0],
+    "dd_limit": [0],
+    "pos": [1.0]
+  },
+  "atoms": [
+    {"family": "price_above_{type}", "expr": "close > {ma}",
+     "indicators": {"ma": {"type": "{type}", "period": "{period}"}},
+     "grid": {"type": ["SMA", "EMA"], "period": ["50d", "200d"]}},
+    {"family": "cross_{type}", "expr": "{fast} > {slow}",
+     "indicators": {"fast": {"type": "{type}", "period": "{fast_period}"},
+                    "slow": {"type": "{type}", "period": "{slow_period}"}},
+     "grid": {"type": ["SMA"]},
+     "cases": [{"fast_period": "50d", "slow_period": "200d"}]},
+    {"family": "macd_signal", "expr": "{macd}.line > {macd}.signal",
+     "indicators": {"macd": {"type": "MACD"}}},
+    {"family": "rsi", "expr": "{rsi} > {level}",
+     "indicators": {"rsi": {"type": "RSI", "period": 14}}, "grid": {"level": [50]}}
+  ]
+}

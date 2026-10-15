@@ -42,6 +42,7 @@ Each strategy is a JSON **model profile**. A profile names its indicators, write
 | **Simulator** | `python simulator.py` | A desktop app that backtests one or more model profiles over up to 10 years of Coinbase candles. It charges fees, slippage and taxes, and shows the results in sortable tables and interactive charts. | Working |
 | **Trader** | `python engine.py` | The headless runtime for an always-on machine. It loads profiles from `quant_system/config/` (one per ticker), opens its ledger and serial link, and starts a status dashboard with an on-demand Coinbase authentication check. Run directly, it exits as soon as start-up finishes; the [Trader guide](Project_Documentation/trader.md#keeping-the-engine-running) has a launcher that keeps it running. | Foundation only; does not trade yet |
 | **Model profiles** | `config/*.json` | Declarative strategy definitions in one format for both tools (the simulator reads `config/`; `python engine.py` reads `quant_system/config/`): 24 indicators, a safe rule language, and settings for friction, capital and safeguards. | Working |
+| **Model search** | `python model_search.py` | Breeds and backtests generations of vote-based models for one market, seeded by your existing models and their logged results, until improvement plateaus. Writes the best to `config/` and the performance log. Everything it searches over comes from a private settings file in `search_config/` ([README](search_config/README.md)). | Working |
 
 ---
 
@@ -271,6 +272,7 @@ Configurable_Crypto_Trading_Bot/
 ├── backtest.py               Candle download; the backtest engine
 ├── candle_store.py           Candle cache and stored indicators (SQLite)
 ├── performance_log.py        Model performance log (data/model_performance.csv)
+├── model_search.py           Evolutionary model search (settings in search_config/)
 ├── model_config.py           Profile validation and compilation
 ├── indicators.py             Indicator library
 ├── rules.py                  Signal rule language
@@ -282,6 +284,9 @@ Configurable_Crypto_Trading_Bot/
 ├── config/
 │   ├── .example/             Public template profiles (tracked)
 │   └── *.json                Your private profiles (ignored by Git)
+├── search_config/
+│   ├── .example/             Public template search settings (tracked)
+│   └── *.json                Your private search settings (ignored by Git)
 ├── data/                     Candle cache (candles.db) and model performance log, created on first run (ignored by Git)
 ├── ledger/                   Ledger database for the repository-root base directory
 ├── quant_system/             Default base directory of `python engine.py`
@@ -298,6 +303,7 @@ Every folder has its own `README.md` that explains what the folder holds and how
 | [Project_Documentation/](Project_Documentation/README.md) | An index of every documentation page, grouped into guides, references and design documents, with a suggested reading order |
 | [config/](config/README.md) | Where private model profiles live, how to add one, and which tools read the folder |
 | [config/.example/](config/.example/README.md) | What each template profile demonstrates, and the rules for public templates |
+| [search_config/](search_config/README.md) | The model search's settings file: every key, writing atoms, and keeping the search space private |
 | [ledger/](ledger/README.md) | Why the simulator creates this database, and what it holds |
 | [quant_system/](quant_system/README.md) | The trader's default base directory: its profiles, its ledger, and path pitfalls |
 | [quant_system/ledger/](quant_system/ledger/README.md) | The trader's ledger, and the blueprint's plans for it |
@@ -316,6 +322,7 @@ The `data/` folder is created by the simulator's first run and is ignored by Git
 | `.env.example` | Tracked | The template for `.env` |
 | `config/*.json` | Ignored | Your private model profiles |
 | `config/.example/` | Tracked | Public template profiles |
+| `search_config/` | Ignored | Your model search settings, apart from the README and `.example/` |
 | `quant_system/config/` | Ignored | The profiles loaded by `python engine.py` |
 | `data/` | Ignored | The cached candle history and stored indicators (`candles.db`), and `model_performance.csv`. A `*_FIFTEEN_MINUTE.csv` cache left by an earlier version can be deleted once it has been imported. |
 | `cdp_api_key*.json` | Ignored | Coinbase key files, if you keep them in the repository folder |

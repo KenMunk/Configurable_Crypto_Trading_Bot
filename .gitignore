@@ -164,6 +164,10 @@ config/*
 !config/README.md
 # Profiles loaded by `python engine.py`, whose base directory is quant_system/
 quant_system/config/
+# Private model search settings (see search_config/README.md)
+search_config/*
+!search_config/.example/
+!search_config/README.md
 
 # Spyder project settings
 .spyderproject
@@ -230,3 +234,4 @@ cdp_api_key*.json
 
 # Cached historical market data
 data/
+search_config/model_search.json
