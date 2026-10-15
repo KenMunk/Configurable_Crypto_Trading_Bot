@@ -6,7 +6,7 @@ This folder holds `fortress.db`, an SQLite database created by the trader engine
 
 The engine creates `<base directory>/ledger/fortress.db` when it starts. Two things use the repository root as their base directory:
 
-- **The simulator.** It creates an engine with `base_directory="."` so it can reuse the engine's Coinbase authentication code. That creates this database as a side effect.
+- **The simulator.** When its window opens, it creates an engine with `base_directory="."` so it can reuse the engine's Coinbase authentication and client code. That creates this database as a side effect. The simulator never writes to it.
 - **The engine launcher** in the [trader guide](../Project_Documentation/trader.md#keeping-the-engine-running), which also uses `base_directory="."`.
 
 Running `python engine.py` uses [quant_system/ledger/](../quant_system/ledger/README.md) instead.
@@ -21,4 +21,4 @@ While a connection is open, SQLite may create `fortress.db-wal` and `fortress.db
 
 ## In Git
 
-The empty database is tracked. If it is deleted, it is recreated automatically the next time a tool starts. Once it holds real trading records, keep it out of the repository.
+The empty database is tracked. If it is deleted, it is recreated automatically the next time a tool starts. Git does not ignore the `fortress.db-wal` and `fortress.db-shm` files, so don't commit them if they appear. Once it holds real trading records, keep it out of the repository.

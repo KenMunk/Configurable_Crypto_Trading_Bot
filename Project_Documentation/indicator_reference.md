@@ -57,8 +57,12 @@ Working examples live in `config/.example/`:
 |---|---|
 | `btc_macro_horizon.example.json` | EMA trend following with a momentum screen and a trend-strength formula |
 | `btc_mean_reversion.example.json` | Bollinger Bands, RSI, ADX, historical volatility and a daily VWAP together |
+| `btc_sma_30_100.example.json` | A 30-day and 100-day SMA trend, plus flash-crash buys and a windowed drawdown stop |
+| `btc_ema_10_100.example.json` | The textbook EMA crossover |
+| `btc_growth_09.example.json` | A two-of-three vote that reads ADX's `plus_di` and `minus_di` outputs |
+| `btc_trend_vote_4in_1out.example.json` | A five-way vote that includes `pct_change(close, '90d')` |
 
-The examples illustrate the syntax. They are not trading recommendations: at Coinbase's entry fee tier, neither is profitable in the simulator.
+The examples illustrate the syntax. They are not trading recommendations: as shipped, the friction screen blocks every entry of `btc_macro_horizon`, and the other four finish behind buying and holding (see [the templates' results](../config/.example/README.md#backtested-models-a-sneak-peek)).
 
 ---
 
@@ -76,7 +80,7 @@ The examples illustrate the syntax. They are not trading recommendations: at Coi
 
 - Letters, digits and underscores only, and not starting with a digit: `fast_ema`, `rsi_14`, `bands`.
 - Names are case-sensitive, and rules refer to indicators by these names.
-- Reserved names cannot be used: the price fields (`open`, `high`, `low`, `close`, `volume`, `hl2`, `hlc3`, `ohlc4`), the rule function names (`previous`, `highest` and so on), and `True`/`False`.
+- Reserved names cannot be used: the price fields (`open`, `high`, `low`, `close`, `volume`, `hl2`, `hlc3`, `ohlc4`), the rule function names (`previous`, `highest` and so on), and `True`/`False`. Python keywords such as `and`, `or`, `not` and `if` are rejected too.
 
 ### Definition keys
 
@@ -84,9 +88,9 @@ The examples illustrate the syntax. They are not trading recommendations: at Coi
 |---|---|---|
 | `type` | yes | One of the indicator types in [section 4](#4-indicator-catalog), in capitals: `"EMA"`, `"BOLLINGER"` and so on. |
 | *parameters* | depends | Type-specific settings such as `period`, `std_dev` or `fast`. Parameters with defaults can be left out. |
-| `source` | no | The series the indicator is computed from (default `"close"`). This can be a price field or **another indicator's name**, for example `{"type": "SMA", "period": 5, "source": "rsi"}` smooths an RSI. Only types that list `source` accept it. |
+| `source` | no | The series the indicator is computed from (default `"close"`). This can be a price field or **another indicator's name**, for example `{"type": "SMA", "period": 5, "source": "rsi"}` smooths an RSI. For an indicator with several outputs, name one output: `"source": "macd.line"`. Only types that list `source` accept it. |
 | `plot` | no | `false` leaves the indicator off the charts; its values still appear in the hover tooltip. Every indicator is drawn by default: price-scale indicators on the price chart, oscillators in their own panel (see [section 10](#10-charts-and-tooltips)). |
-| `label` | no | Display name for the chart legend and reports. Defaults to `name (TYPE period)`. |
+| `label` | no | Display name for the chart legend and reports. Defaults to `name (TYPE period)`, with the period in candles: `"12h"` on 15-minute candles shows as `fast_ema (EMA 48)`. MACD shows its three periods, `macd (MACD 12, 26, 9)`, and types without a period show only the type, `obv (OBV)`. |
 | `description` | no | Free text for readers of the profile; ignored by the simulator. |
 
 Unknown keys are rejected, so a typo like `"peroid"` is caught instead of being silently ignored.
@@ -95,38 +99,44 @@ Unknown keys are rejected, so a typo like `"peroid"` is caught instead of being 
 
 Every period-like parameter (`period`, `fast`, `slow`, `signal`, `k_period`, `d_period`, `smooth`, `atr_period`) accepts either:
 
-- **A whole number of candles**: `30` means 30 candles of the profile's `period_granularity`.
-- **A duration string**: a number followed by `m` (minutes), `h` (hours), `d` (days) or `w` (weeks), such as `"90m"`, `"7.5h"`, `"5d"` or `"2w"`. It is converted to the nearest whole number of candles.
+- **A whole number of candles**, at least 1: `30` means 30 candles of the profile's `period_granularity`. `30.0` is accepted; `2.5`, `0` and `true` are errors.
+- **A duration string**: a number followed by `m` (minutes), `h` (hours), `d` (days) or `w` (weeks), such as `"90m"`, `"7.5h"`, `"5d"` or `"2w"`. The unit may be upper or lower case, and spaces around it are ignored. It is converted to the nearest whole number of candles; an exact half rounds to the even number, so `"2.5h"` on 1-hour candles is 2 candles and `"7.5h"` is 8.
 
-Durations keep a strategy's meaning when you change candle size. With `FIFTEEN_MINUTE` candles, `"45h"` is 180 candles; with `ONE_HOUR` candles it becomes 45 candles, still spanning 45 hours. A duration shorter than one candle is an error.
+Durations keep a strategy's meaning when you change candle size. With `FIFTEEN_MINUTE` candles, `"45h"` is 180 candles; with `ONE_HOUR` candles it becomes 45 candles, still spanning 45 hours. A duration that rounds to zero candles, half a candle or less, is an error ("shorter than one candle").
 
 | Granularity | `"1h"` | `"1d"` | `"1w"` |
 |---|---|---|---|
 | `ONE_MINUTE` | 60 | 1,440 | 10,080 |
+| `FIVE_MINUTE` | 12 | 288 | 2,016 |
 | `FIFTEEN_MINUTE` | 4 | 96 | 672 |
+| `THIRTY_MINUTE` | 2 | 48 | 336 |
 | `ONE_HOUR` | 1 | 24 | 168 |
+| `TWO_HOUR` | error | 12 | 84 |
+| `SIX_HOUR` | error | 4 | 28 |
 | `ONE_DAY` | error | 1 | 7 |
 
 ### Warm-up
 
 An indicator has no value until it has seen enough history: a 180-period moving average needs 180 candles. Before then its value is *unknown*, shown as "warming up" in the chart tooltip. Rules treat unknown values as "not yet true", so **no trade is entered or exited on a half-formed indicator**. Long periods therefore delay the first possible trade by that much history.
 
-Approximate warm-up lengths:
+Warm-up lengths, counted as the candles needed for the first value (the first value is on the last of them):
 
-| Type | Candles before the first value |
+| Type | Candles needed for the first value |
 |---|---|
-| SMA, WMA, EMA, VWMA, ROC, MOMENTUM, STDDEV, DONCHIAN, WILLIAMS_R, CCI, ATR | `period` |
-| DEMA / TEMA | about 2x / 3x `period` |
-| HMA | `period + sqrt(period)` |
-| RSI, MFI | `period + 1` |
-| ADX | about `2 x period` |
-| MACD `line` / `signal` | `slow` / `slow + signal` |
-| STOCHASTIC `k` / `d` | `k_period (+ smooth)` / plus `d_period` |
-| BOLLINGER, KELTNER | `period` (KELTNER: the longer of `period` and `atr_period`) |
-| VOLATILITY | `period + 1` |
-| OBV, anchored VWAP | none |
+| SMA, WMA, EMA, VWMA, STDDEV, CCI, WILLIAMS_R, ATR, DONCHIAN, BOLLINGER, rolling VWAP | `period` |
+| RSI, MFI, ROC, MOMENTUM, VOLATILITY | `period + 1` |
+| DEMA | `2 x period - 1` |
+| TEMA | `3 x period - 2` |
+| HMA | `period + floor(sqrt(period)) - 1` |
+| ADX `plus_di`, `minus_di` / `adx` | `period + 1` / `2 x period` |
+| MACD `line` / `signal`, `histogram` | `slow` / `slow + signal - 1` |
+| STOCHASTIC `k` / `d` | `k_period`, plus `smooth - 1` when `smooth` is above 1 / that plus `d_period - 1` |
+| KELTNER `middle` / `upper`, `lower` | `period` / the longer of `period` and `atr_period` |
+| OBV, anchored VWAP | 1: they have a value from the first candle |
 
-Profiles in the same simulator run share their indicators. Two profiles that define an indicator with the same type and settings compute it once, even if they give it different names. Slow indicators are also stored between runs; see [Stored metrics](simulator.md#stored-metrics).
+An indicator computed from another indicator adds the two: an SMA of 5 over a 14-period RSI needs `15 + 5 - 1 = 19` candles.
+
+Profiles in the same simulator run share their indicators. Two profiles that define an indicator with the same type and settings compute it once, even if they give it different names. Slow indicators whose values depend on a fixed number of recent candles are also stored between runs; see [Stored metrics](simulator.md#stored-metrics).
 
 ---
 
@@ -149,7 +159,7 @@ These series are always available to rules and as indicator sources:
 
 ## 4. Indicator catalog
 
-Each entry lists the parameters (with defaults; **required** means there is no default), the outputs, the formula, and how it is commonly read. Indicators with several outputs are referred to as `name.output` in rules, for example `bands.upper` or `macd.signal`.
+The simulator has 24 indicator types. Each entry lists the parameters (with defaults; **required** means there is no default), the outputs, the formula, and how it is commonly read. Indicators with several outputs are referred to as `name.output` in rules, for example `bands.upper` or `macd.signal`.
 
 "Price scale" indicators are measured in price units and drawn over the price chart. "Oscillators" have their own scale, so each one is drawn in its own panel under the price chart.
 
@@ -194,7 +204,7 @@ Moving averages smooth price to reveal trend direction. Shorter periods react fa
 #### HMA: Hull moving average
 - **Parameters:** `period` (required), `source` (`close`)
 - **Output:** one value
-- **Formula:** `WMA(2 x WMA(x, period/2) - WMA(x, period), sqrt(period))`
+- **Formula:** `WMA(2 x WMA(x, period/2) - WMA(x, period), sqrt(period))`, with `period/2` and `sqrt(period)` rounded down
 - **Use:** very smooth and very responsive. A popular alternative to EMA crossovers is to trade the HMA's direction: `hma > previous(hma)`.
 
 #### VWMA: Volume-weighted moving average
@@ -204,7 +214,7 @@ Moving averages smooth price to reveal trend direction. Shorter periods react fa
 - **Use:** gives heavy-volume candles more say. When the VWMA sits above the SMA of the same period, volume is backing the up-moves.
 
 #### VWAP: Volume-weighted average price
-- **Parameters:** either `"anchor": "day"` or a rolling `period`
+- **Parameters:** `anchor` (none) or `period` (none). Give one: `"anchor": "day"` (the only anchor), or a rolling `period`. If you give both, the anchor is used and `period` is ignored. With neither, the profile loads but the run stops with `VWAP needs either "anchor": "day" or a rolling "period"`. VWAP always uses `hlc3` and takes no `source`.
 - **Output:** one value
 - **Formula:** `sum(typical price x volume) / sum(volume)`, where the typical price is `hlc3`. With `"anchor": "day"` the sums restart at 00:00 UTC each day, as institutional desks use it. With `period` they cover a rolling window, which suits 24/7 crypto markets.
 - **Use:** the benchmark of "fair" price for the session. Buying below VWAP is considered good execution, and price reclaiming VWAP is a common intraday trigger.
@@ -219,7 +229,7 @@ Moving averages smooth price to reveal trend direction. Shorter periods react fa
 #### RSI: Relative strength index
 - **Parameters:** `period` (14), `source` (`close`)
 - **Output:** one value from 0 to 100
-- **Formula:** Wilder's RSI, `100 - 100 / (1 + average gain / average loss)`, with gains and losses smoothed by Wilder's method (`a = 1 / period`, seeded with a simple average).
+- **Formula:** Wilder's RSI, `100 - 100 / (1 + average gain / average loss)`, with gains and losses smoothed by Wilder's method (`a = 1 / period`, seeded with a simple average). With no losses in the average it is 100, and with neither gains nor losses it is 50.
 - **Use:** above 70 is conventionally overbought and below 30 oversold. In strong trends RSI can stay extreme for a long time, so pair it with a trend filter. A cross back above 30 (`crosses_above(rsi, 30)`) is a common entry trigger.
 
 #### MACD: Moving average convergence/divergence
@@ -233,7 +243,7 @@ Moving averages smooth price to reveal trend direction. Shorter periods react fa
 
 #### STOCHASTIC: Stochastic oscillator
 - **Parameters:** `k_period` (14), `d_period` (3), `smooth` (1)
-- **Outputs:** `k` = `100 x (close - lowest low) / (highest high - lowest low)` over `k_period`, optionally smoothed by an SMA of `smooth`; `d` = SMA of `k` over `d_period`
+- **Outputs:** `k` = `100 x (close - lowest low) / (highest high - lowest low)` over `k_period`, smoothed by an SMA of `smooth` when `smooth` is above 1; `d` = SMA of `k` over `d_period`. When the high and low of the window are equal, `k` is unknown.
 - **Use:** where the close sits within its recent range. Above 80 is overbought and below 20 oversold. `crosses_above(stoch.k, stoch.d)` below 20 is a classic buy. `"smooth": 3` gives the "slow stochastic".
 
 #### ROC: Rate of change
@@ -263,7 +273,7 @@ Moving averages smooth price to reveal trend direction. Shorter periods react fa
 #### MFI: Money flow index
 - **Parameters:** `period` (14)
 - **Output:** one value from 0 to 100
-- **Formula:** an RSI-like ratio of positive to negative money flow, where money flow is typical price times volume, counted positive when the typical price rose.
+- **Formula:** `100 - 100 / (1 + positive flow / negative flow)` over the last `period` candles, where money flow is typical price times volume, counted positive when the typical price rose and negative when it fell. With no negative flow it is 100, or unknown if there is no positive flow either.
 - **Use:** "volume-weighted RSI". Above 80 is overbought and below 20 oversold. Divergence from price can warn of reversals.
 
 ### 4.3 Volatility
@@ -310,7 +320,7 @@ Moving averages smooth price to reveal trend direction. Shorter periods react fa
 #### ADX: Average directional index
 - **Parameters:** `period` (14)
 - **Outputs:** `adx` (trend strength, 0-100), `plus_di` (upward pressure), `minus_di` (downward pressure)
-- **Formula:** Wilder's directional movement system. `+DI` and `-DI` are smoothed directional moves divided by ATR, and ADX is the smoothed `|+DI - -DI| / (+DI + -DI)`.
+- **Formula:** Wilder's directional movement system. `+DI` and `-DI` are smoothed directional moves divided by ATR, and ADX is the Wilder-smoothed `100 x |+DI - -DI| / (+DI + -DI)`.
 - **Use:** ADX measures *how strong* a trend is, not its direction. Above 25 is a trending market (favor trend systems) and below 20 a ranging market (favor mean reversion). `trend.plus_di > trend.minus_di` gives the direction.
 
 ```json
@@ -322,7 +332,7 @@ Moving averages smooth price to reveal trend direction. Shorter periods react fa
 #### OBV: On-balance volume
 - **Parameters:** none
 - **Output:** one value, cumulative volume
-- **Formula:** a running total that adds the candle's volume on up-closes and subtracts it on down-closes.
+- **Formula:** a running total, starting at 0 on the first candle, that adds the candle's volume on up-closes and subtracts it on down-closes. An unchanged close adds nothing.
 - **Use:** its level is arbitrary; its direction matters. Rising OBV confirms an uptrend: `obv > previous(obv, '1d')`. OBV rising while price falls (divergence) can precede a reversal.
 
 VWMA, VWAP and MFI (above) also use volume.
@@ -342,7 +352,7 @@ Rules live in the strategy's `entry_signal` and `exit_signal` blocks, in one or 
 
 If a block has both, **every `all` rule and at least one `any` rule** must hold.
 
-`entry_signal` needs at least one rule. `exit_signal` may have none, in which case positions close only through the hard stop, the profit lock or the drawdown limit. A single rule may be written as a string instead of a list: `"any": "fast_ema < slow_ema"`.
+`entry_signal` needs at least one rule. `exit_signal` may have none, in which case positions close only through the stops, the profit lock or the drawdown limit (see [section 6](#6-how-signals-become-trades)). A single rule may be written as a string instead of a list: `"any": "fast_ema < slow_ema"`.
 
 ### 5.2 Syntax
 
@@ -352,7 +362,8 @@ A rule is a formula that is true or false at each candle. You can use:
 |---|---|
 | Names | `close`, `rsi`, `bands.upper`, `macd.signal` |
 | Numbers | `70`, `0.01`, `-1.5` |
-| Arithmetic | `+`, `-`, `*`, `/`, parentheses |
+| Constants | `True`, `False` |
+| Arithmetic | `+`, `-`, `*`, `/`, unary `-`, parentheses |
 | Comparisons | `>`, `>=`, `<`, `<=`, `==`, `!=` |
 | Chained comparisons | `30 < rsi < 70` (both must hold) |
 | Logic | `and`, `or`, `not` |
@@ -360,7 +371,15 @@ A rule is a formula that is true or false at each candle. You can use:
 
 Operator precedence follows the usual rules: arithmetic, then comparisons, then `not`, then `and`, then `or`. Use parentheses when in doubt: `(fast_ema - slow_ema) / slow_ema >= 0.01`.
 
-Rules can use nothing else. There are no variables, strings (except duration periods in functions), lists or attribute access beyond `indicator.output`. Rules are parsed against a whitelist and never run as Python code, so a profile cannot execute arbitrary commands.
+**Counting conditions (votes).** A comparison is worth 1 when it holds and 0 when it doesn't, so comparisons can be added up. This rule means "at least two of these three":
+
+```text
+((adx.plus_di > adx.minus_di) + (sma10 > sma100) + (sma5 > sma100)) >= 2
+```
+
+Wrap each comparison in parentheses, because comparisons bind more loosely than `+`. If any vote is unknown (still warming up), the whole sum is unknown and the rule doesn't fire, so a vote rule waits for its slowest indicator. The templates `btc_growth_09` and `btc_trend_vote_4in_1out` in [config/.example/](../config/.example/README.md#backtested-models-a-sneak-peek) use this pattern.
+
+Rules can use nothing else. There are no variables, strings (except duration periods in functions), lists, indexing, other operators such as `**` or `%`, or attribute access beyond `indicator.output`. Rules are parsed against a whitelist and never run as Python code, so a profile cannot execute arbitrary commands.
 
 ### 5.3 Functions
 
@@ -376,7 +395,7 @@ Rules can use nothing else. There are no variables, strings (except duration per
 | `abs(x)` | absolute value |
 | `min(a, b)` / `max(a, b)` | the smaller or larger of two values at each candle |
 
-The period argument `n` must be a constant: a candle count (`3`) or a quoted duration (`'1d'`). `a`, `b` and `x` can be any expression: `crosses_above(close, bands.lower)`, `previous(fast_ema - slow_ema)`.
+The period argument `n` must be a constant: a candle count of at least 1 (`3`) or a quoted duration (`'1d'`). It is optional for `previous`, `change` and `pct_change`, and required for `highest` and `lowest`. Arguments are positional only, so `previous(close, n=2)` is an error. `a`, `b` and `x` can be any expression: `crosses_above(close, bands.lower)`, `previous(fast_ema - slow_ema)`.
 
 **Crosses versus states:** `fast_ema > slow_ema` is true on every candle of an uptrend, while `crosses_above(fast_ema, slow_ema)` is true only on the candle where the trend flips. Use crosses for "act on the change", and states for "stay in while the condition holds".
 
@@ -384,7 +403,9 @@ The period argument `n` must be a constant: a candle count (`3`) or a quoted dur
 
 While an indicator is warming up, its value is unknown. Comparisons with an unknown value are unknown, and an unknown rule never fires. With `and`/`or`, an unknown part counts as false: `rsi < 30 or close > bands.upper` can still fire on the band condition while RSI warms up. `not` of an unknown is still unknown.
 
-Division by zero also gives an unknown value rather than an error.
+Arithmetic with an unknown value is unknown, and so are `abs`, `min` and `max` of one. A function that looks back further than the available history, such as `previous(close, 3)` on the first three candles, is unknown too. Division by zero also gives an unknown value rather than an error, including in `pct_change`.
+
+**When a model is ready to trade.** The simulator also tracks the first candle on which *every* entry rule, in both `all` and `any`, can be evaluated: every indicator a rule reads has a value, and every lookback has enough history. For example, `change(sma_50, '10d')` needs a value of `sma_50` both now and 10 days earlier, `highest(x, n)` needs `x` on all of the last `n` candles, and `crosses_above` needs the previous candle too. Unlike rule evaluation, readiness doesn't let an `or` skip an unknown part, so a rule is ready only once all of its parts are. The model's [buy-and-hold benchmark](simulator.md#buy-and-hold-starts-when-the-model-can-first-buy) starts on that candle, or at the model's first buy if that comes sooner. Scripts can read the candle's start time as the result's `ready_to_trade`, which is `None` if the rules never become ready.
 
 ### 5.5 Examples
 
@@ -417,15 +438,15 @@ Each candle is processed in this order:
 2. **Flash crashes**, if `strategy.flash_crash_buy` is set: any resting limit buy the candle traded down to fills at its price and is held until the crash recovers. Until the crash recovers, nothing below sells: stops and profit locks are skipped on every crash candle, including the one it recovers in, and exit rules and the drawdown limit wait for the recovery candle's close (see [flash_crash_buy](model_configuration.md#flash_crash_buy)).
 3. **Exits**, if a position is open, checked in priority order:
    1. **Stops**:
-      - the hard stop, if `safeguards.use_hard_stop` and `exit_signal.hard_stop_trigger` are true, at `entry price x (1 - hard_stop_percentage)`
-      - the trailing stop, if `exit_signal.trailing_stop` is set
-      - with `safeguards.drawdown_window`, the drawdown stop, at the price where the model's value would fall `max_drawdown_limit` below its high in the window
+      - the hard stop, if `safeguards.use_hard_stop` is true and `exit_signal.hard_stop_trigger` is not `false`, at `entry price x (1 - safeguards.hard_stop_percentage)`
+      - the trailing stop, if `exit_signal.trailing_stop` is set, at that fraction below the highest price since entry as of the previous candle
+      - with `safeguards.drawdown_window` and `max_drawdown_limit`, the drawdown stop, at the price where the model's value would fall `max_drawdown_limit` below its high in the window
 
       If the candle's low reaches any of them, the highest one fills, at its price, or at the open if the price gapped below it.
-   2. **Profit lock**: if the candle's high reaches `entry price x (1 + profit_lock_target)`, it sells at the target, or at the open if price gapped above it.
+   2. **Profit lock**, if no stop fired: if the candle's high reaches `entry price x (1 + profit_lock_target)`, it sells at the target, or at the open if price gapped above it.
    3. **Exit rules**: if the exit rules hold at the candle's close, it sells at the close. The Trades tab shows the reason `EXIT_SIGNAL`.
 4. **Drawdown limit** without a window: if equity has fallen `max_drawdown_limit` from its peak, any position closes and trading pauses. After either kind of drawdown exit, trading resumes only once the entry signal has switched **off** and then fires again.
-5. **Entries**, if no position is open: the entry rules must hold at the close, `max_orders_per_day` must allow it, and the signal must pass the **friction screen** (see [the friction screen](model_configuration.md#5-the-friction-screen-worked-through)). The screen uses `exit_signal.profit_lock_target` as the expected gain, so a model without a profit target is not screened. Entries fill at the close, with the reason `ENTRY_SIGNAL`.
+5. **Entries**, if no position is open, including one closed earlier on the same candle: the entry rules must hold at the close, `max_orders_per_day` must allow it, and the signal must pass the **friction screen** (see [the friction screen](model_configuration.md#5-the-friction-screen-worked-through)). The screen uses `exit_signal.profit_lock_target` as the expected gain, so a model without a profit target, or without `safeguards.minimum_net_profit_gate`, is not screened. With a `drawdown_window`, the model also enters only while its value is far enough above the drawdown floor that the entry's own costs can't trigger the drawdown stop at once. Entries fill at the close, with the reason `ENTRY_SIGNAL`.
 
 Rules see only the current and past candles, so there is no look-ahead: a rule evaluated at a candle's close uses that close and earlier data.
 
@@ -544,20 +565,31 @@ The simulator checks a profile when you click **Load Profile** and before each r
 
 | Message | Cause and fix |
 |---|---|
+| `"indicators" must be an object mapping names to indicator definitions` | `indicators` is a list or a value instead of an object. |
+| `Indicator 'x' must be an object such as {"type": "EMA", "period": 20}` | A definition is a string or a number instead of an object. |
+| `Indicator name '2x' must be letters, digits and underscores, not starting with a digit` | Rename the indicator. Python keywords such as `and` also get this message. |
+| `Indicator name 'close' is reserved; pick another name` | The name is a price field, a rule function, `True` or `False`. Rename the indicator. |
 | `Indicator 'x' has unknown type 'BOLINGER'; choose one of: ...` | Misspelled `type`. Types are upper case; see section 4. |
 | `Indicator 'x' (EMA) needs "period"` | A required parameter is missing. |
 | `Indicator 'x' (ADX) does not take smoothing; its parameters are: period` | An unknown or misspelled key. |
-| `'x' period '3 fortnights' is not a candle count or a duration` | Use a whole number, or forms like `'90m'`, `'12h'`, `'5d'`, `'2w'`. |
+| `'x' period '3 fortnights' is not a candle count or a duration; use forms like ...` | Use a whole number, or forms like `'90m'`, `'12h'`, `'5d'`, `'2w'`. |
+| `'x' period must be a whole number of candles of at least 1, not 2.5` | A candle count must be a whole number from 1 up. For a fraction of a period, use a duration such as `'2.5h'`. |
 | `... is shorter than one candle` | For example `'5m'` on 15-minute candles. Use a longer duration. |
-| `Indicator name 'close' is reserved` | Rename the indicator. |
-| `Rule '...': unknown name 'fsat_ema'; did you mean fast_ema?` | A typo in a rule, or an indicator that isn't defined. |
-| `'macd' has several outputs; refer to one of: macd.line, ...` | Multi-output indicators need `.output` in rules. |
-| `Rule '...' is not a valid formula` | A syntax error, such as an unbalanced parenthesis or a dangling operator. |
-| `Rule '...': '...' is not allowed` | Something outside the rule language, such as a list, index or lambda. |
-| `the period in previous() must be a number of candles or a duration` | Function periods must be constants, not indicators. |
-| `strategy.entry_signal needs at least one rule in "all" or "any"` | An empty entry block. |
+| `Indicator 'x' (MACD) needs fast shorter than slow` | Swap `fast` and `slow`. |
+| `Indicator 'x' (VWAP) anchor must be "day" or omitted` | `"day"` is the only anchor. For other spans, use a rolling `period`. |
+| `Indicator 'x' has source 'y', which is not a price field or indicator output` | The `source` names nothing in the profile. If `y` has several outputs, the message lists them: use one, such as `macd.line`. |
 | `Indicator sources form a loop: a -> b -> a` | Two indicators use each other as `source`. |
-| `MACD needs fast shorter than slow` | Swap `fast` and `slow`. |
+| `Rule '...': unknown name 'fsat_ema'; did you mean fast_ema? ...` | A typo in a rule, or an indicator that isn't defined. A multi-output indicator used without `.output`, such as `macd`, also gets this message, suggesting `macd.line`. |
+| `Rule '...' is not a valid formula: ...` | A syntax error, such as an unbalanced parenthesis or a dangling operator. |
+| `Rule '...': '...' is not allowed; rules may use names, numbers, ...` | Something outside the rule language, such as a list, an index, `**` or a lambda. |
+| `Rule '...': 'abc' is not a number` | A quoted string outside a function's period argument. |
+| `Rule '...': unknown function 'foo'; available: ...` | A misspelled or unsupported function; see [section 5.3](#53-functions). |
+| `Rule '...': highest() takes 2 arguments, got 1` | Wrong number of arguments. `highest` and `lowest` need a period. |
+| `Rule '...': previous() takes positional arguments only` | Write `previous(close, 2)`, not `previous(close, n=2)`. |
+| `Rule '...': the period in previous() must be a number of candles or a duration like '1d'` | Function periods must be constants, not indicators or expressions. |
+| `strategy.entry_signal needs at least one rule in "all" or "any"` | An empty entry block. |
+| `strategy.entry_signal.all must be a list of rule formulas` | `all` or `any` is something other than a list or a single string. |
+| `strategy.entry_signal.all entries must be formulas in quotes, not 5` | A rule is a number or other value instead of a string. |
 
 **No trades at all?** Check, in order:
 1. The Metrics tab's **Entry signals blocked by the screen** count. If it is high, the profit target cannot clear friction and tax at the `minimum_net_profit_gate`; raise the target or lower the gate.
@@ -593,7 +625,7 @@ They still load: the simulator translates them automatically, and **Load Profile
 }
 ```
 
-The old `trend_filter` field is no longer used.
+A profile counts as old-format when its `indicators` has any of `fast_window_periods`, `slow_window_periods` or `emergency_ema_periods`. Missing fields take the old defaults: periods of 30, 180 and 4 candles, `price_source` `"close"`, `fast_ema_gt_slow_ema` and `fast_ema_lt_slow_ema` true, `emergency_ema_gt_fast_ema` false and `minimum_trend_strength` 0. The `emergency_ema` indicator is always defined, even when no rule uses it. If a signal block already has `all` or `any` rules, they are kept and its old fields are ignored. The old `trend_filter` field is no longer used.
 
 ---
 
@@ -601,11 +633,11 @@ The old `trend_filter` field is no longer used.
 
 Every indicator in the profile gets its own line on the **Chart** tab.
 
-- **Price-scale indicators** (moving averages, VWAP, and the upper, middle and lower lines of Bollinger, Keltner and Donchian) are drawn over the close price. Each indicator has its own color, assigned in the order the indicators are defined; band edges are thinner lines in their indicator's color. There is no limit on how many are drawn: past the fifth, the colors repeat with a dashed line, then a dotted one, so every indicator keeps a distinct color-and-style pair in the legend.
-- **Oscillators** (RSI, MACD, Stochastic, ROC, Momentum, CCI, Williams %R, MFI, ATR, standard deviation, volatility, ADX and OBV) each get a **panel of their own** under the price chart, because their scales differ from price and from each other. Multi-output oscillators draw every output as a separate line in their panel, with a small legend: MACD's `line`, `signal` and `histogram`, ADX's `adx`, `plus_di` and `minus_di`, and Stochastic's `k` and `d`.
+- **Price-scale indicators** (moving averages, VWAP, and the upper, middle and lower lines of Bollinger, Keltner and Donchian) are drawn over the close price. Each indicator has its own color, assigned in the order the indicators are defined; band edges are thinner lines in their indicator's color. There is no limit on how many are drawn: past the fifth, the colors repeat with a dashed line, then a dotted one, so every indicator keeps a distinct color-and-style pair in the legend for up to 15 indicators. Lines with a period under 10 candles hug the price, so they are drawn beneath it; longer ones are drawn on top, slower over faster.
+- **Oscillators** (RSI, MACD, Stochastic, ROC, Momentum, CCI, Williams %R, MFI, ATR, standard deviation, volatility, ADX and OBV) each get a **panel of their own** under the price chart, in the order they are defined, because their scales differ from price and from each other. Each panel shows the indicator's label in its top-left corner. Multi-output oscillators draw every output as a separate line in their panel, with a small legend: MACD's `line`, `signal` and `histogram`, ADX's `adx`, `plus_di` and `minus_di`, and Stochastic's `k` and `d`. Bollinger's `bandwidth` and `percent_b` are not drawn anywhere; read them in the tooltip.
 - Panels show their conventional reference levels as thin lines: RSI 30/70, MFI and Stochastic 20/80, Williams %R -80/-20, CCI ±100, ADX 20 and 25, and zero for MACD, ROC and Momentum. RSI, MFI, Stochastic and Williams %R keep their fixed scale (0-100, or -100-0); other panels scale to their data.
-- All panels share the price chart's time axis: zooming or panning any panel with the toolbar moves them all, and double-clicking a trade in the Trades tab zooms every panel to it.
-- Hovering anywhere shows a crosshair through every panel and a tooltip, in the top corner away from the cursor, listing **every** indicator's value at that candle, including each output of multi-output indicators.
+- All panels share the price chart's time axis: zooming or panning any panel with the toolbar moves them all, and double-clicking a trade in the Trades tab zooms every panel to it, refitting the panels without a fixed scale to the values in view.
+- Hovering anywhere shows a crosshair through every panel and a tooltip, in the top corner away from the cursor, listing **every** indicator's value at that candle, including each output of multi-output indicators. A value that is still unknown shows as "warming up".
 - Set `"plot": false` on an indicator to leave it off the chart (and remove its panel); its values still appear in the tooltip.
-- Buy (▲) and sell (▼) markers show where rules, stops and targets filled.
+- Buy (▲) and sell (▼) markers show where rules, stops and targets filled. Gray bands mark the periods when the drawdown limit paused trading.
 - Each panel takes a slice of the chart's height, so profiles with many oscillators give each panel less room; enlarge the window or hide the less important ones with `"plot": false`.

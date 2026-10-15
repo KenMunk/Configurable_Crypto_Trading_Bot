@@ -1,3 +1,12 @@
+"""Trader foundation: the runtime pieces a live trader will build on.
+
+It loads settings from .env, reads the model profiles in config/, opens the SQLite
+ledger, authenticates against Coinbase (read-only), serves a JSON status dashboard on
+the LAN, opens an optional serial link and offers a GPU smoothing helper. It does not
+place orders: COINBASE_ALLOW_TRADING and LIVE_EXECUTION_ACTIVE are read and reported,
+but nothing acts on them yet.
+"""
+
 import gc
 import json
 import logging
@@ -17,6 +26,7 @@ if not logging.getLogger().handlers:
 
 
 def _coerce_env_value(raw_value):
+    """Strip matching quotes, then turn true/false/yes/no into bools and numbers into int/float."""
     value = raw_value.strip()
     if value.startswith('"') and value.endswith('"'):
         value = value[1:-1]
@@ -133,7 +143,11 @@ def ensure_python_path(prompt=None):
 
 
 def load_environment_config(env_path=DEFAULT_ENV_PATH):
-    """Load local runtime secrets and external API settings from a .env file."""
+    """Load local runtime secrets and external API settings from a .env file.
+
+    Returns the defaults below, overridden by any recognised keys in the file (keys are
+    case-insensitive; unknown keys are ignored). A missing file just gives the defaults.
+    """
     env_file = env_path or DEFAULT_ENV_PATH
     config = {
         "coinbase": {
@@ -217,13 +231,19 @@ except ImportError:  # pragma: no cover - optional runtime dependency
 
 
 class QuantitativeStorageController:
+    """The SQLite ledger file; creates its directory and sets connection pragmas."""
+
     def __init__(self, db_path):
         self.db_path = db_path
         os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
         self._initialize_core_infrastructure()
 
     def _initialize_core_infrastructure(self):
-        """Sets up a low-wear, optimized transaction ledger matrix."""
+        """Switch the database to WAL mode and apply speed/low-disk-wear pragmas.
+
+        Only WAL persists in the file; the other pragmas last for this one connection.
+        No tables are created here.
+        """
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         cursor.execute("PRAGMA journal_mode=WAL;")
@@ -234,6 +254,7 @@ class QuantitativeStorageController:
         conn.close()
 
     def get_connection(self, read_only=False):
+        """Return a new (connection, cursor); the caller closes it. read_only sets query_only."""
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         if read_only:
@@ -242,12 +263,15 @@ class QuantitativeStorageController:
 
 
 class IndustrialHardwareInterlock:
+    """Optional serial link (pyserial) to external hardware; only opened, never written to yet."""
+
     def __init__(self, port_device="/dev/ttyS0", baudrate=9600):
         self.port_device = port_device
         self.baudrate = baudrate
         self.ser = None
 
     def initialize_channel(self):
+        """Open the port at 8N1; return False if pyserial is missing or the port won't open."""
         if serial is None:
             return False
         try:
@@ -266,9 +290,15 @@ class IndustrialHardwareInterlock:
 
 
 class LocalDashboardHandler(BaseHTTPRequestHandler):
-    """LAN-isolated monitoring status router."""
+    """Read-only JSON status endpoints for the engine.
+
+    GET / or /api/status returns the node state; GET /api/coinbase/authenticate runs a
+    fresh read-only Coinbase check. There is no authentication, and the server binds to
+    all interfaces, so keep the port off untrusted networks.
+    """
 
     def log_message(self, format, *args):
+        # Silence the default per-request stderr logging.
         return
 
     def do_GET(self):
@@ -299,6 +329,11 @@ class LocalDashboardHandler(BaseHTTPRequestHandler):
 
 
 class QuantitativeTradingEngine:
+    """Ties settings, profiles, ledger, Coinbase auth, dashboard and serial link together.
+
+    node_is_primary only labels the node in the status payload; this class places no orders.
+    """
+
     def __init__(self, base_directory, serial_port="/dev/ttyS0", node_is_primary=True, env_file=DEFAULT_ENV_PATH):
         self.base_dir = base_directory
         self.config_dir = os.path.join(base_directory, "config")
@@ -314,12 +349,14 @@ class QuantitativeTradingEngine:
         self.last_coinbase_authentication = None
 
     def get_exchange_connection(self, exchange_name):
+        """Return the .env settings for "coinbase" or "kraken" (a dict, not a live connection)."""
         exchange_name = exchange_name.lower()
         if exchange_name not in {"coinbase", "kraken"}:
             raise ValueError(f"Unsupported exchange: {exchange_name}")
         return self.api_config.get(exchange_name, {})
 
     def get_runtime_configuration(self):
+        """Paths and .env settings as a dict; the exchange entries include the API secrets."""
         return {
             "base_directory": self.base_dir,
             "config_dir": self.config_dir,
@@ -333,14 +370,20 @@ class QuantitativeTradingEngine:
         }
 
     def get_model_configuration(self, ticker):
+        """The loaded profile for `ticker`, or None."""
         return self.loaded_models.get(ticker)
 
     def _coinbase_key_label(self):
+        """The last path segment of the key name, safe to log."""
         key_name = self.api_config["coinbase"].get("api_key_name", "")
         return key_name.rsplit("/", 1)[-1] if key_name else "unconfigured"
 
     def load_coinbase_credentials(self):
-        """Resolve the CDP API key name and private key from .env or a key file."""
+        """Resolve the CDP API key name and private key from .env or a key file.
+
+        The key file is used only when .env lacks the name or the secret; a relative path is
+        resolved against base_directory. Raises if neither source supplies both values.
+        """
         coinbase = self.api_config["coinbase"]
         key_name = coinbase.get("api_key_name", "")
         key_secret = coinbase.get("api_key_secret", "")
@@ -387,7 +430,10 @@ class QuantitativeTradingEngine:
     def authenticate_coinbase(self, dependency_prompt=None, path_prompt=None, client=None):
         """Run a read-only Coinbase authentication check by listing accounts.
 
-        Pass `client` to test a client that was already created.
+        Pass `client` to test a client that was already created. Never raises: the result
+        dict says whether it worked and why not, and is also kept in
+        last_coinbase_authentication. On a 401 it adds the public outbound IP, since a key
+        with an IP allowlist rejects other addresses.
         """
         try:
             from requests.exceptions import ConnectionError as RequestsConnectionError
@@ -455,12 +501,18 @@ class QuantitativeTradingEngine:
             return "unavailable"
 
     def initialize_node_cluster(self, lan_port=8080):
+        """Load profiles, try the serial link and start the status dashboard on `lan_port`."""
         LOGGER.info("[RUNTIME] Python interpreter: %s", sys.executable)
         self.ingest_configuration_profiles()
         self.serial_link_active = self.interlock.initialize_channel()
         self.spin_up_lan_isolated_dashboard(lan_port)
 
     def ingest_configuration_profiles(self):
+        """Load every config/*.json profile into loaded_models, keyed by its "ticker".
+
+        Profiles sharing a ticker overwrite each other (the last file name wins); a file
+        that fails to parse is reported and skipped. Creates config/ if it is missing.
+        """
         if not os.path.exists(self.config_dir):
             os.makedirs(self.config_dir, exist_ok=True)
             return
@@ -476,6 +528,7 @@ class QuantitativeTradingEngine:
         gc.collect()
 
     def spin_up_lan_isolated_dashboard(self, port):
+        """Serve LocalDashboardHandler on all interfaces at `port` from a daemon thread."""
         try:
             self.web_server = HTTPServer(("0.0.0.0", port), LocalDashboardHandler)
             self.web_server.engine_ref = self
@@ -486,9 +539,11 @@ class QuantitativeTradingEngine:
             print(f"❌ [LAN SERVER] Interface socket bind failure: {exc}")
 
     def execute_isolated_gpu_simulation(self, device_id, target_architecture, raw_prices, window_size):
-        """
-        Runs localized simulations with an explicit Hardware Mutual Exclusion Guard.
-        Strictly prevents modern RTX and legacy GTX architectures from running at the same time.
+        """Return a simple moving average of raw_prices (window_size) computed on one GPU.
+
+        Returns None if CuPy is missing, if the machine has both RTX and GTX cards (the
+        mixed-architecture guard), if device_id's name doesn't contain target_architecture,
+        or if the GPU call fails.
         """
         if cp is None:
             return None
@@ -534,5 +589,6 @@ class QuantitativeTradingEngine:
 
 
 if __name__ == "__main__":
+    # Starts the status node (profiles, serial link, dashboard); it does not trade.
     engine = QuantitativeTradingEngine(base_directory="./quant_system", serial_port="/dev/ttyS0", node_is_primary=True)
     engine.initialize_node_cluster(lan_port=8080)

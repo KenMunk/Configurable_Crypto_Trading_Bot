@@ -1,6 +1,21 @@
 # System Configuration Structure and Meaning
 
 > **Status: planned design.** No code reads a system configuration file yet. Today the system-wide settings (exchange credentials, the dashboard port and the trading switches) live in the local `.env` file. See [Setting up the .env file](trader.md#2-setting-up-the-env-file) in the trader guide.
+>
+> What exists today, compared with this design:
+>
+> | Design | Today |
+> |---|---|
+> | `system.live_execution_active` | `LIVE_EXECUTION_ACTIVE` in `.env`. It is loaded, but nothing checks it, and no code places orders. |
+> | `system.lan_port` | `LAN_PORT` in `.env`. It is loaded, but `python engine.py` always serves the dashboard on port 8080. |
+> | `system.name`, `system.environment` | Not present. |
+> | `exchange_connections.coinbase` credentials and `base_url` | `COINBASE_*` settings in `.env`, or a key file named by `COINBASE_KEY_FILE`. The engine and the simulator use them. `COINBASE_ENABLED` and `COINBASE_ALLOW_TRADING` are loaded, but nothing checks them. |
+> | `exchange_connections.kraken` | `KRAKEN_*` settings in `.env`. They are loaded, but no code connects to Kraken. |
+> | Fee refresh schedule | Not present. The simulator looks up the live Coinbase fee tier once at the start of each run. |
+> | `fee_buffer_multiplier`, `fallback_commission_rate` | Set per model, in each profile's `friction_model` (see [model_configuration.md](model_configuration.md#44-friction_model)). |
+> | `global_safeguards` | Not present. Hard stops, the profit gate and drawdown limits are set per model, in each profile's `safeguards`. |
+>
+> The engine's `get_runtime_configuration()` already returns the loaded `.env` settings in a shape close to this design: `live_execution_active`, `lan_port` and `exchange_connections` with `coinbase` and `kraken`.
 
 This document explains the shared system-level configuration used across all trading models. Unlike the model config files, the system config is not strategy-specific. It defines platform-wide settings that affect how the bot connects to exchanges, refreshes operational data, and enforces cross-model runtime policies.
 
@@ -103,13 +118,14 @@ These settings are intentionally global because they affect all models sharing t
 Authentication permissions are system-level settings, not model settings. A
 model cannot grant itself trading access. The `live_execution_active` safeguard
 must also be enabled before any live order-routing implementation can execute
-trades.
+trades. No order routing exists yet.
 
 ### Coinbase authentication and diagnostics
 
 Coinbase requests go through the official `coinbase-advanced-py` SDK. The local
 dashboard provides:
 
+- `GET /` and `GET /api/status`: the engine's status
 - `GET /api/coinbase/authenticate`: performs a read-only account request
 
 The SDK's `RESTClient` signs each request with a short-lived JWT. The engine logs

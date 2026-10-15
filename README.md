@@ -23,6 +23,7 @@ Each strategy is a JSON **model profile**. A profile names its indicators, write
 ## Contents
 
 - [What's in the project](#whats-in-the-project)
+- [Sneak peek: backtested models](#sneak-peek-backtested-models)
 - [Quick start](#quick-start)
 - [Documentation](#documentation)
 - [How the pieces fit together](#how-the-pieces-fit-together)
@@ -39,8 +40,23 @@ Each strategy is a JSON **model profile**. A profile names its indicators, write
 | Tool | Command | What it does | Status |
 |---|---|---|---|
 | **Simulator** | `python simulator.py` | A desktop app that backtests one or more model profiles over up to 10 years of Coinbase candles. It charges fees, slippage and taxes, and shows the results in sortable tables and interactive charts. | Working |
-| **Trader** | `python engine.py` | The headless runtime for an always-on machine. It loads profiles, checks Coinbase access, opens its ledger and serial link, and serves a status dashboard on your local network. | Foundation only; does not trade yet |
-| **Model profiles** | `config/*.json` | Declarative strategy definitions that both tools share: 24 indicators, a safe rule language, and settings for friction, capital and safeguards. | Working |
+| **Trader** | `python engine.py` | The headless runtime for an always-on machine. It loads profiles from `quant_system/config/` (one per ticker), opens its ledger and serial link, and starts a status dashboard with an on-demand Coinbase authentication check. Run directly, it exits as soon as start-up finishes; the [Trader guide](Project_Documentation/trader.md#keeping-the-engine-running) has a launcher that keeps it running. | Foundation only; does not trade yet |
+| **Model profiles** | `config/*.json` | Declarative strategy definitions in one format for both tools (the simulator reads `config/`; `python engine.py` reads `quant_system/config/`): 24 indicators, a safe rule language, and settings for friction, capital and safeguards. | Working |
+
+---
+
+## Sneak peek: backtested models
+
+The project's own research has produced over 150 models, each backtested on 10 years of BTC-USD or ETH-USD history. Four of the **weaker** BTC models are published as templates in [config/.example/](config/.example/README.md#backtested-models-a-sneak-peek), so you can run them yourself and see what the simulator reports:
+
+| Template | Idea | Return | Buy & hold | vs Buy & hold | Max drawdown |
+|---|---|---|---|---|---|
+| `btc_sma_30_100` | 30/100-day SMA trend, 20% positions, flash-crash buys, 10% drawdown stop | +52.8% | +8,636% | −98.3% | 16.5% |
+| `btc_ema_10_100` | 10/100-day EMA crossover, all in | +4,113% | +8,636% | −51.8% | 71.0% |
+| `btc_growth_09` | Two of three trend signals, including ADX | +6,950% | +8,659% | −19.5% | 63.5% |
+| `btc_trend_vote_4in_1out` | Five-way trend vote: in on 4, out on 1 | +5,791% | +6,209% | −6.6% | 65.4% |
+
+These figures come from one run on 2026-10-15 (UTC) over the previous 10 years, on 15-minute candles for the first two models and daily candles for the other two. It charged a 0.9% fee per fill (flash-crash limit buys pay the lower maker fee), 0.25% slippage, and 31.3% tax on each year's net realized gains, with losses carried forward. Buy and hold pays none of these costs, and starts when each model could first buy. All four finish behind it, which is why they're public. The better models stay private. The simulator also records every model you test in [a running performance log](Project_Documentation/simulator.md#model-performance-log), so comparisons like this one build up as you work.
 
 ---
 
@@ -48,7 +64,7 @@ Each strategy is a JSON **model profile**. A profile names its indicators, write
 
 These steps take you from a fresh clone to your first backtest.
 
-1. **Install Python 3.11.** The project is developed and tested with 3.11. On Linux, also install tkinter for the simulator window: `sudo apt install python3-tk`.
+1. **Install Python 3.11 or newer.** The project is developed and tested with Python 3.13. On Linux, also install tkinter for the simulator window: `sudo apt install python3-tk`.
 
 2. **Create a virtual environment and install the requirements** from the repository root:
 
@@ -58,7 +74,7 @@ These steps take you from a fresh clone to your first backtest.
    pip install -r requirements.txt
    ```
 
-3. **Create a view-only Coinbase API key** and put it in `.env`. The simulator needs the key to download candles and look up your fee tier. It never trades.
+3. **Create a view-only Coinbase API key** and put it in `.env`. Every simulator run needs the key, even when the candles are already cached: it checks the key, looks up your fee tier, and downloads any new candles. It never trades.
 
    ```bash
    cp .env.example .env            # then fill in COINBASE_API_KEY_NAME and COINBASE_API_KEY_SECRET
@@ -78,7 +94,7 @@ These steps take you from a fresh clone to your first backtest.
    python simulator.py
    ```
 
-   Select the model, click **Load Profile** to validate it, and then click **Run Simulation**. The first run downloads the price history, which can take several minutes. Later runs use the local cache.
+   Select the model and click **Run Simulation**. The run checks every selected profile first; click **Load Profile** to see the full validation report beforehand. Run the simulator from the repository root: it reads `.env` from the current folder, so starting it elsewhere means no API key. The first run downloads the price history, which can take several minutes. Later runs use the local cache.
 
 From there, read the [Model configuration guide](Project_Documentation/model_configuration.md) to write your own strategies.
 
@@ -86,13 +102,13 @@ From there, read the [Model configuration guide](Project_Documentation/model_con
 
 ## Documentation
 
-All documentation lives in [Project_Documentation/](Project_Documentation/), which has its own [index](Project_Documentation/README.md). Every folder in the repository also has a `README.md` that explains what the folder holds (see [Project layout](#project-layout)).
+All documentation lives in [Project_Documentation/](Project_Documentation/), which has its own [index](Project_Documentation/README.md). Every tracked folder in the repository also has a `README.md` that explains what the folder holds (see [Project layout](#project-layout)).
 
 ### Guides: how to use the tools
 
 | Page | What it covers |
 |---|---|
-| [Simulator guide](Project_Documentation/simulator.md) | Installing and launching the simulator; every control and results tab; the candle cache; exactly how trades are filled, charged and taxed; what a backtest leaves out; scripting backtests in Python; troubleshooting. |
+| [Simulator guide](Project_Documentation/simulator.md) | Installing and launching the simulator; every control and results tab; the buy-and-hold benchmark; the model performance log; the candle cache; exactly how trades are filled, charged and taxed; what a backtest leaves out; scripting backtests in Python; troubleshooting. |
 | [Trader guide](Project_Documentation/trader.md) | Every `.env` setting; creating a view-only Coinbase API key; running the engine and keeping it running; the status dashboard and its security; profiles, ledger, serial link and GPU helper; the trading safety switches; troubleshooting. |
 | [Model configuration guide](Project_Documentation/model_configuration.md) | Creating a profile step by step; every field with its default and whether the simulator uses it; flash-crash buys; the friction screen with a worked example; what validation catches. This page was formerly `config_file_structure.md`. |
 
@@ -118,6 +134,8 @@ All documentation lives in [Project_Documentation/](Project_Documentation/), whi
   config/*.json           simulator.py                 Comparison, Chart, Model value,
   model profiles  ----->  10-year backtests  ------->  Trades and Metrics tabs
         ^                 on Coinbase history                    |
+        |                                          data/model_performance.csv
+        |                                          (one row per model tested)
         |                                                        |
         +------------ edit the profile, compare variants <-------+
 
@@ -194,7 +212,7 @@ The blueprint has five sections, which this summary follows:
 
 *Blueprint sections 2 and 3.*
 
-- **Long-lived software.** The engine core is built on the Python standard library, plus the optional `pyserial` and `cupy` packages, so that it keeps working for decades without dependency churn. In practice, the simulator uses numpy, matplotlib and the Coinbase SDK, and the engine needs the Coinbase SDK only for authentication.
+- **Long-lived software.** The engine core is built on the Python standard library, plus the optional `pyserial` and `cupy` packages (neither is in `requirements.txt`, so the serial link and GPU helper do nothing until you install them), so that it keeps working for decades without dependency churn. In practice, the simulator uses numpy, matplotlib and the Coinbase SDK, and the engine needs the Coinbase SDK only for authentication.
 - **The GPU mutual exclusion guard.** GPU simulations run on either a modern RTX card or a legacy GTX card, never both in one run, to protect the driver stack. The engine includes this guard (see the [GPU helper](Project_Documentation/trader.md#9-gpu-simulation-helper)). The simulator itself runs on the CPU.
 - **The storage budget.** At 32 bytes per row, 10 years of data for five assets needs very little disk space:
 
@@ -211,7 +229,7 @@ The blueprint has five sections, which this summary follows:
   - SQLite page cache and in-memory temporary tables: 200 MB each
   - the status server: 50 MB
 
-  The engine's actual SQLite cache setting reserves about 50 MB.
+  The engine sets a 50 MB SQLite cache (`cache_size=-50000`), but only on the set-up connection it opens and closes at start-up; later connections use SQLite's default.
 - **Low disk wear.** The SQLite ledger uses write-ahead logging, and the design batches its writes into one daily flush at midnight. This protects the node's solid-state storage.
 
 ### Security and hardware cutover
@@ -299,9 +317,9 @@ The `data/` folder is created by the simulator's first run and is ignored by Git
 | `config/*.json` | Ignored | Your private model profiles |
 | `config/.example/` | Tracked | Public template profiles |
 | `quant_system/config/` | Ignored | The profiles loaded by `python engine.py` |
-| `data/` | Ignored | The cached candle history, stored indicators, and `model_performance.csv` |
+| `data/` | Ignored | The cached candle history and stored indicators (`candles.db`), and `model_performance.csv`. A `*_FIFTEEN_MINUTE.csv` cache left by an earlier version can be deleted once it has been imported. |
 | `cdp_api_key*.json` | Ignored | Coinbase key files, if you keep them in the repository folder |
-| `ledger/`, `quant_system/ledger/` | Tracked (currently empty) | SQLite ledgers; keep real trading records out of Git |
+| `ledger/`, `quant_system/ledger/` | Tracked | A README and an empty `fortress.db` each (no tables yet). `.gitignore` does not exclude `*.db` files, so keep real trading records out of Git yourself. |
 
 Keep proprietary strategies in `config/`, never in `config/.example/`.
 
@@ -322,9 +340,11 @@ The tests cover:
 
 - indicators and rules
 - profile validation
-- the backtest: fills, stops, taxes, drawdown limits, flash crashes and start dates
+- the backtest: fills, stops, taxes, drawdown limits, flash crashes, start dates and the buy-and-hold benchmark
+- the candle cache and its stored indicators
 - the friction model and the charts
-- the simulator's run workflow
+- the simulator's run workflow and the model performance log
+- that every template in `config/.example/` is a valid profile
 - the engine's settings and authentication
 
 They use fake Coinbase clients, so they need no API key.
@@ -333,7 +353,7 @@ They use fake Coinbase clients, so they need no API key.
 
 ## Safety
 
-- **The simulator only reads.** It lists your accounts, reads your fee tier and downloads candles from Coinbase, and it fetches the public Bitcoin network fee from mempool.space.
+- **The simulator only reads.** It lists your accounts, reads your fee tier and downloads candles from Coinbase, and it fetches the public Bitcoin network fee from mempool.space. If authentication fails with HTTP 401, it also asks api.ipify.org for your public IP address to show in the error. Its only changes to your machine are the files it creates (`data/`, `ledger/fortress.db`) and, if you accept its prompts, installing the Coinbase SDK and adding Python to your user `PATH`.
 - **The trader cannot trade yet.** No code places orders. Use a **view-only** API key, and keep `COINBASE_ALLOW_TRADING`, `LIVE_EXECUTION_ACTIVE` and every profile's `live_execution_active` set to `false`. See [Trading safety switches](Project_Documentation/trader.md#10-trading-safety-switches).
 - **The dashboard has no login.** Keep its port behind a firewall on your local network.
 - **Backtests are optimistic.** Read [what the results do not include](Project_Documentation/simulator.md#what-the-results-do-not-include) before trusting a result.

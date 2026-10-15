@@ -1,3 +1,9 @@
+"""Tk simulator: backtest one or more model profiles on Coinbase history and compare them.
+
+The report and table helpers here are plain functions so the tests can check them
+without a display. Each run also updates the model performance CSV log.
+"""
+
 import json
 import math
 import queue
@@ -37,6 +43,7 @@ except ImportError:  # pragma: no cover - GUI is optional in headless env
 class SimulationProfile:
     @staticmethod
     def from_json(path):
+        """The profile file's raw JSON; describe_profile and run_backtest validate it."""
         with open(path, "r", encoding="utf-8") as handle:
             payload = json.load(handle)
         return payload
@@ -63,7 +70,10 @@ def format_model(indicators, rules):
 
 
 def describe_profile(profile):
-    """Validate a profile; return (is_valid, report text) for the Load Profile button."""
+    """Validate a profile; return (is_valid, report text).
+
+    Load Profile shows the report; Run Simulation refuses to start while any profile is invalid.
+    """
     try:
         _, granularity_seconds = resolve_granularity(profile.get("period_granularity", "FIFTEEN_MINUTE"))
         model = CompiledModel(profile, granularity_seconds)
@@ -104,6 +114,7 @@ def format_fee_line(friction):
 
 
 def format_friction(result):
+    """Report lines for the fee, slippage and tax model, the friction screen, and taxes paid."""
     friction = result["friction"]
     lines = [
         "",
@@ -434,7 +445,7 @@ def comparison_rows(results):
         display = dict(values)
         display["first_buy"] = _short_time(values["first_buy"]) if values["first_buy"] is not None else "never"
         if values["first_buy"] is None:
-            values["first_buy"] = float("inf")  # models that never bought sort last
+            values["first_buy"] = float("inf")  # models that never bought sort after every date
         display["bh_start"] = _short_time(values["bh_start"]) if values["bh_start"] is not None else "test start"
         if values["bh_start"] is None:
             values["bh_start"] = 0
@@ -463,6 +474,8 @@ def group_by_market(models):
 
 
 class SimulationWindow:
+    """Pick models, run them on a worker thread, and browse the results in tabs."""
+
     def __init__(self, root):
         self.root = root
         self.root.title("Quant Bot Simulator")
@@ -695,6 +708,7 @@ class SimulationWindow:
         )
 
     def _sort_comparison(self, key):
+        """Sort by a column; clicking it again reverses. Text starts A-Z, numbers start largest first."""
         sort_key, descending = self.comparison_sort
         descending = not descending if key == sort_key else key not in ("model", "product", "candles")
         items = sorted(self.comparison_rows, key=lambda item: self.comparison_rows[item]["sort"][key],
@@ -920,9 +934,10 @@ class SimulationWindow:
         self.root.after(100, self._poll_progress)
 
     def _simulation_worker(self, client, models, start_time=None, wait_for_fresh_signal=False):
-        """Test the API, then gather data and simulate each (name, profile) in turn.
+        """Test the API, then gather data, simulate each (name, profile) in turn and log the results.
 
-        With `start_time`, every model starts testing there (see run_backtest).
+        With `start_time`, every model starts testing there (see run_backtest). Runs off the
+        Tk thread, so it only posts events for _poll_progress to apply.
         """
         post = self.progress_queue.put
         try:
@@ -978,6 +993,7 @@ class SimulationWindow:
             post(("error", exc))
 
     def _poll_progress(self):
+        """Apply the worker's queued events to the window; checks again every 100 ms until the run ends."""
         finished = False
         while True:
             try:

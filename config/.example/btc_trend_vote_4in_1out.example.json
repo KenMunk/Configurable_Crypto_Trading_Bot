@@ -1,0 +1,93 @@
+{
+  "ticker": "BTC",
+  "product_id": "BTC-USD",
+  "strategy_horizon": "MACRO_TREND",
+  "execution_platform": "COINBASE_ADVANCED",
+  "period_granularity": "ONE_DAY",
+  "indicators": {
+    "sma_100d": {
+      "type": "SMA",
+      "period": "100d",
+      "description": "Vote 1: price above its 100-day average."
+    },
+    "sma_140d": {
+      "type": "SMA",
+      "period": "140d",
+      "description": "Vote 2: price above its 140-day (20-week) average."
+    },
+    "sma_5d": {
+      "type": "SMA",
+      "period": "5d",
+      "description": "Vote 3: 5-day average above the 100-day average."
+    },
+    "ema_10d": {
+      "type": "EMA",
+      "period": "10d",
+      "description": "Vote 4: 10-day EMA above the 100-day EMA."
+    },
+    "ema_100d": {
+      "type": "EMA",
+      "period": "100d",
+      "description": "Slow line for vote 4."
+    }
+  },
+  "strategy": {
+    "direction": "LONG_ONLY",
+    "market_regime": "TREND_FOLLOWING",
+    "entry_signal": {
+      "description": "Buy when at least 4 of 5 trend votes agree (vote 5: the 90-day return is positive).",
+      "all": [
+        "((close > sma_100d) + (close > sma_140d) + (sma_5d > sma_100d) + (ema_10d > ema_100d) + (pct_change(close, '90d') > 0)) >= 4"
+      ]
+    },
+    "exit_signal": {
+      "any": [
+        "((close > sma_100d) + (close > sma_140d) + (sma_5d > sma_100d) + (ema_10d > ema_100d) + (pct_change(close, '90d') > 0)) <= 1"
+      ],
+      "hard_stop_trigger": false,
+      "profit_lock_target": 0,
+      "description": "Sell when 1 or fewer of the 5 votes remain."
+    }
+  },
+  "friction_model": {
+    "exchange_fee_coverage_enabled": true,
+    "commission_rate_source": "exchange_api",
+    "fee_buffer_multiplier": 1.0,
+    "fallback_commission_rate": 0.005,
+    "tax_buffer_rate": 0.313,
+    "slippage_buffer": 0.0025,
+    "liquidity_fee_buffer": 0.5,
+    "rebalancing_cost_adjustment": true
+  },
+  "capital_allocation": {
+    "starting_capital": 10000,
+    "target_position_fraction": 1.0,
+    "value_harvesting_rate": 0.1,
+    "allocation_policy": "convert_harvested_profit_to_configured_trading_currency"
+  },
+  "tax_allocation": {
+    "enabled": true,
+    "rate": 0.1,
+    "schedule": {
+      "interval": "MONTHLY",
+      "day_of_month": 1,
+      "time_utc": "00:00:00"
+    },
+    "description": "Configurable tax reserve allocation that converts harvested gains into the configured trading currency on a scheduled interval."
+  },
+  "execution": {
+    "order_style": "LIMIT_WITH_FRICTION_MARGIN",
+    "live_execution_active": false,
+    "max_orders_per_day": 12,
+    "rebalance_interval_minutes": 15,
+    "primary_exchange": "COINBASE_ADVANCED"
+  },
+  "safeguards": {
+    "live_execution_active": false,
+    "use_hard_stop": false,
+    "hard_stop_percentage": 0.03,
+    "max_drawdown_limit": 0,
+    "volatility_cap": 0.08,
+    "risk_budget_per_trade": 0.02
+  }
+}

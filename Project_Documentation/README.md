@@ -6,8 +6,8 @@ This folder holds all of the project's documentation. The [project README](../RE
 
 | Page | What it covers |
 |---|---|
-| [simulator.md](simulator.md) | **Simulator guide.** Covers installing and launching the simulator, every control and results tab, the candle cache, and exactly how trades are filled, charged and taxed. It also covers what a backtest leaves out, scripting backtests in Python, and troubleshooting. |
-| [trader.md](trader.md) | **Trader guide.** Covers every `.env` setting, creating a view-only Coinbase API key, and running the engine and keeping it running. It also covers the status dashboard and its security, the ledger, the serial link, the GPU helper, the trading safety switches, and troubleshooting. |
+| [simulator.md](simulator.md) | **Simulator guide.** Covers installing and launching the simulator, every control and results tab, the buy-and-hold benchmark, the model performance log, the candle cache, and exactly how trades are filled, charged and taxed. It also covers what a backtest leaves out, scripting backtests in Python, and troubleshooting. |
+| [trader.md](trader.md) | **Trader guide.** Covers every `.env` setting, creating a view-only Coinbase API key, and running the engine and keeping it running. It also covers the status dashboard and its security, how the engine loads model profiles (one per ticker), the ledger, the serial link, the GPU helper, using the engine from Python, the trading safety switches, and troubleshooting. |
 | [model_configuration.md](model_configuration.md) | **Model configuration guide.** Covers creating a profile step by step, and every field with its default and whether the simulator uses it. It also covers flash-crash buys, the friction screen with a worked example, and what validation does and doesn't catch. This page was formerly `config_file_structure.md`. |
 
 ## References: for looking things up
@@ -21,7 +21,7 @@ This folder holds all of the project's documentation. The [project README](../RE
 
 | Page | What it covers |
 |---|---|
-| [quant_infrastructure_blueprint.md](quant_infrastructure_blueprint.md) | **The founding specification.** Its five sections cover: (1) the workstation and headless-node architecture, and the friction, value-harvesting and network-isolation principles; (2) the original engine code listing; (3) storage and memory budgets; (4) the LAN firewall rules; (5) the hardware cutover procedure. The [project README](../README.md#the-quant-infrastructure-blueprint) summarizes it and shows what has been built so far. |
+| [quant_infrastructure_blueprint.md](quant_infrastructure_blueprint.md) | **The founding specification.** Its five sections cover: (1) the workstation and headless-node architecture, and the friction, value-harvesting and network-isolation principles; (2) the original engine code listing and template profile; (3) storage and memory budgets; (4) the LAN firewall rules; (5) the hardware cutover procedure. The [project README](../README.md#the-quant-infrastructure-blueprint) summarizes it and shows what has been built so far. |
 | [system_config_structure.md](system_config_structure.md) | **The planned system configuration file:** exchange connections, fee refresh schedules and global safeguards. It is not built yet; the local `.env` file holds these settings today. |
 
 ## Suggested reading order

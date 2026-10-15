@@ -41,14 +41,18 @@ This page explains how profiles work and documents every field. The indicator ca
 
 The simulator names each model after its file name without `.json`. Any name works. When the simulator opens, it pre-selects `btc_macro_horizon.json` if that file exists.
 
-Two templates ship with the project:
+Six templates ship with the project:
 
 | Template | What it demonstrates |
 |---|---|
 | `btc_macro_horizon.example.json` | EMA trend following with a momentum screen and a trend-strength formula, on 15-minute candles |
 | `btc_mean_reversion.example.json` | Bollinger Bands, RSI, ADX, historical volatility and a daily VWAP, on 1-hour candles |
+| `btc_sma_30_100.example.json` | An SMA crossover with 20% positions, a [flash-crash reserve](#flash_crash_buy) and a [windowed drawdown stop](#the-two-drawdown-modes), on 15-minute candles |
+| `btc_ema_10_100.example.json` | An all-in EMA crossover with a 50% drawdown limit, on 15-minute candles |
+| `btc_growth_09.example.json` | A two-of-three vote that reads the ADX's `plus_di` and `minus_di` outputs, on daily candles |
+| `btc_trend_vote_4in_1out.example.json` | A five-way trend vote that enters on 4 votes and exits on 1, on daily candles |
 
-The templates demonstrate the syntax. They are not trading recommendations. As shipped, the friction screen blocks every entry the macro template signals (see [section 5](#5-the-friction-screen-worked-through)).
+The templates demonstrate the syntax. They are not trading recommendations. As shipped, the friction screen blocks every entry the macro template signals (see [section 5](#5-the-friction-screen-worked-through)). The last four are backtested research models; [config/.example/README.md](../config/.example/README.md) describes each template and shows their results.
 
 ---
 
@@ -186,10 +190,10 @@ Each block answers one question:
 | `friction_model` | What does trading cost? | Fees, slippage, tax and the liquidity buffer |
 | `capital_allocation` | How much money, and how much per trade? | `starting_capital`, `target_position_fraction` |
 | `execution` | How are orders placed? | `max_orders_per_day` |
-| `safeguards` | What limits the risk? | Hard stop, profit gate, drawdown limit |
+| `safeguards` | What limits the risk? | Hard stop, profit gate, drawdown limit and drawdown window |
 | `tax_allocation` | When are tax reserves set aside? | Nothing yet |
 
-Every simulation report ends with a **Not modeled yet** line. It lists the settings the simulator reads but does not act on yet.
+Every simulation report ends with a **Not modeled yet** line. It lists the same six settings for every model, whether or not the profile sets them: the fields marked **Not modeled yet** in the [field reference](#4-field-reference).
 
 ---
 
@@ -199,7 +203,8 @@ In the **Status** column:
 
 - **Simulated** means the simulator acts on the field.
 - **Label** means the field is descriptive only.
-- **Not modeled yet** means the field is read but has no effect in the simulator yet.
+- **Not modeled yet** means the field is planned but has no effect in the simulator yet. The report's **Not modeled yet** line lists these fields.
+- **Not used yet** means no code reads the field today.
 - **Engine** means only the trader engine uses the field.
 
 Fractions are decimals: `0.08` means 8%.
@@ -319,8 +324,9 @@ Flash-crash buys are resting limit orders placed far below the market to catch s
 | Field | Values | Default | Meaning |
 |---|---|---|---|
 | `enabled` | `true` or `false` | `true` when the block is present | Turns the feature off without deleting the block. |
-| `levels` | A list of `{"drop": ..., "allocation": ...}` | Required | Each `drop` (above 0 and below 1) places a buy that far below the previous candle's close. Each `allocation` (above 0, at most 1) sizes that buy. |
+| `levels` | A list of `{"drop": ..., "allocation": ...}` | Required | Each `drop` (above 0 and below 1) places a buy that far below the previous candle's close. Once a crash has started, the levels stay priced from the close before it. Each `allocation` (above 0, at most 1) sizes that buy. |
 | `reserve` | A positive amount, such as `100` | none | Sets aside a fixed amount of cash for these buys. The main strategy never trades it. Each level spends `allocation` of the reserve, so the allocations must add up to at most 1. Without a reserve, each level spends `allocation` of the cash available when it fills. |
+| `description` | Free text | none | For readers. |
 
 How a flash crash plays out:
 
@@ -332,6 +338,7 @@ How a flash crash plays out:
   - No exit rule or drawdown limit sells until the recovery candle's close.
   - The crash is never removed from the data. Its real prices count in the indicators, the model's value and the drawdown figures.
   - If the crash never recovers, everything stays held.
+- **Entries are not paused.** The entry rules still run during a crash, so the main strategy can buy at a crash candle's close. That position is then held through the crash like any other.
 
 Without `flash_crash_buy`, there is no crash handling: a stop fills at whatever price a candle gapped to, as a stop-market order would.
 
@@ -344,14 +351,14 @@ These settings model the real-world costs every trade pays.
 | Field | Values | Default | Status | Meaning |
 |---|---|---|---|---|
 | `exchange_fee_coverage_enabled` | `true` or `false` | `true` | Simulated | `false` removes exchange fees entirely. |
-| `commission_rate_source` | `exchange_api`, `config` or `disabled` | `exchange_api` | Simulated | `exchange_api` looks up your account's live Coinbase fee tier at the start of each run and falls back to the profile rate if the lookup fails. `config` always uses the profile rate. `disabled` charges no fees. |
+| `commission_rate_source` | `exchange_api`, `config` or `disabled` | `exchange_api` | Simulated | `exchange_api` looks up your account's live Coinbase fee tier at the start of each run and falls back to the profile rate if the lookup fails. `config` always uses the profile rate. `disabled` charges no fees. Any other value acts like `config`. |
 | `fallback_commission_rate` | Fraction | `0.005` | Simulated | The **profile rate**: used when the source is `config` or the live lookup fails. `exchange_commission_rate` is an older name for the same setting and takes precedence if both are present. |
 | `fee_buffer_multiplier` | Number, typically `1.0` to `1.5` | `1.0` | Simulated | Multiplies whichever fee rate is in use, as a safety cushion. A 0.5% rate with `1.25` becomes 0.625% per fill. |
 | `slippage_buffer` | Fraction | `0` | Simulated | Price penalty on every market-style fill: buys fill this much higher and sells this much lower. |
 | `tax_buffer_rate` | Fraction, such as `0.313` | `0` | Simulated | Tax on net realized gains, settled once a year (see [Taxes](#how-taxes-are-settled)). The friction screen also uses it. |
 | `liquidity_fee_buffer` | Fraction | `0.5` | Simulated | A cushion used only by the friction screen: this fraction of the round-trip exchange fees plus the Bitcoin network fee for moving the position on-chain. It is never charged. |
-| `liquidity_buffer` | — | — | Ignored | Superseded by `liquidity_fee_buffer`. |
-| `rebalancing_cost_adjustment` | `true` or `false` | — | Not modeled yet | The simulator never resizes an open position. |
+| `liquidity_buffer` | — | — | Not modeled yet | Superseded by `liquidity_fee_buffer`. The simulator ignores it. |
+| `rebalancing_cost_adjustment` | `true` or `false` | none | Not modeled yet | The simulator never resizes an open position. |
 
 **Which fee applies:** entries, exits, stops and profit locks fill immediately, so they pay the **taker** rate. Flash-crash limit buys rest on the book, so they pay the **maker** rate. With live rates, maker and taker come from your fee tier. With the profile rate, both equal that rate.
 
@@ -372,17 +379,17 @@ The simulator nets each calendar year's realized gains and losses. When the firs
 | `starting_capital` | Positive number | `10000` | Simulated | Starting cash, in the quote currency. **Load Profile**, the Metrics tab and the Model value chart all show it. |
 | `target_position_fraction` | Fraction from 0 to 1 | `1.0` | Simulated | The share of the model's cash committed to each entry, after setting aside any flash-crash reserve. The rest waits in cash and earns nothing. Values above 1 are not rejected and would simulate borrowing, so keep it at or below 1. |
 | `value_harvesting_rate` | Fraction | none | Not modeled yet | Planned: the share of profits moved out of trading into capital preservation. This is the blueprint's "value harvesting" (see the [README](../README.md#the-quant-infrastructure-blueprint)). |
-| `allocation_policy` | Text | none | Not modeled yet | Planned: how harvested profit is converted. |
+| `allocation_policy` | Text | none | Not used yet | Planned: how harvested profit is converted. |
 
 ### 4.6 `execution`
 
 | Field | Values | Default | Status | Meaning |
 |---|---|---|---|---|
 | `max_orders_per_day` | Whole number | Unlimited (`0` or absent) | Simulated | The maximum number of buys plus sells per UTC day. Once it is reached, new entries wait for the next UTC day. Exits are never blocked, and flash-crash fills don't count. |
-| `order_style` | Text, such as `LIMIT_WITH_FRICTION_MARGIN` | none | Not modeled yet | The simulator fills at candle prices as described in [simulator.md](simulator.md#fills-fees-and-slippage). |
-| `rebalance_interval_minutes` | Number | none | Not modeled yet | |
+| `order_style` | Text, such as `LIMIT_WITH_FRICTION_MARGIN` | none | Not used yet | The simulator fills at candle prices as described in [simulator.md](simulator.md#fills-fees-and-slippage). |
+| `rebalance_interval_minutes` | Number | none | Not used yet | Rules are evaluated once per candle, whatever this says. |
 | `primary_exchange` | Text | none | Label | |
-| `live_execution_active` | `true` or `false` | `false` | Not used yet | No code places live orders today. Keep it `false`. |
+| `live_execution_active` | `true` or `false` | `false` | Not used yet | No code places live orders today. Keep it `false`. The system-wide switch is `LIVE_EXECUTION_ACTIVE` in `.env`, which is not used yet either. |
 
 ### 4.7 `safeguards`
 
@@ -399,17 +406,19 @@ The simulator nets each calendar year's realized gains and losses. When the firs
 
 #### The two drawdown modes
 
-- **Without `drawdown_window`:** the limit is checked at each candle's close. When the model's value falls `max_drawdown_limit` below its peak, any open position is sold at the close (`DRAWDOWN_LIMIT`) and trading pauses. Trading resumes only when the entry signal switches **off** and then fires again. The peak resets when trading resumes, so separate drawdowns can add up to more than the limit.
+- **Without `drawdown_window`:** the limit is checked at each candle's close, except during a flash crash, when it waits for the recovery candle's close. When the model's value falls `max_drawdown_limit` below its peak, any open position is sold at the close (`DRAWDOWN_LIMIT`) and trading pauses. Trading resumes only when the entry signal switches **off** and then fires again. The peak resets when trading resumes, so separate drawdowns can add up to more than the limit.
 - **With `drawdown_window`** (such as `"180d"`): the limit applies to the model's value against its highest value within that trailing window, and it is enforced continuously.
   - During a trade, an equity stop (`DRAWDOWN_STOP`) sells at the exact price where the model's value would reach the limit below that high, after the sale's slippage and fee. Trading then pauses until a fresh entry signal.
   - New entries are taken only when there is room above the limit for two round trips' costs.
-  - With `0.10` and `"180d"`, the model never loses more than 10% within any six months. The exception is a gap: when the price gaps through the stop, the stop fills at the gapped price, as a real stop-market order would.
+  - With `0.10` and `"180d"`, the model never loses more than 10% within any six months. There are two exceptions:
+    - **A gap.** When the price gaps through the stop, the stop fills at the gapped price, as a real stop-market order would.
+    - **A flash crash, with `flash_crash_buy` set.** The equity stop doesn't fire on crash candles, so the model's value can fall further while a crash lasts (see [flash_crash_buy](#flash_crash_buy)).
 
 Pauses are shaded gray on the charts and listed in the Metrics tab.
 
 ### 4.8 `tax_allocation`
 
-`tax_allocation` is an optional block for a scheduled tax reserve. The simulator does not model it yet; it settles taxes yearly using `friction_model.tax_buffer_rate` instead. The trader engine keeps the block with the loaded profile, so future code can read it through `get_model_configuration(ticker)`.
+`tax_allocation` is an optional block for a scheduled tax reserve. The simulator does not model it yet; it settles taxes yearly using `friction_model.tax_buffer_rate` instead. The trader engine keeps the block with the loaded profile, so future code can read it through `get_model_configuration(ticker)`. Nothing checks its values yet. The four research templates (`btc_sma_30_100`, `btc_ema_10_100`, `btc_growth_09` and `btc_trend_vote_4in_1out`) each include a monthly example.
 
 | Field | Meaning |
 |---|---|
@@ -441,7 +450,9 @@ enter only if expected >= minimum_net_profit_gate
 In these formulas:
 
 - `fee` is the per-fill taker rate after `fee_buffer_multiplier`.
-- `network_fee` applies only to `BTC-` products. It is the live "half-hour" fee rate from mempool.space times a typical 141-vbyte transaction, valued at the candle's price.
+- `network_fee` applies only to `BTC-` products. It is the live "half-hour" fee rate from mempool.space times a typical 141-vbyte transaction, valued at the candle's price. If the lookup fails, it counts as 0.
+- `position_value` is the cash the entry would commit: the model's cash, less any flash-crash reserve, times `target_position_fraction`.
+- The price used is the signal candle's close.
 
 **Worked example: the macro template at its 0.5% profile rate**
 
@@ -454,7 +465,7 @@ Inputs: 0.5% fee, 0.25% slippage, 8% target, 50% liquidity buffer, 31.3% tax, ne
 | Before tax | 6.39% - 0.50% | +5.89% |
 | After 31.3% tax | 5.89% × 0.687 | **+4.05%** |
 
-The result, +4.05%, is below the 5% gate, so **every entry is blocked**. A run of this template reports the blocked signals as "Entry signals blocked by the screen" in Metrics and "Blocked signals" in Comparison. Each signal is counted once, even if it stays true for many candles.
+The result, +4.05%, is below the 5% gate, so **every entry is blocked**. A live fee tier gives a different figure, but any fee of 0.1% or more per fill still blocks every entry. At 0.9% per fill, for example, the result is about +3.18%. A run of this template reports the blocked signals as "Entry signals blocked by the screen" in Metrics and "Blocked signals" in Comparison. Each signal is counted once, even if it stays true for many candles.
 
 To let trades through, do one of the following:
 
@@ -462,7 +473,7 @@ To let trades through, do one of the following:
 - Lower the gate to 4%.
 - Reduce the assumed costs, if your real costs are lower.
 
-The Metrics tab prints this calculation for a full-size first trade on every run, so you can see whether the screen passes.
+The Metrics tab prints this calculation on every run, so you can see whether the screen passes. It uses the first test candle's close and a first trade of `starting_capital` × `target_position_fraction`.
 
 ---
 
@@ -482,6 +493,7 @@ These are checked when a model's simulation starts, and an error stops the whole
 
 - `strategy.direction` must be `LONG_ONLY`.
 - `exit_signal.trailing_stop` must be at least 0 and below 1.
+- `safeguards.drawdown_window`, when set, must be a candle count or a duration such as `"180d"`.
 - The start date must not be after the last candle.
 
 **Not checked:** fields outside `indicators` are read with defaults, so a misspelled key is **silently ignored**. For example, a block named `"safegaurds"` means no safeguards, and `"profit_lock_targt"` means no target and no friction screen. Out-of-range values, such as a negative fee, are also accepted. After changing costs or safeguards, check the **Friction model** section of the Metrics tab to confirm the settings took effect.

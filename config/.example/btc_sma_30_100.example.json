@@ -1,0 +1,103 @@
+{
+  "ticker": "BTC",
+  "product_id": "BTC-USD",
+  "strategy_horizon": "MACRO_TREND",
+  "execution_platform": "COINBASE_ADVANCED",
+  "period_granularity": "FIFTEEN_MINUTE",
+  "indicators": {
+    "fast_sma": {
+      "type": "SMA",
+      "period": "30d",
+      "description": "30d trend."
+    },
+    "slow_sma": {
+      "type": "SMA",
+      "period": "100d",
+      "description": "100d macro trend."
+    }
+  },
+  "strategy": {
+    "direction": "LONG_ONLY",
+    "market_regime": "TREND_FOLLOWING",
+    "entry_signal": {
+      "description": "The 30d SMA is above the 100d SMA.",
+      "all": [
+        "fast_sma > slow_sma"
+      ]
+    },
+    "exit_signal": {
+      "description": "Exit when the 30d SMA falls below the 100d SMA, at the +50% profit target, or when the model's value falls 10% below its 6-month high.",
+      "any": [
+        "fast_sma < slow_sma"
+      ],
+      "hard_stop_trigger": false,
+      "profit_lock_target": 0.5
+    },
+    "flash_crash_buy": {
+      "enabled": true,
+      "reserve": 100,
+      "description": "A fixed $100 reserve for resting limit buys 30%, 60%, 90% and 99% below the previous 15-minute close, $25 each; a fill is held until the crash recovers and sold at the recovery candle's close. The main strategy never trades the reserve.",
+      "levels": [
+        {
+          "drop": 0.3,
+          "allocation": 0.25
+        },
+        {
+          "drop": 0.6,
+          "allocation": 0.25
+        },
+        {
+          "drop": 0.9,
+          "allocation": 0.25
+        },
+        {
+          "drop": 0.99,
+          "allocation": 0.25
+        }
+      ]
+    }
+  },
+  "friction_model": {
+    "exchange_fee_coverage_enabled": true,
+    "commission_rate_source": "exchange_api",
+    "fee_buffer_multiplier": 1.0,
+    "fallback_commission_rate": 0.005,
+    "tax_buffer_rate": 0.313,
+    "slippage_buffer": 0.0025,
+    "liquidity_fee_buffer": 0.5,
+    "rebalancing_cost_adjustment": true
+  },
+  "capital_allocation": {
+    "starting_capital": 10000,
+    "target_position_fraction": 0.2,
+    "value_harvesting_rate": 0.1,
+    "allocation_policy": "convert_harvested_profit_to_configured_trading_currency"
+  },
+  "tax_allocation": {
+    "enabled": true,
+    "rate": 0.1,
+    "schedule": {
+      "interval": "MONTHLY",
+      "day_of_month": 1,
+      "time_utc": "00:00:00"
+    },
+    "description": "Configurable tax reserve allocation that converts harvested gains into the configured trading currency on a scheduled interval."
+  },
+  "execution": {
+    "order_style": "LIMIT_WITH_FRICTION_MARGIN",
+    "live_execution_active": false,
+    "max_orders_per_day": 12,
+    "rebalance_interval_minutes": 15,
+    "primary_exchange": "COINBASE_ADVANCED"
+  },
+  "safeguards": {
+    "live_execution_active": false,
+    "use_hard_stop": false,
+    "hard_stop_percentage": 0.03,
+    "minimum_net_profit_gate": 0.05,
+    "max_drawdown_limit": 0.1,
+    "volatility_cap": 0.08,
+    "risk_budget_per_trade": 0.02,
+    "drawdown_window": "180d"
+  }
+}

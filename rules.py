@@ -6,7 +6,9 @@ Nothing is passed to eval(), so a profile can't run arbitrary code.
 
 Evaluation is vectorized over the whole candle history. Conditions are float arrays
 holding 1.0 (true), 0.0 (false) or NaN (unknown, e.g. during an indicator's warm-up);
-a rule only fires where it is known to be true.
+a rule only fires where it is known to be true. "and"/"or" are the exception: they
+treat an unknown side as false, so a rule with an "or" can fire before every part of
+it has warmed up (see Rule.ready for the stricter check).
 """
 
 import ast
@@ -39,6 +41,7 @@ FUNCTIONS = {
 
 
 class RuleError(ValueError):
+    """A rule formula that doesn't parse or uses something not allowed."""
     pass
 
 
@@ -51,6 +54,7 @@ def _condition(result, *operands):
 
 
 def _known_true(condition):
+    """True where a condition is 1.0; unknown (NaN) counts as false."""
     return np.nan_to_num(condition, nan=0.0) == 1.0
 
 
@@ -60,6 +64,12 @@ def _and(a, b):
 
 
 class Rule:
+    """One rule formula, parsed and checked against the series names it may use.
+
+    `references` holds the series the formula reads; evaluate() and ready() take a dict
+    of those series' arrays (plus "close", which sets the length).
+    """
+
     def __init__(self, text, known_names, granularity_seconds):
         self.text = text
         self.granularity_seconds = granularity_seconds
@@ -153,6 +163,7 @@ class Rule:
             return float(node.value)
         with np.errstate(divide="ignore", invalid="ignore"):
             if isinstance(node, ast.BoolOp):
+                # Two-valued: an unknown part counts as false, so the result is never NaN.
                 parts = [np.nan_to_num(self._eval(v, series), nan=0.0) == 1.0 for v in node.values]
                 combine = np.logical_and if isinstance(node.op, ast.And) else np.logical_or
                 result = parts[0]
@@ -259,6 +270,7 @@ class Rule:
                 ready = np.logical_and(ready, self._ready(argument, series))
         if function in ("abs", "min", "max"):
             return ready
+        # As floats, so shift() pads the first candles with NaN, which never equals 1.
         known = np.broadcast_to(np.asarray(ready, dtype=float), (len(series["close"]),))
         if function in ("crosses_above", "crosses_below"):
             return (known == 1) & (shift(known, 1) == 1)
@@ -270,7 +282,7 @@ class Rule:
 
 
 def rules_ready(compiled, series, length):
-    """True where every rule of a compiled signal can be evaluated."""
+    """True where every rule of a compiled signal, "all" and "any" alike, can be evaluated."""
     ready = np.ones(length, dtype=bool)
     for rule in compiled["all"] + compiled["any"]:
         ready &= rule.ready(series)

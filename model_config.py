@@ -32,17 +32,23 @@ LEGACY_INDICATOR_KEYS = ("fast_window_periods", "slow_window_periods", "emergenc
 
 
 class ProfileError(ValueError):
+    """Every problem found in a profile, so they can all be reported at once."""
+
     def __init__(self, errors):
         self.errors = errors
         super().__init__("The profile has problems:\n- " + "\n- ".join(errors))
 
 
 def is_legacy_profile(profile):
+    """True for a profile written with the original fixed EMA fields."""
     return any(key in profile.get("indicators", {}) for key in LEGACY_INDICATOR_KEYS)
 
 
 def normalize_profile(profile):
-    """Return the profile in the current format, translating the original fixed EMA fields."""
+    """Return the profile in the current format, translating the original fixed EMA fields.
+
+    A legacy profile is translated in a copy; the one passed in is left unchanged.
+    """
     if not is_legacy_profile(profile):
         return profile
     profile = copy.deepcopy(profile)
@@ -87,7 +93,10 @@ def _label(name, definition, parameters):
 
 
 class CompiledModel:
-    """A validated profile, ready to produce indicator series and entry/exit signals."""
+    """A validated profile, ready to produce indicator series and entry/exit signals.
+
+    Raises ProfileError listing every problem with the indicators and rules.
+    """
 
     def __init__(self, profile, granularity_seconds):
         self.profile = normalize_profile(profile)
@@ -183,7 +192,8 @@ class CompiledModel:
     def evaluate(self, candles):
         """Return (series by name, entry signal array, exit signal array) for the candles.
 
-        `candles` may be a MetricCache shared with other models on the same candles.
+        The exit array is None when the profile has no exit rules. `candles` may be a
+        MetricCache shared with other models on the same candles.
         """
         context = IndicatorContext(candles, self.definitions, self.granularity_seconds)
         series = {name: context.series(name) for name in self.series_names}
@@ -193,7 +203,11 @@ class CompiledModel:
         return series, entry, exit_signal
 
     def entry_ready(self, series):
-        """True on each candle where every entry rule can be evaluated, past all warm-ups."""
+        """True on each candle where every entry rule can be evaluated, past all warm-ups.
+
+        `series` is the dict evaluate() returns. Entry signals aren't gated by this: an
+        "or" rule can fire earlier (see rules.py).
+        """
         return rules_ready(self.entry_rules, series, len(series["close"]))
 
     def indicator_meta(self):
@@ -216,6 +230,7 @@ class CompiledModel:
         return meta
 
     def rule_text(self):
+        """The rule formulas as written, by signal and list, for reports."""
         return {
             "entry_all": [rule.text for rule in self.entry_rules["all"]],
             "entry_any": [rule.text for rule in self.entry_rules["any"]],

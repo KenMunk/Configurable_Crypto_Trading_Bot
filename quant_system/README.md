@@ -17,8 +17,8 @@ In the [quant infrastructure blueprint](../Project_Documentation/quant_infrastru
 
 ## Things to know
 
-- **The path is relative to the current working directory.** Run `python engine.py` from the repository root to use this folder.
-- **The engine reads profiles only at start-up.** It loads every `*.json` file in `config/`, keyed by each profile's `ticker`, and does not validate them. Validate each profile with the simulator's **Load Profile** button first.
+- **The path is relative to the current working directory.** Run `python engine.py` from the repository root to use this folder. If `ledger/` or `config/` is missing, the engine creates it.
+- **The engine reads profiles only at start-up.** It loads every `*.json` file directly in `config/`, keyed by each profile's `ticker`, and does not validate them. Subfolders are not read. A later file with the same `ticker` replaces an earlier one, so only one profile per ticker stays loaded. Validate each profile with the simulator's **Load Profile** button first.
 - **A relative `COINBASE_KEY_FILE`** in `.env` is resolved against this folder when you run `python engine.py`. An absolute path avoids surprises.
 - **To use the repository's own `config/` folder instead**, run the engine with the launcher script in the [trader guide](../Project_Documentation/trader.md#keeping-the-engine-running). It uses `base_directory="."`.
 

@@ -1,0 +1,88 @@
+{
+  "ticker": "BTC",
+  "product_id": "BTC-USD",
+  "strategy_horizon": "MACRO_TREND",
+  "execution_platform": "COINBASE_ADVANCED",
+  "period_granularity": "ONE_DAY",
+  "indicators": {
+    "adx": {
+      "type": "ADX",
+      "period": 14,
+      "description": "Directional movement (ADX 14): +DI above -DI means buyers are in control"
+    },
+    "sma10": {
+      "type": "SMA",
+      "period": "10d",
+      "description": "Simple moving average, 10d"
+    },
+    "sma100": {
+      "type": "SMA",
+      "period": "100d",
+      "description": "Simple moving average, 100d"
+    },
+    "sma5": {
+      "type": "SMA",
+      "period": "5d",
+      "description": "Simple moving average, 5d"
+    }
+  },
+  "strategy": {
+    "direction": "LONG_ONLY",
+    "market_regime": "TREND_FOLLOWING",
+    "entry_signal": {
+      "description": "Buy when at least 2 of these 3 signals are true: +DI above -DI (buyers in control, ADX 14); 10-day SMA above the 100-day SMA; 5-day SMA above the 100-day SMA.",
+      "all": [
+        "((adx.plus_di > adx.minus_di) + (sma10 > sma100) + (sma5 > sma100)) >= 2"
+      ]
+    },
+    "exit_signal": {
+      "any": [
+        "((adx.plus_di > adx.minus_di) + (sma10 > sma100) + (sma5 > sma100)) <= 1"
+      ],
+      "hard_stop_trigger": false,
+      "profit_lock_target": 0,
+      "description": "Sell when 1 or fewer of them remain true."
+    }
+  },
+  "friction_model": {
+    "exchange_fee_coverage_enabled": true,
+    "commission_rate_source": "exchange_api",
+    "fee_buffer_multiplier": 1.0,
+    "fallback_commission_rate": 0.005,
+    "tax_buffer_rate": 0.313,
+    "slippage_buffer": 0.0025,
+    "liquidity_fee_buffer": 0.5,
+    "rebalancing_cost_adjustment": true
+  },
+  "capital_allocation": {
+    "starting_capital": 10000,
+    "target_position_fraction": 1.0,
+    "value_harvesting_rate": 0.1,
+    "allocation_policy": "convert_harvested_profit_to_configured_trading_currency"
+  },
+  "tax_allocation": {
+    "enabled": true,
+    "rate": 0.1,
+    "schedule": {
+      "interval": "MONTHLY",
+      "day_of_month": 1,
+      "time_utc": "00:00:00"
+    },
+    "description": "Configurable tax reserve allocation that converts harvested gains into the configured trading currency on a scheduled interval."
+  },
+  "execution": {
+    "order_style": "LIMIT_WITH_FRICTION_MARGIN",
+    "live_execution_active": false,
+    "max_orders_per_day": 12,
+    "rebalance_interval_minutes": 15,
+    "primary_exchange": "COINBASE_ADVANCED"
+  },
+  "safeguards": {
+    "live_execution_active": false,
+    "use_hard_stop": false,
+    "hard_stop_percentage": 0.03,
+    "max_drawdown_limit": 0,
+    "volatility_cap": 0.08,
+    "risk_budget_per_trade": 0.02
+  }
+}

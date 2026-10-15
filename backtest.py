@@ -204,6 +204,10 @@ def find_flash_crashes(candles, drop, granularity_seconds):
     A crash starts when a candle trades `drop` or more below the previous close, and it
     recovers at the first close back above that level. Crashes are only located here: the
     candles are left as they traded, so the strategy sees every crash's real prices.
+
+    Returns a dict per crash, where `start` and `end` index into `candles` (`end` is the
+    recovery candle, or None if the data ends before it recovers) and `minutes` is how
+    long it lasted.
     """
     if not drop:
         return []
@@ -281,8 +285,11 @@ def run_backtest(candles, profile, starting_capital=None, progress=None, frictio
                  start_time=None, wait_for_fresh_signal=False):
     """Simulate a long-only strategy over `candles` using the profile's indicators and rules.
 
-    The model starts with `starting_capital`, or the profile's
-    capital_allocation.starting_capital when it isn't given.
+    `candles` is the full history, oldest first (ideally from load_candles, whose metric
+    cache other models on the same market share). `profile` is the model's config.
+    `starting_capital` defaults to the profile's capital_allocation.starting_capital, and
+    `friction` to a FrictionModel built from the profile. `progress(fraction, message)` is
+    called about once per percent.
 
     With `start_time` (a unix timestamp), the test begins at the first candle at or after
     it: the model holds its starting capital in cash and looks for an entry from there.
@@ -291,18 +298,36 @@ def run_backtest(candles, profile, starting_capital=None, progress=None, frictio
     `start_time`. With `wait_for_fresh_signal`, an entry signal already true at the start
     is not taken; the model waits for it to switch off and fire again.
 
-    Buy and hold is measured from the close of the first candle on which the model could
-    buy, once every entry rule's indicators and lookbacks have warmed up (or its first buy,
-    if that came sooner). The indicator warm-up then doesn't count against the model,
-    while its choice to wait in cash after that does.
-
     Entry and exit rules (see model_config.py) are evaluated on each candle's close and
-    filled at that close. Hard stops and profit locks trigger intrabar on the candle's low/high and
-    fill at their trigger price; when both are hit in one candle the stop is assumed
-    first. Every entry signal must pass the friction screen (see friction.py), and
-    tax on each calendar year's net realized gain is paid from cash when the next
-    year begins, with losses carried forward. `progress(fraction, message)` is called
-    about once per percent.
+    filled at that close. Hard stops, trailing stops and profit locks trigger intrabar on
+    the candle's low/high and fill at their trigger price (or the open, if it gapped past
+    it); when a stop and the profit lock are both hit in one candle the stop is assumed
+    first. Every entry signal must pass the friction screen (see friction.py), and tax on
+    each calendar year's net realized gain is paid from cash when the next year begins,
+    with losses carried forward. Flash crashes are traded as they happened: optional
+    limit buys at strategy.flash_crash_buy levels, sold on the recovery candle's close;
+    the model never sells into a crash (see the comment in the candle loop).
+
+    Returns a dict; the main keys:
+        period_start, period_end, candle_count   the tested candles (after `start_time`)
+        warmup_candles     candles before the test start, used only for indicator warm-up
+        starting_capital, ending_equity, total_return
+        first_entry        time of the first signal entry, or None
+        ready_to_trade     first candle on which every entry rule's indicators and
+                           lookbacks have warmed up, or None if they never do
+        buy_and_hold_start, buy_and_hold_return
+                           buy and hold from the close of the ready_to_trade candle (or
+                           the first entry, if that came sooner), so the warm-up doesn't
+                           count against the model but its choice to wait in cash does
+        buy_and_hold_from_test_start   buy and hold from the first tested candle
+        max_drawdown, max_window_drawdown, drawdown_window
+                           the worst drawdown overall and within any `drawdown_window`
+        trade_count, win_rate, trades   closed trades, flash-crash lots included
+        fees_paid, commission_rate, taxes_paid, tax_payments, estimated_tax_due
+        screened_signals   entry signals the friction screen blocked
+        flash_crash_buys, flash_crash_events, open_flash_lots
+        open_position, drawdown_pauses, friction, indicators, rules, unmodeled_settings
+        series             per-candle time, close, equity and indicator values for charts
     """
     if not candles:
         raise ValueError("No candles to simulate")
@@ -466,7 +491,7 @@ def run_backtest(candles, profile, starting_capital=None, progress=None, frictio
             "return": (proceeds - fee) / entry["cost"] - 1,
             "entry_reason": entry["reason"],
             "exit_reason": reason,
-            "equity_after": cash,  # the position is closed, so equity is all cash
+            "equity_after": cash,  # the position is closed; excludes any flash-crash lots still held
         })
         units = 0.0
         entry = None

@@ -1,4 +1,5 @@
-"""Backtest charts: price with EMA trend lines and trades, and model value over time.
+"""Backtest charts: price with its indicators, oscillator panels and trades, and model value
+over time against buy and hold.
 
 The charts draw on any matplotlib canvas, so the simulator embeds them in Tk and
 the tests render them headless. Hover shows a crosshair and tooltip, redrawn by
@@ -172,6 +173,7 @@ class _HoverChart:
                            label="Paused (drawdown limit)" if number == 0 and ax is self.ax else "_nolegend_")
 
     def _finish(self, title, subtitle, ylabel, hover_values, hover_color, legend_columns, legend_location="upper left"):
+        """Axes, titles, legend and floor shared by both charts, then the hidden hover artists."""
         ax = self.ax
         ax.set_yscale("log")
         ax.yaxis.set_major_locator(PriceLogLocator())
@@ -223,6 +225,7 @@ class _HoverChart:
         self.canvas.draw_idle()
 
     def tooltip_text(self, index):
+        """Hover text for the candle at `index`; each chart supplies its own."""
         raise NotImplementedError
 
     def _on_draw(self, _event):
@@ -444,8 +447,8 @@ class ModelValueChart(_HoverChart):
         self.run_x = [mdates.date2num(run_times) for run_times in self.run_times]
         self.run_values = [np.asarray(run["series"]["equity"]) for run in runs]
 
-        # One buy-and-hold line per product and starting value, starting where a model could
-        # first buy: the chosen model's where it trades that product, otherwise the first such model's.
+        # One buy-and-hold line per product and starting value. Each starts where a model could
+        # first buy: the chosen model's start for its own line, else the first model with that product and value.
         self.benchmarks = {}
         for position in [primary] + [p for p in range(len(runs)) if p != primary]:
             run = runs[position]
@@ -520,7 +523,7 @@ class ModelValueChart(_HoverChart):
         moment = self.x_values[index]
         lines = [_format_timestamp(self.result["series"]["time"][index])]
         for position, run in enumerate(self.runs):
-            # Runs can have different candle times, so each is read at its nearest candle.
+            # Runs can have different candle times, so each is read at its first candle at or after the hovered one.
             nearest = int(np.clip(np.searchsorted(self.run_x[position], moment), 0, len(self.run_x[position]) - 1))
             value, capital = self.run_values[position][nearest], run["starting_capital"]
             name = "Model value" if len(self.runs) == 1 else run.get("model_name", f"Model {position + 1}")

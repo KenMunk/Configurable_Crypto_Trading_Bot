@@ -24,7 +24,9 @@ This folder holds the **model profiles**: JSON files that each describe one comp
 2. Edit the profile. Every field is documented in the [model configuration guide](../Project_Documentation/model_configuration.md), and every indicator and rule function in the [indicator reference](../Project_Documentation/indicator_reference.md).
 3. In the simulator, click **Refresh**, select the model, and click **Load Profile** to validate it.
 
-When the simulator opens, it pre-selects `btc_macro_horizon.json` if that file exists. To test variants side by side, save them as separate files and select them together.
+When the simulator opens, it pre-selects `btc_macro_horizon.json` if that file exists, and otherwise the first model in the list. **Refresh** rescans this folder and keeps your current selection. To test variants side by side, save them as separate files and select them together.
+
+To test a profile stored elsewhere, use **Add file...** in the simulator. It adds the file to the list for this session without copying it here.
 
 ## Which tools read this folder
 

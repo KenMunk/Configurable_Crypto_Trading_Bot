@@ -1,6 +1,6 @@
 # quant_system/ledger/: the trader's ledger
 
-This folder holds `fortress.db`, the SQLite ledger that `python engine.py` creates in its base directory, [quant_system/](../README.md).
+This folder holds `fortress.db`, the SQLite ledger that `python engine.py` creates in its base directory, [quant_system/](../README.md). The engine creates it as soon as it is constructed, before it loads profiles. The simulator does not use this file; it uses the repository's [ledger/](../../ledger/README.md) folder.
 
 ## What it contains
 
@@ -15,4 +15,4 @@ While a connection is open, SQLite may create `fortress.db-wal` and `fortress.db
 
 ## In Git
 
-The empty database is tracked. If it is deleted, it is recreated automatically the next time the engine starts. Once it holds real trading records, keep it out of the repository.
+The empty database is tracked. If it is deleted, it is recreated automatically the next time the engine starts. Git does not ignore the `fortress.db-wal` and `fortress.db-shm` files, so don't commit them if they appear. Once it holds real trading records, keep it out of the repository.

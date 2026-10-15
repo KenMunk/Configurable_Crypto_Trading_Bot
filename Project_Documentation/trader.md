@@ -70,21 +70,22 @@ In PowerShell: `Copy-Item .env.example .env`
 |---|---|---|---|
 | `COINBASE_API_KEY_NAME` | empty | Engine, simulator | The key name, in the form `organizations/{org_id}/apiKeys/{key_id}`. |
 | `COINBASE_API_KEY_SECRET` | empty | Engine, simulator | The private key: a base64 Ed25519 secret, or an ECDSA PEM key on one line with its line breaks written as `\n`, inside double quotes. |
-| `COINBASE_KEY_FILE` | empty | Engine, simulator | The path to a key JSON file, used only when the name or the secret above is empty. A relative path resolves against the engine's base directory: the current directory for the simulator, but `quant_system/` for `python engine.py`. An absolute path is safest. |
+| `COINBASE_KEY_FILE` | empty | Engine, simulator | The path to a key JSON file, used only when the name or the secret above is empty. Both values then come from the file. A relative path resolves against the engine's base directory: the current directory for the simulator, but `quant_system/` for `python engine.py`. An absolute path is safest. |
 | `COINBASE_REQUIRED_PERMISSIONS` | `view` | Reports | A comma-separated list of the permissions you expect the key to have. It is documentation only: authentication results repeat it, but it grants nothing. |
 | `COINBASE_BASE_URL` | `https://api.coinbase.com` | Engine, simulator | The API host. |
 | `COINBASE_ALLOW_TRADING` | `false` | Not used yet | A reserved guard for future order routing. Keep it `false`. |
 | `COINBASE_ENABLED` | `false` | Not used yet | Loaded, but nothing checks it. Authentication works either way. |
 | `KRAKEN_API_KEY`, `KRAKEN_API_SECRET`, `KRAKEN_BASE_URL`, `KRAKEN_ENABLED` | empty, empty, `https://api.kraken.com`, `false` | Not used yet | Placeholders for a future Kraken connection. |
-| `LAN_PORT` | `8080` | Your launcher | Loaded, but `python engine.py` always uses port 8080. The [launcher script](#keeping-the-engine-running) below uses this value. |
+| `LAN_PORT` | `8080` | Your launcher | Loaded, but `python engine.py` always uses port 8080. The [launcher script](#keeping-the-engine-running) below uses this value. It must be a whole number: any other value stops both the engine and the simulator from starting. |
 | `LIVE_EXECUTION_ACTIVE` | `false` | Not used yet | A reserved system-wide switch for live trading. Keep it `false`. |
 
 ### How the file is read
 
-- Each line holds one `KEY=value`. Blank lines and lines starting with `#` are skipped, and keys are not case-sensitive.
+- Each line holds one `KEY=value`. Blank lines, lines starting with `#` and lines without `=` are skipped. Keys are not case-sensitive.
 - Surrounding single or double quotes are removed from values.
 - `true`, `false`, `yes` and `no` become booleans, in any case. Numbers become numbers.
-- **Comments must be on their own line.** An inline comment becomes part of the value, which can quietly invert a setting. For example, `COINBASE_ALLOW_TRADING=false  # off` reads as **true**, and `LAN_PORT=8080 # dashboard` stops the engine from starting.
+- For the on/off settings, `1` and any other non-empty text also mean on. `0` and an empty value mean off.
+- **Comments must be on their own line.** An inline comment becomes part of the value, which can quietly invert a setting. For example, `COINBASE_ALLOW_TRADING=false  # off` reads as **true**, and `LAN_PORT=8080 # dashboard` stops the engine and the simulator from starting.
 - Unknown keys are ignored. Without a `.env` file, the defaults apply and no credentials are set.
 
 ### Using a key file instead
@@ -127,17 +128,21 @@ The check uses the official `coinbase-advanced-py` SDK. It lists your accounts, 
 }
 ```
 
-On failure, `authenticated` is `false` and `message` explains why:
+On failure, `authenticated` is `false`, `account_count` is `0` and `message` explains why:
 
-- **HTTP 401:** check the key name and private key, and that the key has not expired. The result also gets an `outbound_ip` field, looked up from api.ipify.org.
+- **HTTP 401:** check the key name and private key, and that the key has not expired. The result also gets an `outbound_ip` field, looked up from api.ipify.org, and the address is added to `message`. If the lookup fails, the field reads `unavailable`.
 - **HTTP 403:** the key was accepted but lacks permission. Enable **View** on the key.
+- **No connection:** `message` starts with `Could not reach the Coinbase API:`.
+- **No key:** `message` is the missing-key or missing-file error listed in [Troubleshooting](#12-troubleshooting).
 
-Before creating a client, the engine runs two checks:
+The check never raises an error, so a failed check cannot stop the engine.
 
-- **Python on `PATH`.** If the running Python's folder isn't on `PATH`, the engine offers to add it. On Windows, accepting writes the folder to your user `PATH` and applies it to the running process. Declining is harmless when the right interpreter is already running.
+After reading the key and before creating a client, the engine runs two checks:
+
+- **Python on `PATH`.** If the running Python's folder isn't on `PATH`, the engine offers to add it. On Windows, accepting writes the folder to your user `PATH` and applies it to the running process. On other systems, it applies only to the running process. Declining is harmless when the right interpreter is already running.
 - **The Coinbase SDK.** If `coinbase-advanced-py` can't be imported, the engine offers to `pip install` it into the running interpreter.
 
-In a terminal, the engine asks these questions with a `[y/N]` prompt. Without a terminal, such as under a service manager, it declines automatically and logs why. The simulator asks with dialog boxes instead.
+In a terminal, the engine asks these questions with a `[y/N]` prompt. This includes checks started from the dashboard: the request waits until you answer in the terminal. Without a terminal, such as under a service manager, it declines automatically and logs why. The simulator asks with dialog boxes instead.
 
 ---
 
@@ -152,7 +157,7 @@ With this command, the engine uses the following settings:
 | Setting | Value |
 |---|---|
 | Base directory | `./quant_system` |
-| Model profiles | `quant_system/config/*.json`; the folder is created if it is missing and is ignored by Git |
+| Model profiles | `quant_system/config/*.json`; the folder is ignored by Git. If it is missing, it is created and no profiles load. |
 | Ledger | `quant_system/ledger/fortress.db` |
 | `.env` | read from the current directory |
 | Serial port | `/dev/ttyS0` |
@@ -235,7 +240,10 @@ The dashboard is a small JSON API served by Python's built-in HTTP server.
 |---|---|
 | `GET /` or `GET /api/status` | `200` with the node status (below). |
 | `GET /api/coinbase/authenticate` | Runs the read-only [authentication check](#the-authentication-check) immediately and returns its result: `200` if it succeeded, `502` if it failed. |
-| Anything else | `404 Endpoint Out of Scope` |
+| Any other path | `404 Endpoint Out of Scope`. Paths must match exactly, so `/api/status?x=1` also gets `404`. |
+| Any other method, such as `POST` | `501 Unsupported method` |
+
+The server handles one request at a time, so status requests wait while an authentication check runs. The dashboard does not log requests.
 
 ```bash
 curl http://localhost:8080/api/status
@@ -274,8 +282,8 @@ The dashboard listens on **all network interfaces** (`0.0.0.0`), over plain HTTP
 
 The engine reads model profiles in the same JSON format as the simulator (see [model_configuration.md](model_configuration.md)):
 
-- **Which files:** every `*.json` file in `<base directory>/config/`, in alphabetical order, once at start-up.
-- **The `ticker` key:** each profile is stored under its `ticker`. If a later file has the same ticker, it replaces the earlier one.
+- **Which files:** every `*.json` file directly in `<base directory>/config/`, in alphabetical order, once at start-up. Subfolders, such as `config/.example/`, are not read. The extension is case-sensitive, so `.JSON` files are skipped.
+- **The `ticker` key:** each profile is stored under its `ticker`. If a later file has the same ticker, it replaces the earlier one, so the engine holds **one profile per ticker**. For example, with the repository's `config/` folder, only the alphabetically last `BTC` profile stays loaded.
 - **Bad files:** a file that isn't valid JSON, or has no `ticker`, is skipped with a message such as `Parsing failure on my_model.json: 'ticker'`. In that message, `'ticker'` means the field is missing.
 - **No validation:** the engine does **not** validate indicators or rules. Check every profile with the simulator's **Load Profile** button before deploying it.
 - **Changes:** after changing profiles, restart the engine, or call `ingest_configuration_profiles()` again. A reload adds and replaces profiles but does not remove ones whose files were deleted.
@@ -293,7 +301,7 @@ At start-up, the engine creates `<base directory>/ledger/fortress.db`, an SQLite
 
 The ledger has no tables yet. `storage.get_connection(read_only=True)` returns a query-only connection and cursor for future readers.
 
-The two empty ledger files (`ledger/fortress.db`, created by the simulator, and `quant_system/ledger/fortress.db`) are currently tracked by Git. Once the ledger holds real trading records, keep it out of the repository.
+The two empty ledger files (`ledger/fortress.db`, created by the simulator, and `quant_system/ledger/fortress.db`) are currently tracked by Git. Git does not ignore the `fortress.db-wal` and `fortress.db-shm` files that SQLite may create beside them while a connection is open. Once the ledger holds real trading records, keep it out of the repository.
 
 ---
 
@@ -314,15 +322,17 @@ No messages are exchanged over the link yet. The handover protocol is planned; s
 
 ## 9. GPU simulation helper
 
-`execute_isolated_gpu_simulation(device_id, target_architecture, raw_prices, window_size)` computes a simple moving average of `raw_prices` over `window_size` values on an NVIDIA GPU, using the optional `cupy` package. It returns a numpy array, or `None` in any of these cases:
+`execute_isolated_gpu_simulation(device_id, target_architecture, raw_prices, window_size)` computes a simple moving average of `raw_prices` over `window_size` values on an NVIDIA GPU, using the optional `cupy` package (it is not in `requirements.txt`). It returns a numpy array with one value per full window, so `len(raw_prices) - window_size + 1` values. It returns `None` in any of these cases:
 
-- `cupy` is not installed, or the GPU computation fails.
+- `cupy` is not installed, or the computation on the GPU fails.
 - **The mutual exclusion guard:** the machine has both an RTX-generation and a GTX-generation card. The blueprint forbids mixing GPU generations in one run, to protect the driver stack.
 - `target_architecture`, such as `"RTX"`, does not appear in the name of device `device_id`.
 
 ```python
 averages = engine.execute_isolated_gpu_simulation(0, "RTX", prices, 20)
 ```
+
+The device checks are not guarded. If `cupy` is installed but no CUDA device or driver is available, or `device_id` does not exist, the call raises an error instead of returning `None`.
 
 The simulator does not use this helper; its backtests run on the CPU with numpy.
 
@@ -357,17 +367,19 @@ client = engine.create_coinbase_client()    # an authenticated coinbase.rest.RES
 
 | Member | Purpose |
 |---|---|
-| `QuantitativeTradingEngine(base_directory, serial_port="/dev/ttyS0", node_is_primary=True, env_file=".env")` | Creates the engine. It loads `env_file` and creates the ledger immediately. |
+| `QuantitativeTradingEngine(base_directory, serial_port="/dev/ttyS0", node_is_primary=True, env_file=".env")` | Creates the engine. It creates the ledger and loads `env_file` immediately. It does not load profiles, open the serial port or start the dashboard. |
 | `initialize_node_cluster(lan_port=8080)` | Loads the profiles, opens the serial link and starts the dashboard. |
 | `ingest_configuration_profiles()` | Re-reads `<base directory>/config/*.json`. |
 | `loaded_models`, `get_model_configuration(ticker)` | The loaded profiles, keyed by ticker. |
 | `authenticate_coinbase(dependency_prompt=None, path_prompt=None, client=None)` | Runs the read-only check and stores it in `last_coinbase_authentication`. The prompts are functions that return `True` to approve an SDK install or a `PATH` change. |
-| `create_coinbase_client(...)` | An authenticated Advanced Trade `RESTClient`. |
+| `create_coinbase_client(dependency_prompt=None, path_prompt=None)` | An authenticated Advanced Trade `RESTClient`. Unlike `authenticate_coinbase()`, it raises an error if the key or the SDK is missing. |
 | `load_coinbase_credentials()` | The resolved `(key_name, private_key)`. |
-| `get_runtime_configuration()`, `get_exchange_connection(name)` | The loaded settings. **These include your API secrets**, so never log, print or serve them. |
+| `get_runtime_configuration()`, `get_exchange_connection(name)` | The loaded settings. `name` is `coinbase` or `kraken`; anything else raises `ValueError`. **These include your API secrets**, so never log, print or serve them. |
+| `last_coinbase_authentication`, `serial_link_active`, `is_active_executor` | The last check result (or `None`), whether the serial port opened, and the `node_is_primary` value. |
 | `web_server` | The running `HTTPServer`, or `None`. Call `web_server.shutdown()` to stop it. |
 | `storage.get_connection(read_only=False)` | An `(connection, cursor)` pair for the ledger. |
 | `load_environment_config(env_path=".env")` | A module-level function that reads `.env` into a dictionary, without creating an engine. |
+| `ensure_python_path(prompt=None)`, `ensure_coinbase_sdk(prompt=None, path_prompt=None)` | Module-level functions that run the `PATH` and SDK checks. Each returns `True` when its check passes. |
 
 ---
 
@@ -383,5 +395,8 @@ client = engine.create_coinbase_client()    # an authenticated coinbase.rest.RES
 | `Parsing failure on x.json: Expecting ...` | A JSON syntax error. The message gives the line and column. |
 | `coinbase-advanced-py is missing and no interactive prompt is available` | Install the requirements into the interpreter that runs the engine: `pip install -r requirements.txt`. |
 | `Coinbase API key name and private key are required ...` | `.env` wasn't found (run from the folder that contains it) or is missing the key. |
+| `Coinbase key file not found: ...` | `COINBASE_KEY_FILE` points to a missing file. A relative path is resolved against the base directory, so use an absolute path. |
+| `The coinbase-advanced-py package is unavailable to ...` | The SDK install was declined or failed. Install the requirements into the interpreter named in the message. |
+| `Could not reach the Coinbase API: ...` | There is no network connection, or `COINBASE_BASE_URL` is wrong. |
 | Authentication fails with HTTP 401 or 403 | See [The authentication check](#the-authentication-check). |
 | The dashboard works locally but not from another machine | A firewall is blocking the port. Allow it for your local network only. |

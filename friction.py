@@ -1,7 +1,8 @@
 """Friction model: the real-world costs every simulated trade passes through.
 
 Charged on each fill (both ends of a round trip):
-- exchange commission, from the live Coinbase fee tier or the profile
+- exchange commission, from the live Coinbase fee tier or the profile, times
+  fee_buffer_multiplier
 - slippage, as a price penalty
 
 Used only to screen entries, never charged at the moment of a trade:
@@ -9,7 +10,10 @@ Used only to screen entries, never charged at the moment of a trade:
   the Bitcoin network transaction fee for moving the position on-chain
 - the tax buffer on the remaining gain
 
-Taxes themselves are settled by the backtest once a year on net realized gains.
+The screen only runs when the profile sets both a profit_lock_target and a
+minimum_net_profit_gate. Taxes themselves are settled by the backtest once a year on
+net realized gains. The fetch_* helpers make network calls; FrictionModel itself never
+does, so a backtest without live inputs runs on the profile's rates alone.
 """
 
 import json
@@ -33,7 +37,10 @@ def fetch_exchange_fee_rates(client):
 
 
 def fetch_bitcoin_network_fee(timeout=10):
-    """Return the fee in BTC for a typical transaction confirmed within about half an hour."""
+    """Return {"sats_per_vbyte", "btc"} for a typical transaction confirmed in about half an hour.
+
+    Uses mempool.space's recommended halfHourFee rate times BITCOIN_TX_VBYTES.
+    """
     request = Request(BITCOIN_FEE_URL, headers={"User-Agent": "ConfigurableCryptoTradingBot/1.0"})
     with urlopen(request, timeout=timeout) as response:
         rates = json.loads(response.read().decode("utf-8"))
@@ -67,6 +74,7 @@ def fetch_friction_inputs(client, profiles):
 
 
 def _commission_source(friction):
+    """Where the commission comes from: "disabled", "exchange_api" or another source (the profile)."""
     if not friction.get("exchange_fee_coverage_enabled", True):
         return "disabled"
     # Profiles written before commission_rate_source existed still look up live fees;
@@ -75,10 +83,17 @@ def _commission_source(friction):
 
 
 def _base_currency(profile):
+    """The base asset of the profile's product_id, e.g. "BTC" for "BTC-USD"."""
     return str(profile.get("product_id") or "").partition("-")[0].upper()
 
 
 class FrictionModel:
+    """One profile's trading costs and its entry screen.
+
+    `inputs` is the dict from fetch_friction_inputs; without it (or when a fetch failed)
+    the commission falls back to exchange_commission_rate and the network fee is zero.
+    """
+
     def __init__(self, profile, inputs=None):
         inputs = inputs or {}
         friction = profile.get("friction_model", {})
@@ -104,7 +119,8 @@ class FrictionModel:
         self.maker_rate = maker
         self.taker_rate = taker
         self.fee_buffer_multiplier = float(friction.get("fee_buffer_multiplier", 1.0))
-        # The backtest fills immediately at the candle price, so both ends pay the taker rate.
+        # Regular fills happen immediately at the candle price, so both ends pay the taker
+        # rate. Resting limit orders (flash-crash buys) use maker_rate instead; see backtest.py.
         self.fill_fee_rate = taker * self.fee_buffer_multiplier
 
         self.slippage = float(friction.get("slippage_buffer", 0.0))
@@ -139,11 +155,17 @@ class FrictionModel:
         return pre_tax * (1 - self.tax_rate) if pre_tax > 0 else pre_tax
 
     def passes_screen(self, price, position_value):
+        """True if an entry may go ahead: the screen is off, or the expected net return
+        at the profit target meets minimum_net_profit_gate."""
         if not self.screen_enabled:
             return True
         return self.expected_net_return(price, position_value) >= self.minimum_net_profit
 
     def describe(self, price=None, position_value=None):
+        """The model's rates and settings as a dict for reports.
+
+        Includes expected_net_return when a price and a non-zero position value are given.
+        """
         summary = {
             "commission_source": self.fee_source_detail,
             "maker_rate": self.maker_rate,

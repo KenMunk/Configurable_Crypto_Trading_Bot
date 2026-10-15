@@ -281,6 +281,7 @@ class MarketMetrics:
         self._caches = {}
 
     def cache(self, candles):
+        """The shared cache for `candles`, one per distinct candle range."""
         key = (len(candles), candles[0]["start"], candles[-1]["start"])
         if key not in self._caches:
             self._caches[key] = StoredMetricCache(candles, self.store, self.table)

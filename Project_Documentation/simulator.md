@@ -65,14 +65,14 @@ python simulator.py
 
 The model list (`config/`) and the data cache (`data/`) are always found next to `simulator.py`.
 
-The simulator reuses the trader engine's authentication code. As a side effect, it creates an empty `ledger/fortress.db` in the current directory.
+The window opens with the title **Quant Bot Simulator**. The simulator reuses the trader engine's authentication code. As a side effect, it creates an empty `ledger/fortress.db` in the current directory when it starts.
 
 ---
 
 ## 3. Your first run
 
 1. **Select a model** in the **Models** list.
-2. Click **Load Profile**. The **Metrics** tab confirms the profile is valid and lists its starting value, indicators and rules, or it lists every problem it found.
+2. Click **Load Profile**. The **Metrics** tab confirms the profile is valid and lists its starting value, flash-crash buys, indicators and rules, or it lists every problem it found.
 3. *(Optional)* Click **Test Coinbase Authentication** to check your API key on its own.
 4. *(Optional)* Type a **Start testing from** date, such as `2022-01-01`.
 5. Click **Run Simulation** and watch the three progress bars. The first run for a product and candle size downloads the full history, which can take several minutes. Later runs load it from the cache.
@@ -89,8 +89,9 @@ From top to bottom:
 The list shows every `.json` file in `config/`, named after the file (`btc_macro_horizon.json` appears as `btc_macro_horizon`).
 
 - Click to select one model. Ctrl-click or Shift-click to select several, or use **Select all**. Every selected model is tested in the same run.
-- **Add file...** adds profiles from anywhere on disk to the list.
-- **Refresh** picks up files added to or removed from `config/`, and keeps your selection.
+- When the window opens, `btc_macro_horizon` is selected if it exists; otherwise the first model is.
+- **Add file...** adds profiles from anywhere on disk to the list and selects them, along with the models already selected.
+- **Refresh** picks up files added to or removed from `config/`, and keeps your selection. Files added with **Add file...** stay in the list while they still exist.
 - If two files share a name, the second appears as `name (2)`.
 
 ### Start testing from
@@ -102,7 +103,7 @@ The list shows every `.json` file in `config/`, named after the file (`btc_macro
 
 | Button | What it does |
 |---|---|
-| **Load Profile** | Validates every selected profile and writes a report to the **Metrics** tab. With one profile selected, the report also shows the profile's JSON. |
+| **Load Profile** | Validates every selected profile and writes a report to the **Metrics** tab, one section per profile headed `=== name ===`. With one profile selected, the report also shows the profile's JSON. A profile in the original fixed-EMA format gets a note that it was translated into indicators and rules. |
 | **Run Simulation** | Backtests every selected profile. The button is disabled while a run is in progress. |
 | **Test Coinbase Authentication** | Makes a read-only account request with your key and shows the full result in the **Metrics** tab. |
 
@@ -113,6 +114,8 @@ The list shows every `.json` file in `config/`, named after the file (`btc_macro
 | **API check** | The authentication test, then the fee lookups. |
 | **Data gathering (10 years)** | Candle downloads or cache loads, one product and candle size at a time. |
 | **Simulation** | Each model in turn: its indicators, then every candle of its test. |
+
+Under each bar, a line shows its percentage and what it is doing, such as `BTC-USD FIFTEEN_MINUTE: 350,640 candles loaded from cache`. Before a run, it reads `waiting`.
 
 ### Showing model
 
@@ -132,17 +135,18 @@ The bottom of the window shows two status lines: the simulation status (what is 
 
 When you click **Run Simulation**, the simulator works through these steps:
 
-1. **Validation.** Every selected profile is checked. If any has a problem, nothing runs, and a dialog lists the first problem in each failing profile. **Load Profile** lists every problem.
+1. **Validation.** The start date is checked, then every selected profile. If any has a problem, nothing runs, and a dialog lists the first problem in each failing profile. **Load Profile** lists every problem.
 2. **Client set-up.** The simulator creates a Coinbase client from your `.env` settings. If the Coinbase SDK (`coinbase-advanced-py`) is missing, it asks whether to install it into the running Python. If Python's folder isn't on `PATH`, it offers to add it (see [Troubleshooting](#10-troubleshooting)).
 3. **API check.** A read-only request lists your accounts. If it fails, the run stops before downloading anything, and the status line explains why.
 4. **Fee lookups**, once for the whole run:
    - **Your live Coinbase fee tier**, if any selected profile uses `commission_rate_source: "exchange_api"`, which is the default.
    - **The Bitcoin network fee** from [mempool.space](https://mempool.space), if any selected profile trades a `BTC-` product.
 
-   If a lookup fails, the run continues with the profile's fallback rate, and the Metrics tab gives the reason.
+   If the fee tier lookup fails, the run continues with the profile's fallback rate. If the network fee lookup fails, the run continues without a network fee. Either way, the Metrics tab gives the reason. When both lookups are done, the **API check** bar shows the fee rates of the first selected model.
 5. **Data gathering.** Candles are loaded for each distinct product and candle size. Models that share both also share one download.
 6. **Simulation.** Each model is backtested in turn.
-7. **Results.** The tabs fill in, and the **Showing model** picker selects the best model by return.
+7. **Performance log.** Each model's results are recorded in the [model performance log](#model-performance-log).
+8. **Results.** The tabs fill in, and the **Showing model** picker selects the best model by return. The status line reports the return and trade count (or, with several models, the best one) and what the performance log recorded.
 
 There is no cancel button. Closing the window stops a run. A download interrupted that way is not saved, and the next run fetches that range again.
 
@@ -163,7 +167,8 @@ data/candles.db
 ```
 
 - **The first run** for a product and candle size downloads everything, in requests of up to 350 candles with a 0.1 second pause between them.
-- **Later runs** load the cache and fetch only candles that have closed since the last run. New candles are added to the table, and candles already in it are never rewritten.
+- **Later runs** load the cache and fetch only candles that have closed since the last run. New candles are added to the table, and candles already in it are never rewritten. The **Data gathering** bar says which happened: `candles loaded from cache`, `candles downloaded`, or a count of each.
+- **Candles are kept as they traded.** Nothing is removed or smoothed, including flash crashes and prints that look like errors.
 - **To force a fresh download**, delete `data/candles.db`. Deleting it also discards every stored metric.
 - **A CSV cache from an earlier version** (`data/BTC-USD_FIFTEEN_MINUTE.csv` with its `.meta.json`) is imported into the database the first time it is needed, which takes a couple of seconds. After that, the CSV files are not read, and you can delete them.
 - `data/` is ignored by Git. It also holds `model_performance.csv`, the [model performance log](#model-performance-log).
@@ -180,12 +185,12 @@ The models in a run share their indicators. An indicator that two profiles defin
 
   In practice, this means CCI, and Donchian, Williams %R, Stochastic, WMA and HMA over long periods. For example, a 30-day CCI on 15-minute candles takes about 5.5 seconds to compute.
 
-  Fast indicators, such as SMA and Bollinger Bands, are computed every run, because computing them is quicker than reading them back. EMA, DEMA, TEMA, MACD, RSI, ATR, ADX, Keltner, OBV and VWAP are never stored. Each of their values depends on the entire history before it, so new candles would mean recomputing them from the start.
-- **Column names.** A column is named after the indicator's type and settings, with periods counted in candles. For example, a 30-day CCI on 15-minute candles is stored as `CCI(period=2880)`.
+  Fast indicators, such as SMA and Bollinger Bands, are computed every run, because computing them is quicker than reading them back. EMA, DEMA, TEMA, MACD, RSI, ATR, ADX, Keltner, OBV and VWAP are never stored. Each of their values depends on the entire history before it, so new candles would mean recomputing them from the start. For the same reason, an indicator whose `source` is one of these is never stored either.
+- **Column names.** A column is named after the indicator's type and settings, with periods counted in candles. For example, a 30-day CCI on 15-minute candles is stored as `CCI(period=2880)`. Each output of a multi-output indicator has its own column, ending in the output's name, such as `.upper`.
 - **Filling in missing candles.** New candles have empty metric columns until a model needs that metric again. The next run that needs it reads the stored values back and computes only the missing candles, plus the earlier candles the indicator depends on. The `metric_columns` table records the candles each column has been computed for. Within that range, an empty cell is a warm-up candle where the indicator has no value yet; outside it, the cell has not been computed.
 - **Results don't change.** Stored values match a fresh computation to within floating-point rounding. Before it fills in missing candles, a run recomputes the last 50 stored values and compares them. If any differ, the whole column is recomputed.
 
-On 10 years of 15-minute BTC-USD candles, a profile with a 30-day CCI took about 6.8 seconds per run before this change, and takes about 1.4 seconds the day after its first run.
+On 10 years of 15-minute BTC-USD candles, a profile with a 30-day CCI takes about 6.8 seconds per run without stored metrics, and about 1.4 seconds the day after its first run.
 
 The amount of data depends heavily on the candle size:
 
@@ -193,7 +198,9 @@ The amount of data depends heavily on the candle size:
 |---|---|---|
 | `ONE_DAY` | about 3,650 | about 11 |
 | `SIX_HOUR` | about 14,600 | about 42 |
+| `TWO_HOUR` | about 43,800 | about 125 |
 | `ONE_HOUR` | about 87,700 | about 250 |
+| `THIRTY_MINUTE` | about 175,000 | about 500 |
 | `FIFTEEN_MINUTE` | about 351,000 | about 1,000 |
 | `FIVE_MINUTE` | about 1.05 million | about 3,000 |
 | `ONE_MINUTE` | about 5.26 million | about 15,000 |
@@ -208,7 +215,7 @@ All times are in UTC.
 
 ### Comparison
 
-The Comparison tab has one row per model, sorted by return with the best first. Click a column heading to sort by it, and click again to reverse. Double-click a model to open its chart.
+The Comparison tab has one row per model, sorted by return with the best first. A line above the table gives the number of models and the best one, and, with a start date, when the test started. Click a column heading to sort by it, and click again to reverse. Number columns sort largest first, and text columns A to Z. Double-click a model to open its chart.
 
 | Column | Meaning |
 |---|---|
@@ -216,13 +223,13 @@ The Comparison tab has one row per model, sorted by return with the best first. 
 | Start, End | The starting capital and the ending value. |
 | Return | The ending value divided by the starting capital, minus 1. |
 | First buy | When the model first bought on its entry signal, or `never`. |
-| B&H start | Where this model's buy-and-hold benchmark starts: the first candle on which the model could buy, once its indicators have warmed up. Each model has its own, so check it when comparing models. |
+| B&H start | Where this model's buy-and-hold benchmark starts: the first candle on which the model could buy, once its indicators have warmed up, or its first buy if that came sooner. Each model has its own, so check it when comparing models. |
 | Buy & hold | The return from buying at **B&H start** and holding to the end: the last close divided by the close at B&H start, minus 1. It includes no fees or taxes. See [Buy and hold starts when the model can first buy](#buy-and-hold-starts-when-the-model-can-first-buy). |
 | vs Buy & hold | How much bigger (+) or smaller (−) the model's ending value is than buy and hold's: the model's growth multiple divided by buy and hold's, minus 1. For example, 90× against 60× is +50%, and 50× against 60× is −16.7%. The Metrics tab shows the same figure as **Model vs buy and hold**. |
 | Max drawdown | The largest fall in the model's value from a previous peak. |
-| Worst in window | The largest fall from the highest value within the trailing window (`safeguards.drawdown_window`, or 180 days when it is not set). |
-| Flash buys | The number of flash-crash limit buys that filled. |
-| Trades, Win rate | Completed trades, and the share of them with a positive profit after fees. |
+| Worst in window | The largest fall from the highest value within the trailing window (`safeguards.drawdown_window`, or 180 days when it is not set), shown with the window, such as `12.34% / 180d`. |
+| Flash buys | The number of flash-crash limit buys that filled and were sold when their crash recovered. Buys still held at the end are not counted. |
+| Trades, Win rate | Completed trades, flash-crash buys included, and the share of them with a positive profit after fees. |
 | Fees, Taxes | Total commissions paid, and total tax paid at year boundaries. |
 | Blocked signals | Entry signals the [friction screen](model_configuration.md#5-the-friction-screen-worked-through) rejected. |
 
@@ -235,7 +242,7 @@ The Chart tab draws the chosen model on a log price scale:
 - ▲ buy and ▼ sell markers at the fill prices
 - gray shading where trading was paused by the drawdown limit
 
-Hover anywhere to see a crosshair and a tooltip listing every indicator's value at that candle. Use the toolbar to zoom, pan, go back, or save the chart as an image. All panels share one time axis, so zooming one zooms them all.
+The subtitle gives the model's trade count and return. Hover anywhere to see a crosshair and a tooltip listing the close and every indicator's value at that candle; an indicator still in its warm-up shows `warming up`. Use the toolbar to zoom, pan, go back, or save the chart as an image. All panels share one time axis, so zooming one zooms them all.
 
 **Lowest price shown** sets a floor for the price axis. Type a price and press **Enter** or **Apply**; **Clear** fits the axis to the data again. Lines below the floor are cut off, which is useful when one stray price squashes the chart: BTC-USD has a bad $0.06 print on 2017-04-15 that drags the 100-day Donchian channel down for 100 days, and a floor of `500` removes it from view. The floor:
 
@@ -245,7 +252,7 @@ Hover anywhere to see a crosshair and a tooltip listing every indicator's value 
 - redraws the full view, which becomes what the toolbar's Home button returns to
 - also applies when you double-click a trade, but never hides that trade's own buy and sell markers
 
-If the floor is above every price on the chart, the note beside it says so and the chart shows all its values.
+If the floor is above every price on the chart, the note beside it says so and the chart shows all its values. If the text isn't a number above zero, the note says why and the floor is left as it was.
 
 For how indicators are drawn and how to hide some, see [Charts and tooltips](indicator_reference.md#10-charts-and-tooltips).
 
@@ -253,28 +260,29 @@ For how indicators are drawn and how to hide some, see [Charts and tooltips](ind
 
 The Model value tab draws every model's value over time on one chart, with these reference lines:
 
-- a horizontal line at the starting capital
-- a gray **buy and hold** line for each product and starting capital. It stays at the starting capital until the model could first buy, then follows the price from that candle's close. An open circle marks where it starts, and the legend and subtitle give the date. With several models, it uses the start of the model chosen in **Showing model** (or, for another product, of the first model trading it), and the legend names that model.
+- a horizontal line at the starting capital, one for each different starting capital
+- a gray **buy and hold** line for each product and starting capital. It stays at the starting capital until the model could first buy, then follows the price from that candle's close. An open circle marks where it starts, and the legend gives the date. With several models, it uses the start of the model chosen in **Showing model** (or, for another product or starting capital, of the first model with that product and starting capital), and the legend names that model.
 
-With several models, the legend shows each model's ending value and return, and the model chosen in **Showing model** is drawn slightly heavier. Hover to read every model's value and buy-and-hold value at one moment.
+With one model, the chart labels the start and end values, the subtitle gives the model's return and the buy-and-hold return with its start date, and gray shading marks drawdown pauses. With several models, the legend shows each model's ending value and return, the subtitle names the best model, and the model chosen in **Showing model** is drawn slightly heavier. Hover to read every model's value and buy-and-hold value at one moment, each with its return.
 
 **Lowest value shown** works like the Chart tab's floor, in value units. For example, set it to the starting capital to hide the part of the chart below it. Each tab keeps its own floor.
 
 ### Trades
 
-The Trades tab lists every completed trade of the chosen model, with a summary above the table:
+The Trades tab lists every completed trade of the chosen model, flash-crash buys included, with a summary above the table:
 
 - wins and losses
 - net P&L
 - average, best and worst return
 - a count of each exit reason
 
-Click a column heading to sort by it. Double-click a trade to zoom the chart to it; the toolbar's back button returns to the previous view.
+Click a column heading to sort by it, and click again to reverse. Double-click a trade to zoom the chart to it, with some time on each side. The trade's holding period is shaded and its markers are drawn larger, and unbounded oscillator panels rescale to the zoomed values. The toolbar's back button returns to the previous view.
 
 | Column | Meaning |
 |---|---|
+| # | The trade's number, in order of exit. |
 | Entry, Exit (UTC) and prices | Fill times and fill prices, including slippage. |
-| Held | How long the position was open. |
+| Held | How long the position was open, such as `3d 4h` or `2h 15m`. |
 | Position | The cash committed to the trade, including the entry fee. |
 | Fees | The fees for both ends of the trade. |
 | P&L, Return | The profit after fees and before tax, in currency and as a fraction of Position. |
@@ -284,17 +292,18 @@ Click a column heading to sort by it. Double-click a trade to zoom the chart to 
 
 ### Metrics
 
-The Metrics tab holds the full text report for the chosen model:
+The Metrics tab holds the full text report for the chosen model, headed by its name:
 
-- the period, start date, warm-up and first entry
-- headline results
+- the product, the period and the number of candles simulated; with a start date, also the test start, the days of warm-up and the first entry
+- headline results: starting capital, ending equity and total return; the buy-and-hold return with where it starts; **Model vs buy and hold**; without a start date, **First buy**; and, when the two differ, **Buy and hold from the test start**
+- the maximum drawdown, the worst drawdown within the window, trades and win rate, fees paid with the rate per fill, and whether a position is open at the end
 - the indicators and rules
-- the **friction model** actually used: fee rates and their source, slippage, the liquidity buffer, tax, and the friction-screen verdict
-- the tax paid each year, with any loss carried forward
-- flash-crash events and fills
-- drawdown pauses
+- the **friction model** actually used: fee rates and their source, slippage, the liquidity buffer, tax, the friction-screen verdict and **Entry signals blocked by the screen**
+- the tax paid each year, with any loss carried forward, and the estimated tax for the unfinished final year
+- flash-crash events, each with its low and how long it took to recover, and the last 10 flash-crash fills
+- drawdown pauses, with when each resumed
 - the last 10 trades
-- the settings the simulator does not model yet
+- the settings the simulator does not model yet, under **Not modeled yet**
 
 **Load Profile** and **Test Coinbase Authentication** also write their reports here.
 
@@ -305,7 +314,7 @@ Every run also records each model's results in `data/model_performance.csv`, one
 - **A model tested for the first time** gets a new row.
 - **A run whose results differ** from the model's row replaces that row. This includes a different start date, newer candles, a different fee tier, or an edited profile.
 - **A run with identical results** leaves the file untouched.
-- The status line at the bottom of the window reports what happened, such as `model_performance.csv: 1 added, 2 updated`.
+- The status line at the bottom of the window reports what happened, such as `model_performance.csv: 1 added, 2 updated, 3 unchanged`.
 
 Rows are keyed by the model's name, which is its file name, and sorted by it. The columns are:
 
@@ -313,17 +322,25 @@ Rows are keyed by the model's name, which is its file name, and sorted by it. Th
 |---|---|
 | `model`, `product`, `candles` | The profile's file name, `product_id` and candle size. |
 | `profile_fingerprint` | A short hash of the profile's contents. It changes whenever you edit the profile, so a row shows which version of the model produced it. |
-| `test_start`, `test_end`, `requested_start`, `wait_for_fresh_signal` | The test window (UTC) and the run settings. `requested_start` is blank when no start date was set. |
+| `test_start`, `test_end`, `requested_start`, `wait_for_fresh_signal` | The test window (UTC, `YYYY-MM-DD HH:MM`) and the run settings. `requested_start` is blank when no start date was set; `wait_for_fresh_signal` is `yes` or `no`. |
 | `commission_rate_pct` | The fee per fill, in percent, that the run used. |
 | `starting_capital`, `ending_value`, `growth_multiple`, `return_pct` | The model's result. A growth multiple of 50 means 50 times the starting capital. |
-| `first_buy`, `buy_and_hold_start` | When the model first bought, and where its buy-and-hold benchmark starts. |
+| `first_buy`, `buy_and_hold_start` | When the model first bought on its entry signal (blank if never), and where its buy-and-hold benchmark starts. |
 | `buy_and_hold_multiple`, `buy_and_hold_return_pct` | The benchmark's result from `buy_and_hold_start`. |
 | `vs_buy_and_hold_pct` | How much bigger (+) or smaller (−) the model's ending value is than buy and hold's, in percent. |
 | `max_drawdown_pct`, `worst_in_window_pct`, `drawdown_window` | The drawdowns, as in the Comparison tab. |
 | `trades`, `win_rate_pct`, `fees`, `taxes`, `blocked_signals`, `flash_buys` | Trading activity and costs. |
-| `first_recorded_utc`, `last_changed_utc` | When the model's row was first written, and when its results last changed. |
+| `first_recorded_utc`, `last_changed_utc` | When the model's row was first written, and when its results last changed, such as `2026-10-14 09:30:00 UTC`. These two are not compared when deciding whether a run changed anything. |
 
 Numbers are plain values without thousands separators or % signs, so they sort and chart correctly. If the file is open in Excel, Windows locks it: the run still completes and shows its results, but the status line says the file was not updated. Close it and run again to record the results.
+
+A few more details:
+
+- **The file is never half written.** Each update is written to `model_performance.csv.tmp` and then swapped into place.
+- **Models that aren't in a run are kept.** Running a subset of your models updates only their rows.
+- **Renaming a profile file starts a new row**, because rows are keyed by the name. Delete the old row by hand if you no longer want it.
+- **Files from an earlier version** with fewer columns are upgraded in place: the next run of a model fills in the new columns for its row, and the other rows keep them blank until their model is run again.
+- **Comparing results between machines or dates:** check `profile_fingerprint`, `test_end` and `commission_rate_pct` first. Two rows with different values in any of them were not tested under the same conditions.
 
 ---
 
@@ -335,20 +352,22 @@ The backtest (`backtest.py`) is a long-only, spot simulation. It holds at most o
 
 1. **New UTC day:** the `max_orders_per_day` count resets.
 2. **New calendar year:** tax on the finished year is settled (see [Taxes](#taxes)).
-3. **Flash crashes**, if `flash_crash_buy` is set: any resting limit buy the candle traded down to fills. What those buys hold is sold at the close of the candle in which the crash recovers.
+3. **Flash crashes**, if `flash_crash_buy` is set: any resting limit buy the candle traded down to fills, each level once per crash. What those buys hold is sold at the close of the candle in which the crash recovers.
 4. **Exits**, if a position is open, checked in priority order:
    1. **Stops.** These are the hard stop, the trailing stop and the drawdown stop. If the candle's low reaches any of them, the highest one triggered fills.
    2. **Profit lock.** If the candle's high reaches the target, the position sells at the target.
    3. **Exit rules.** If the exit rules hold at the close, the position sells at the close.
 
-   When a stop and the target are both reached within one candle, the stop is assumed to come first, which is the conservative choice. During a flash crash, no exits happen until the crash recovers (see [Flash crashes](#flash-crashes)).
+   When a stop and the target are both reached within one candle, the stop is assumed to come first, which is the conservative choice. During a flash crash, nothing is sold until the crash recovers (see [Flash crashes](#flash-crashes)).
 5. **Drawdown limit** (the mode without a window): if the model's value at the close has fallen `max_drawdown_limit` below its peak, the position is sold at the close and trading pauses.
 6. **Entries**, if no position is open. The model buys at the close when all of these hold:
    - the entry rules hold
    - trading isn't paused
+   - with **Wait for a fresh entry signal** ticked, the signal has switched off at least once since the start
    - the daily order limit allows it
+   - there is cash to spend beyond the flash-crash reserve
    - with a drawdown window, there is room above the limit for the trade's costs
-   - the signal passes the friction screen
+   - the signal passes the friction screen. A signal the screen blocks is counted once, however many candles it stays true.
 
    A position closed by a stop or target earlier in the same candle can be reopened here if the entry rules still hold.
 
@@ -360,13 +379,15 @@ The backtest (`backtest.py`) is a long-only, spot simulation. It holds at most o
 | Exit rule, drawdown limit | close × (1 - slippage) | taker |
 | Stop | the stop price, or the open if the candle gapped below it, × (1 - slippage) | taker |
 | Profit lock | the target price, or the open if the candle gapped above it, × (1 - slippage) | taker |
-| Flash-crash buy | the level's limit price | maker |
+| Flash-crash buy | the level's limit price, even if the candle opened below it | maker |
 | Flash-crash rebound sale | close × (1 - slippage) | taker |
 
-- The **hard stop** sits at entry fill price × (1 - `hard_stop_percentage`).
+- **Fees** are the rate × `friction_model.fee_buffer_multiplier` (1 when it is not set). Every fill except a flash-crash buy pays the taker rate, because it fills at once at a candle price.
+- The **hard stop** sits at entry fill price × (1 - `hard_stop_percentage`). It needs `safeguards.use_hard_stop` set to `true`, and is off when `strategy.exit_signal.hard_stop_trigger` is `false`.
 - The **profit target** sits at entry fill price × (1 + `profit_lock_target`).
-- The **trailing stop** sits at the highest high since entry × (1 - `trailing_stop`).
+- The **trailing stop** sits at the highest price since entry × (1 - `trailing_stop`). The highest price starts at the entry candle's close and takes in each later candle's high, as of the previous candle, because a candle's high and low can't be ordered within it.
 - **Position size:** an entry spends (cash - flash-crash reserve) × `target_position_fraction`. The fee comes out of that amount.
+- **Flash-crash buy size:** each level spends its `allocation` of the `reserve`, or, without a reserve, its `allocation` of the cash available when it fills.
 
 ### Exit reasons
 
@@ -390,7 +411,19 @@ Each calendar year's realized gains and losses are netted. When the first candle
 
 ### Flash crashes
 
-With `strategy.flash_crash_buy`, the limit buys catch the dip and the model holds through the crash: nothing is sold until it recovers. Crashes are never removed from the data, so the strategy sees every crash's real prices. For details, see [flash_crash_buy](model_configuration.md#flash_crash_buy).
+Crashes are never removed from the data, so the strategy sees every crash's real prices, and they count in the model's value and drawdowns.
+
+With `strategy.flash_crash_buy`, the limit buys catch the dip and the model holds through the crash:
+
+- **A crash starts** on a candle whose low is at or below the shallowest level's `drop` under the previous candle's close. It **recovers** at the first close back above that level.
+- **Each level** is a limit buy at its `drop` below that same close.
+- **Nothing is sold during the crash.** Stops and the profit lock don't fire on any crash candle, including the one it recovers in. Exit rules and the drawdown limit resume at the recovery candle's close.
+- **The flash-crash buys are sold** at the recovery candle's close. If the crash never recovers, they are still held at the end and valued at the last close.
+- **The Metrics tab** lists each crash in the test with its low and how long it took to recover, or `never recovered`.
+
+Without `flash_crash_buy`, a crash is an ordinary candle. A stop it reaches fills at the stop price, or at the open if the candle opened below it, however far down that is.
+
+For the settings, see [flash_crash_buy](model_configuration.md#flash_crash_buy).
 
 ### Start date and warm-up
 
@@ -408,7 +441,7 @@ The Metrics tab reports:
 - how many days of warm-up were available
 - when the first entry came
 
-If the date is before the first available candle, the test starts at the first candle, and the Metrics tab says so.
+If the date is before the first available candle, the test starts at the first candle, and the Metrics tab says so when the date is more than a day earlier. A date after the last candle stops the run with an error.
 
 Without a start date, the test begins at the first candle. Each indicator then has no value until it has enough history, and no rule can fire during that warm-up, so the model sits in cash.
 
@@ -420,6 +453,7 @@ The buy-and-hold benchmark buys at the close of the first candle on which the mo
 - **Waiting after the warm-up does count.** A model that is ready but chooses to stay in cash, for example through a bear market, is credited or penalized for that choice, because buy and hold is already invested.
 - **With a start date** after the warm-up, buy and hold starts on the start date itself.
 - **A first buy before that candle** (possible when an `or` rule fires before all of its parts have warmed up) moves the start back to the first buy.
+- **A model whose entry rules never become ready, and that never buys,** is compared from the test start.
 - **Each model has its own start.** The Comparison tab shows it as **B&H start** next to **First buy**, the Metrics tab states it, and the Model value chart marks it with an open circle.
 - **The Metrics tab also reports Buy and hold from the test start**, for reference, when the two differ.
 
@@ -430,7 +464,7 @@ Backtests flatter strategies. Keep these limits in mind:
 - **Fills are idealized.** Orders fill at candle prices, plus your slippage setting, whatever their size.
 - **Today's fee tier is applied to the whole history.**
 - **Taxes are one flat rate** on calendar-year net gains. Short-term and long-term rates are not distinguished.
-- **An open position at the end is valued at the last close**, without selling costs. The final year's estimated tax is not deducted.
+- **An open position at the end is valued at the last close**, without selling costs, and so are flash-crash buys still held. The final year's estimated tax is not deducted.
 - **Idle cash earns nothing.**
 - **Flash-crash profits are an upper bound.** Candles can't show whether a resting order would really have filled.
 - **Gaps in the data shift periods.** Periods count candles, and candle data has gaps where nothing traded, so a period can span more time than its nominal length on a quiet product.
@@ -472,7 +506,7 @@ print(f"{result['total_return']:+.2%} over {result['trade_count']} trades")
 
 The script has two dependencies:
 
-- **The cache must already exist.** Run the simulator once for that product and candle size first. `load_cached_candles` returns `None` when there is no cache.
+- **The cache must already exist.** Run the simulator once for that product and candle size first. `load_cached_candles` returns `None` when there is no cache, and the script above then stops with a `TypeError`.
 - **Without live inputs**, `FrictionModel(profile)` uses the profile's fallback fee rate and no Bitcoin network fee. The report shows this as `profile fallback (live rates not fetched)`.
 
 The candle list that `load_cached_candles` and `load_candles` return carries its market's metric cache. Backtests run on that same list share their indicators and use the [stored metrics](#stored-metrics), as the simulator's runs do. A sweep should therefore load the candles once and pass the same list to every `run_backtest` call. A plain list of candle dictionaries works too, but each backtest then computes all of its indicators itself.
@@ -502,18 +536,27 @@ Useful functions:
 | `load_cached_candles(cache_dir, product_id, granularity)` | `backtest` | Reads the cache only. Returns `(candles, fetched_start, fetched_end)` or `None`. |
 | `lookback_window(granularity_seconds)` | `backtest` | The 10-year `(start, end)` the simulator uses. |
 | `parse_start_date("2022-01-01")` | `simulator` | Converts a date string to the `start_time` timestamp. |
+| `fetch_friction_inputs(client, profiles)` | `friction` | Looks up the live fee tier and Bitcoin network fee that one profile, or a list of them, needs. A failed lookup is recorded, not raised. |
+| `update_performance_log([(result, profile), ...], path=...)` | `performance_log` | Records results in the [model performance log](#model-performance-log), as a run does. Set `result["model_name"]` first, or the row is named after the product. Returns the model names `added`, `updated` and `unchanged`. |
+| `describe_update(outcome, path=...)` | `performance_log` | The status-line summary of an update, such as `model_performance.csv: 1 added`. |
 
 The main keys of the result dictionary are:
 
 - `total_return`, `ending_equity` and `starting_capital`
+- `period_start`, `period_end` and `candle_count`, the test window; `requested_start` and `warmup_candles` describe the start date
 - `first_entry`, the time of the model's first buy on its entry signal (`None` if it never bought)
 - `ready_to_trade`, the first candle on which every entry rule could be evaluated (`None` if never)
 - `buy_and_hold_return`, measured from `buy_and_hold_start` (`ready_to_trade`, or the first buy if that came sooner), and `buy_and_hold_from_test_start`
-- `max_drawdown` and `max_window_drawdown`
-- `trade_count`, `win_rate`, `fees_paid`, `taxes_paid` and `screened_signals`
+- `max_drawdown`, `max_window_drawdown` and `drawdown_window`
+- `trade_count`, `win_rate`, `fees_paid`, `commission_rate`, `taxes_paid` and `screened_signals`
+- `tax_payments`, one per settled year, and `estimated_tax_due` for the unfinished final year
 - `trades`, a list of dictionaries with entry and exit times, prices, P&L, fees and reasons
+- `flash_crash_buys` (the sold flash-crash buys), `flash_crash_events` and `open_flash_lots`
+- `open_position` and `drawdown_pauses`
 - `friction`, which describes the rates used
 - `series`, the time, close, equity and indicator arrays behind the charts
+
+All times are Unix timestamps in seconds, UTC.
 
 ---
 
@@ -523,15 +566,23 @@ The main keys of the result dictionary are:
 |---|---|
 | `Select at least one model in the Models list` | Nothing is selected. Click a model; if the list is empty, add a profile to `config/` and click **Refresh**. |
 | `Fix these profiles first ...` | A selected profile is invalid. Click **Load Profile** to see every problem, then see [Validation and troubleshooting](indicator_reference.md#8-validation-and-troubleshooting). |
+| `Start date '...' must look like 2020-01-01 or 2020-01-01 14:30 (UTC)` | The start date isn't in a format the simulator reads. Use `YYYY-MM-DD` or `YYYY-MM-DD HH:MM`, or leave it blank. |
+| `Start date ... is in the future` | Choose a date up to now, in UTC. |
 | `Coinbase API key name and private key are required ...` | `.env` wasn't found or is incomplete. Run the simulator from the repository root, and check `.env` (see [trader.md](trader.md#2-setting-up-the-env-file)). |
+| `Coinbase key file not found: ...` | `COINBASE_KEY_FILE` points to a file that doesn't exist. A relative path is read from the current directory, so run the simulator from the repository root. |
 | `Coinbase API test failed: HTTP Error 401 ...` | The key name or private key is wrong, or the key has expired. If the key has an IP allowlist, add the outbound IP address shown in the message. |
 | `... HTTP Error 403 ...` | The key works but lacks permission. Enable **View** on the key. |
 | `Could not reach the Coinbase API` | A network problem, or a wrong `COINBASE_BASE_URL`. |
 | A dialog asks to install the Coinbase SDK | `coinbase-advanced-py` isn't installed in the Python running the simulator. Accept, or run `pip install -r requirements.txt` in your virtual environment. |
+| `The coinbase-advanced-py package is unavailable to ...` | You declined the install, or it failed. Run `pip install -r requirements.txt` with the Python named in the message. |
 | A dialog asks to add Python to `PATH` | The running Python's folder isn't on `PATH`. Declining is harmless when the right interpreter is already running. Accepting adds the folder to your user `PATH`, persistently on Windows. |
 | `Only LONG_ONLY strategies can be simulated so far` | Set `strategy.direction` to `LONG_ONLY` or remove it. |
 | `The start date ... is after the last candle` | Choose an earlier date. |
+| `No candles to simulate` | Coinbase returned no candles for the product in the 10-year window. Check `product_id`. |
+| The note beside **Lowest price shown** says `Floor ... must be a number` | Type a plain number above zero, such as `500`, or click **Clear**. |
 | The run finishes with no trades | Check **Entry signals blocked by the screen** in Metrics first (see the [friction screen](model_configuration.md#5-the-friction-screen-worked-through)). For more checks, see the [no-trades checklist](indicator_reference.md#8-validation-and-troubleshooting). |
 | Fees show `profile fallback (...)` | The live fee lookup failed (the reason is shown), so the profile's fallback rate was used. |
 | The first run is slow | It is downloading the full history; later runs use the cache. Larger candle sizes download much faster (see [section 6](#6-historical-data-and-the-cache)). |
+| Status line ends with `model_performance.csv not updated (...)` | The file is open in another program, usually Excel, which locks it. The results on screen are complete. Close the file and run again to record them. |
+| Buy & hold differs between models in one run | Expected: each model's benchmark starts when that model could first buy. Compare the **B&H start** column (see [Buy and hold starts when the model can first buy](#buy-and-hold-starts-when-the-model-can-first-buy)). |
 | The chart is crowded | Hide less important indicators with `"plot": false`, or enlarge the window. |

@@ -33,11 +33,15 @@ REQUIRED = object()
 
 
 class IndicatorError(ValueError):
+    """A bad indicator definition; the message is written for the profile's author."""
     pass
 
 
 def parse_period(value, granularity_seconds, name="period"):
-    """Convert a period (whole candles, or a duration such as "12h") to a candle count."""
+    """Convert a period (whole candles, or a duration such as "12h") to a candle count.
+
+    Durations are rounded to the nearest whole candle; the result is always at least 1.
+    """
     if isinstance(value, bool):
         raise IndicatorError(f"{name} must be a number of candles or a duration like '12h', not {value!r}")
     if isinstance(value, (int, float)):
@@ -102,6 +106,10 @@ def _recursive(x, alpha, seed_mean_periods=None):
 
 
 def ema(x, periods):
+    """Exponential moving average (alpha 2/(periods+1)), seeded with the first valid value.
+
+    NaN for the first periods-1 candles from the first valid value, its warm-up.
+    """
     out = _recursive(x, 2 / (periods + 1))
     start = _first_valid(x)
     out[start:start + periods - 1] = np.nan  # warm-up
@@ -109,10 +117,15 @@ def ema(x, periods):
 
 
 def wilder(x, periods):
+    """Wilder's smoothing (alpha 1/periods), seeded with the mean of the first `periods` values.
+
+    The first value lands periods-1 candles after the first valid input.
+    """
     return _recursive(x, 1 / periods, seed_mean_periods=periods)
 
 
 def rolling_sum(x, periods):
+    """Sum of the last `periods` values, counting from the first valid one; NaN before that."""
     out = _nan_like(x)
     start = _first_valid(x)
     values = x[start:]
@@ -132,12 +145,14 @@ def rolling_std(x, periods):
     """Population standard deviation over the window, as Bollinger Bands use."""
     mean = sma(x, periods)
     start = _first_valid(x)
+    # E[x^2] - E[x]^2, shifted by the first value so large prices don't lose precision.
     centered = x - (x[start] if start < len(x) else 0.0)
     variance = sma(centered * centered, periods) - (mean - (x[start] if start < len(x) else 0.0)) ** 2
     return np.sqrt(np.maximum(variance, 0.0))
 
 
 def _rolling_reduce(x, periods, reducer):
+    """`reducer` over each window of the last `periods` values; NaN during the warm-up."""
     out = _nan_like(x)
     start = _first_valid(x)
     values = x[start:]
@@ -155,6 +170,7 @@ def rolling_min(x, periods):
 
 
 def wma(x, periods):
+    """Linearly weighted moving average: weights periods..1, newest first."""
     out = _nan_like(x)
     start = _first_valid(x)
     values = x[start:]
@@ -180,6 +196,7 @@ def _mean_absolute_deviation(x, periods, chunk=20_000):
 
 
 def _true_range(ctx):
+    """Per-candle true range; the first candle, with no previous close, uses high - low."""
     previous_close = shift(ctx.close, 1)
     ranges = np.vstack([ctx.high - ctx.low, np.abs(ctx.high - previous_close), np.abs(ctx.low - previous_close)])
     true_range = np.nanmax(ranges, axis=0)
@@ -188,6 +205,7 @@ def _true_range(ctx):
 
 
 def _divide(numerator, denominator):
+    """Elementwise division with NaN wherever the result isn't finite (e.g. division by zero)."""
     with np.errstate(divide="ignore", invalid="ignore"):
         result = numerator / denominator
     result[~np.isfinite(result)] = np.nan
@@ -233,6 +251,7 @@ def _vwma(ctx, p):
 
 
 def _vwap(ctx, p):
+    """VWAP of the typical price, reset each UTC day ("anchor": "day") or over a rolling period."""
     typical = ctx.series("hlc3")
     if p["anchor"] == "day":
         day = ctx.time // 86_400
@@ -358,6 +377,7 @@ def _adx(ctx, p):
 
 
 def _obv(ctx, p):
+    """Running volume total, added on up closes and subtracted on down; 0 on the first candle."""
     direction = np.sign(np.diff(ctx.close, prepend=ctx.close[0]))
     return np.cumsum(direction * ctx.volume)
 
@@ -377,7 +397,8 @@ def _mfi(ctx, p):
 
 SOURCE = {"source": "close"}
 
-# type: (function, parameters with defaults, outputs or None for one value, plotted on price chart?, summary)
+# type: (function, parameters with defaults, outputs or None for one value,
+#        overlay: drawn on the price chart rather than its own panel, summary)
 INDICATORS = {
     "SMA": (_sma, {"period": REQUIRED, **SOURCE}, None, True, "Simple moving average"),
     "EMA": (_ema, {"period": REQUIRED, **SOURCE}, None, True, "Exponential moving average"),
@@ -599,6 +620,7 @@ class IndicatorContext:
             function, _, outputs, _, _ = INDICATORS[definition["type"]]
             parameters = resolve_parameters(name, definition, self.granularity_seconds)
 
+            # `first` lets a storing MetricCache compute only the candles from that index on.
             def compute(first=0):
                 context = self if not first else IndicatorContext(
                     self.metrics.tail(first), self.definitions, self.granularity_seconds)
@@ -615,6 +637,7 @@ class IndicatorContext:
 
 
 def indicator_outputs(indicator_type):
+    """The output fields of a multi-output indicator type, or None for a single value."""
     return INDICATORS[indicator_type][2]
 
 
@@ -658,7 +681,7 @@ def output_names(definitions):
 
 
 def price_scale_outputs(name, definition):
-    """The outputs that share the price axis, for charting; empty for oscillators."""
+    """The outputs that share the price axis, for charting; empty for oscillators or with plot off."""
     indicator_type = definition["type"]
     function, parameters, outputs, overlay, _ = INDICATORS[indicator_type]
     if not definition.get("plot", overlay):
@@ -671,7 +694,7 @@ def price_scale_outputs(name, definition):
 
 
 def panel_outputs(name, definition):
-    """The outputs drawn in an oscillator's own chart panel; empty for price-scale indicators."""
+    """The outputs drawn in an oscillator's own chart panel; empty for overlays or with plot off."""
     _, _, outputs, overlay, _ = INDICATORS[definition["type"]]
     if overlay or not definition.get("plot", True):
         return []
