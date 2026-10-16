@@ -21,9 +21,17 @@ characteristics of the best of them seed the search. Each generation then:
   3. the analyst worker measures which characteristics the best models share and feeds
      those weights back to the generators.
 
-The search stops when the best models stop improving (a plateau), then writes the top
-models as config/<prefix>_###.json, records them in the performance log exactly as the
-simulator would, and leaves a report in data/model_search/<run>/.
+The search stops when the best models stop improving (a plateau). It then writes the best
+models that each trade differently, and aren't near-copies of one another, as
+config/<prefix>_###.json under the next unused numbers, records them in the performance log
+exactly as the simulator would, and leaves a report in data/model_search/<run>/. Finally it
+ranks every model of the currency in config/ against your goals (see model_assessor.py) and
+moves the bottom 80% to config/discard/.
+
+Several searches can run at once on one computer, started separately or with --instances:
+they share data/model_search/registry.db, so no model is backtested twice under the same
+conditions and each borrows the others' best models as parents, and they take model names
+under a lock, so none overwrites another's.
 
 Selection only ever sees the training window; the holdout columns are an honest check.
 """
@@ -35,6 +43,7 @@ import itertools
 import json
 import math
 import multiprocessing as mp
+import os
 import queue
 import random
 import re
@@ -45,6 +54,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from backtest import GRANULARITY_SECONDS
+from file_lock import file_lock
 
 ROOT = Path(__file__).parent
 CONFIG_DIR = ROOT / "config"
@@ -68,7 +78,10 @@ REQUIRED_SETTINGS = {
                 "exit_persist_h", "lock", "trail", "stop", "target", "dd_limit", "pos"],
 }
 # Settings a genome carries, each drawn from settings["options"].
-GENOME_SETTINGS = ["entry_persist_h", "exit_persist_h", "lock", "trail", "stop", "target", "dd_limit", "pos"]
+GENOME_SETTINGS = ["entry_persist_h", "exit_persist_h", "lock", "trail", "stop", "target", "target_trail",
+                   "dd_limit", "pos"]
+# Genome options a settings file may leave out, with the choices they then have.
+OPTIONAL_OPTIONS = {"target_trail": [0]}
 
 
 class SettingsError(ValueError):
@@ -93,6 +106,8 @@ def load_settings(path):
         [f"unknown granularities {', '.join(unknown)}"] if unknown else [])
     if problems:
         raise SettingsError(f"{path}: " + "; ".join(problems))
+    for key, choices in OPTIONAL_OPTIONS.items():
+        settings["options"].setdefault(key, choices)
     return settings
 
 
@@ -301,7 +316,7 @@ class Harvest:
                     else:
                         genome["confirm"], genome["confirm_k"] = exprs, k
                     votes += 1
-                elif self._is_lock(term, indicators):
+                elif self._is_lock(term, indicators, after_vote=votes > 0):
                     genome["lock"] = int(str(indicators[term.comparators[0].id]["period"]).rstrip("d"))
                 else:
                     expr = self._canonical_atom(term, indicators, mapping)
@@ -327,6 +342,7 @@ class Harvest:
             safeguards = profile.get("safeguards", {})
             genome["trail"] = float(exit_signal.get("trailing_stop", 0) or 0)
             genome["target"] = float(exit_signal.get("profit_lock_target", 0) or 0)
+            genome["target_trail"] = float(exit_signal.get("profit_lock_trail", 0) or 0)
             genome["stop"] = float(safeguards.get("hard_stop_percentage", 0)) if (
                 safeguards.get("use_hard_stop") and exit_signal.get("hard_stop_trigger", True)) else 0.0
             genome["dd_limit"] = float(safeguards.get("max_drawdown_limit", 0) or 0)
@@ -342,15 +358,67 @@ class Harvest:
         return genome
 
     @staticmethod
-    def _is_lock(term, indicators):
-        return (isinstance(term, ast.Compare) and len(term.ops) == 1 and isinstance(term.ops[0], ast.Gt)
-                and getattr(term.left, "id", "") == "close" and isinstance(term.comparators[0], ast.Name)
-                and indicators.get(term.comparators[0].id, {}).get("type") == "SMA"
-                and term.comparators[0].id.startswith("lock"))
+    def _is_lock(term, indicators, after_vote=False):
+        """Whether an entry term is the SMA regime lock, `close > <N-day SMA>`: an indicator named
+        lock..., or (as build_profile writes it, named like any SMA) such a term after the entry vote."""
+        if not (isinstance(term, ast.Compare) and len(term.ops) == 1 and isinstance(term.ops[0], ast.Gt)
+                and getattr(term.left, "id", "") == "close" and isinstance(term.comparators[0], ast.Name)):
+            return False
+        name = term.comparators[0].id
+        definition = indicators.get(name, {})
+        if definition.get("type") != "SMA" or not re.fullmatch(r"\d+d", str(definition.get("period", ""))):
+            return False
+        return name.startswith("lock") or after_vote
 
 
-def load_reference(library, performance_path, settings):
-    """Harvest every model profile in config/, with its logged performance as a reference score."""
+def profile_path(path):
+    """A profile path from the repository root, such as a template_profile. A path written before currency
+    folders (config/<name>.json) is found in its currency's folder."""
+    candidate = ROOT / path
+    if not candidate.exists() and Path(path).parts[:1] == ("config",) and len(Path(path).parts) == 2:
+        moved = sorted(ROOT.glob(f"config/*/{Path(path).name}"))
+        if moved:
+            return moved[0]
+    return candidate
+
+
+def _match(pattern):
+    """The profiles a reference pattern (a path or glob from the repository root) names."""
+    matched = sorted(ROOT.glob(pattern)) if any(ch in pattern for ch in "*?[") else [ROOT / pattern]
+    return [path for path in matched if path.suffix == ".json" and path.exists() and path.name != "best_model.json"
+            and "discard" not in path.relative_to(ROOT).parts]
+
+
+def reference_paths(settings):
+    """The profiles a search learns from: those matching the settings' "references" patterns (paths or
+    globs from the repository root), or every profile in the library (config/ and each currency's
+    folder, see model_library.py) when it sets none."""
+    from model_library import profile_paths
+    patterns = settings.get("references") or []
+    if not patterns:
+        return profile_paths(CONFIG_DIR)
+    paths = []
+    for pattern in patterns:
+        matched = _match(pattern)
+        if not matched and Path(pattern).parts[:1] == ("config",) and len(Path(pattern).parts) == 2:
+            # A path from before currency folders, such as config/doge_061.json: look in each currency's folder.
+            matched = _match(f"config/*/{Path(pattern).name}")
+        if not matched:
+            raise SettingsError(f"references: {pattern!r} matches no profile")
+        paths.extend(path for path in matched if path not in paths)
+    return paths
+
+
+def models_dir(settings):
+    """Where a search writes its models: the settings' "models_dir", else its currency's folder,
+    config/<product>/ (see model_library.py)."""
+    if settings.get("models_dir"):
+        return ROOT / settings["models_dir"]
+    return CONFIG_DIR / settings["market"]["product"]
+
+
+def load_reference(library, performance_path, settings, paths=None):
+    """Harvest the reference profiles (see reference_paths), with their logged performance as a reference score."""
     market = settings["market"]
     harvest = Harvest(library, market["granularities"], market["reference_fallback_granularity"])
     rows = {}
@@ -358,7 +426,7 @@ def load_reference(library, performance_path, settings):
         with performance_path.open(newline="", encoding="utf-8") as handle:
             rows = {row["model"]: row for row in csv.DictReader(handle)}
     scored = []
-    for path in sorted(CONFIG_DIR.glob("*.json")):
+    for path in reference_paths(settings) if paths is None else paths:
         with path.open(encoding="utf-8") as handle:
             profile = json.load(handle)
         if "strategy" not in profile:
@@ -446,6 +514,11 @@ def build_profile(genome, atoms, template, product_id):
                    "profit_lock_target": genome.get("target", 0) or 0, "description": exit_words}
     if genome.get("trail"):
         exit_signal["trailing_stop"] = genome["trail"]
+    if genome.get("target_trail") and genome.get("target"):
+        exit_signal["profit_lock_trail"] = genome["target_trail"]
+        exit_words += (f" On reaching the {genome['target']:.0%} profit target, it holds on and sells after a "
+                       f"{genome['target_trail']:.0%} fall from the high.")
+        exit_signal["description"] = exit_words
     profile["strategy"] = {"direction": "LONG_ONLY", "market_regime": "TREND_FOLLOWING",
                            "entry_signal": {"description": " ".join(words), "all": entry_rules},
                            "exit_signal": exit_signal}
@@ -483,7 +556,7 @@ def features(genome, atoms, options):
         "entry_persist_h=" + _bucket(snap_hours(genome.get("entry_persist_h", 0), gran), options["entry_persist_h"]),
         "exit_persist_h=" + _bucket(snap_hours(genome.get("exit_persist_h", 0), gran), options["exit_persist_h"]),
     ]
-    out += [f"{s}=" + _bucket(genome.get(s, 0), options[s]) for s in GENOME_SETTINGS if not s.endswith("persist_h")]
+    out += [f"{s}=" + _bucket(genome.get(s) or 0, options[s]) for s in GENOME_SETTINGS if not s.endswith("persist_h")]
     for side, exprs in (("entry", entry), ("exit", exits)):
         out.extend(sorted({f"{side}_family={atoms[e]['family']}" for e in exprs}))
         out.extend(f"{side}_atom={e}" for e in exprs)
@@ -649,11 +722,15 @@ class Breeder:
         child["exit"], child["exit_k"], child["exit_mode"] = list(donor["exit"]), donor["exit_k"], donor.get("exit_mode", "own")
         child["entry_k"] = max(1, round(len(child["entry"]) * a["entry_k"] / max(len(a["entry"]), 1)))
         for setting in GENOME_SETTINGS + ["gran"]:
-            child[setting] = self.random.choice([a, b]).get(setting, child.get(setting))
+            # A genome recorded before a setting existed doesn't carry it: that means the setting is off.
+            child[setting] = self.random.choice([a, b]).get(setting) or child.get(setting) or 0
         return child
 
     def repair(self, genome):
         """Drop atoms that are invalid on the genome's candle size, then build and validate."""
+        for setting in GENOME_SETTINGS:
+            if genome.get(setting) is None:
+                genome[setting] = 0  # recorded before the setting existed: off
         if genome.get("gran") not in self.granularities:
             genome["gran"] = self.choose("gran")
         gran = genome["gran"]
@@ -732,27 +809,69 @@ class _MemoryMetrics:
         return self._caches[key]
 
 
-def fitness_of(result, fitness):
-    """Annualized, drawdown-adjusted log growth; models that barely trade are marked down."""
-    years = max((result["period_end"] - result["period_start"]) / (365.25 * 86400), 0.25)
-    growth = max(1 + result["total_return"], 1e-6)
-    drawdown = min(result["max_drawdown"], 0.99)
+def summary_fitness(summary, fitness):
+    """Annualized, drawdown-adjusted log growth; models that barely trade, or (with the optional
+    `max_trades`) trade too often, are marked down by `trade_penalty` per trade outside the range."""
+    years = max(summary.get("years", 1.0), 0.25)
+    growth = max(1 + summary["return"], 1e-6)
+    drawdown = min(summary["max_drawdown"], 0.99)
     score = (math.log(growth) + fitness["drawdown_weight"] * math.log(1 - drawdown)) / years
-    return score - fitness["trade_penalty"] * max(0, fitness["min_trades"] - result["trade_count"])
+    score -= fitness["trade_penalty"] * max(0, fitness["min_trades"] - summary["trades"])
+    if fitness.get("max_trades") is not None:
+        score -= fitness["trade_penalty"] * max(0, summary["trades"] - fitness["max_trades"])
+    return score
 
 
-def _summary(result, fitness):
-    return {"return": result["total_return"], "buy_and_hold": result["buy_and_hold_return"],
-            "max_drawdown": result["max_drawdown"], "trades": result["trade_count"],
-            "win_rate": result["win_rate"], "fitness": fitness_of(result, fitness)}
+def fitness_of(result, fitness):
+    return summary_fitness(_summary(result), fitness)
 
 
-def evaluator_worker(settings, friction_inputs, train_start, holdout_start, tasks, results):
+def _summary(result, fitness=None):
+    """The measures a search keeps of one backtest; with `fitness` settings, its score too."""
+    summary = {"return": result["total_return"], "buy_and_hold": result["buy_and_hold_return"],
+               "max_drawdown": result["max_drawdown"], "trades": result["trade_count"],
+               "win_rate": result["win_rate"],
+               "years": (result["period_end"] - result["period_start"]) / (365.25 * 86400)}
+    if fitness is not None:
+        summary["fitness"] = summary_fitness(summary, fitness)
+    return summary
+
+
+def rescore(scores, fitness):
+    """Recompute the fitness of stored summaries ({"train", "holdout"}, the training one possibly
+    holding a "validation" summary) under the current fitness settings; returns `scores`."""
+    for summary in (scores["train"], scores["holdout"], scores["train"].get("validation")):
+        if summary is not None:
+            summary["fitness"] = summary_fitness(summary, fitness)
+    return scores
+
+
+def selection_fitness(scores):
+    """What the search selects on: the training fitness, or with a validation period the weaker
+    of the training and validation fitness, so a model must work in both."""
+    validation = scores["train"].get("validation")
+    return scores["train"]["fitness"] if validation is None else min(scores["train"]["fitness"],
+                                                                      validation["fitness"])
+
+
+def conditions(genome):
+    return len(genome["entry"]) + len(genome["exit"]) + len(genome.get("confirm") or [])
+
+
+def rank_key(model):
+    """Best first: higher fitness; among ties, the simpler model (fewer conditions), then fewer trades."""
+    return (model["fitness"], -conditions(model["genome"]), -model["train"]["trades"])
+
+
+def evaluator_worker(settings, friction_inputs, train_start, holdout_start, tasks, results,
+                     compute_device="cpu", device_id=0):
     from backtest import DEFAULT_CACHE_DIR, load_cached_candles, run_backtest
     from candle_store import MarketCandles
     from friction import FrictionModel
 
     product_id, fitness = settings["market"]["product"], settings["fitness"]
+    validation_start = settings["windows"].get("validation_start")
+    validation_start = _timestamp(validation_start) if validation_start else None
     markets = {}
     for gran in settings["market"]["granularities"]:
         # Read-only: refresh_market, before the workers start, is the only writer.
@@ -774,12 +893,25 @@ def evaluator_worker(settings, friction_inputs, train_start, holdout_start, task
             friction = FrictionModel(profile, friction_inputs)
             try:
                 if task["mode"] == "score":
-                    train = run_backtest(markets[gran]["train"], profile, friction=friction, start_time=train_start)
-                    holdout = run_backtest(markets[gran]["full"], profile, friction=friction, start_time=holdout_start)
-                    out.append({"key": item["key"], "train": _summary(train, fitness),
-                                "holdout": _summary(holdout, fitness)})
+                    train = run_backtest(
+                        markets[gran]["train"], profile, friction=friction, start_time=train_start,
+                        compute_device=compute_device, device_id=device_id)
+                    holdout = run_backtest(
+                        markets[gran]["full"], profile, friction=friction, start_time=holdout_start,
+                        compute_device=compute_device, device_id=device_id)
+                    scores = {"key": item["key"], "train": _summary(train, fitness),
+                              "holdout": _summary(holdout, fitness)}
+                    if validation_start is not None:
+                        # The last part of the training window, scored on its own.
+                        validation = run_backtest(markets[gran]["train"], profile, friction=friction,
+                                                  start_time=validation_start,
+                                                  compute_device=compute_device, device_id=device_id)
+                        scores["train"]["validation"] = _summary(validation, fitness)
+                    out.append(scores)
                 else:  # "full": the simulator's own run, for the performance log
-                    result = run_backtest(markets[gran]["full"], profile, friction=friction)
+                    result = run_backtest(
+                        markets[gran]["full"], profile, friction=friction,
+                        compute_device=compute_device, device_id=device_id)
                     result["model_name"], result["granularity"] = item["name"], gran
                     for heavy in ("series", "indicators", "rules", "trades", "friction"):
                         result.pop(heavy, None)
@@ -853,18 +985,168 @@ def refresh_market(product_id, granularities, offline):
     return fetch_friction_inputs(client, [template])
 
 
+# --- variety: unique behaviour and diverse output ------------------------------------
+
+def signature(model):
+    """What a scored model did: two models with the same signature traded identically."""
+    return (model["genome"]["gran"],) + tuple(
+        (model[window]["trades"], round(model[window]["return"], 6), round(model[window]["max_drawdown"], 6))
+        for window in ("train", "holdout"))
+
+
+def unique_by_behaviour(models):
+    """The models (best first) without any that only repeat a better model's trades."""
+    seen, out = set(), []
+    for model in models:
+        key = signature(model)
+        if key not in seen:
+            seen.add(key)
+            out.append(model)
+    return out
+
+
+def similarity(a, b):
+    """How alike two genomes are: the share of conditions they have in common, 0 if the candles differ."""
+    if a["gran"] != b["gran"]:
+        return 0.0
+    sides = [set(genome["entry"]) | set(genome["exit"]) | set(genome.get("confirm") or []) for genome in (a, b)]
+    return len(sides[0] & sides[1]) / max(len(sides[0] | sides[1]), 1)
+
+
+def select_diverse(ranked, count, max_similarity):
+    """Up to `count` models, best first, skipping repeats of a better model's trades and any model whose
+    conditions overlap a chosen one's by more than `max_similarity` (1 keeps every distinct model)."""
+    chosen = []
+    for model in unique_by_behaviour(ranked):
+        if len(chosen) >= count:
+            break
+        if all(similarity(model["genome"], other["genome"]) <= max_similarity for other in chosen):
+            chosen.append(model)
+    return chosen
+
+
+def outperforming_buy_and_hold(models):
+    """Keep models whose training-window ending value strictly beats buy and hold."""
+    return [model for model in models
+            if model["train"]["return"] > model["train"]["buy_and_hold"]]
+
+
+# --- naming and writing models -------------------------------------------------------
+
+def _library_files(config_dir):
+    """Every profile and discarded profile in the library `config_dir` belongs to."""
+    from model_library import discard_folders, library_root, profile_paths
+    root = library_root(config_dir)
+    return profile_paths(root) + [path for folder in discard_folders(root) for path in sorted(folder.glob("*.json"))]
+
+
+def used_names(config_dir, performance_path):
+    """Every model name in use anywhere in the library (any currency folder or discard folder) or in the
+    performance log."""
+    names = {path.stem for path in _library_files(config_dir)}
+    if Path(performance_path).exists():
+        with Path(performance_path).open(newline="", encoding="utf-8") as handle:
+            names |= {row["model"] for row in csv.DictReader(handle)}
+    return names
+
+
+def existing_fingerprints(config_dir):
+    """{fingerprint: name} of the profiles already anywhere in the library, discard folders included."""
+    from performance_log import profile_fingerprint
+    found = {}
+    for path in _library_files(config_dir):
+        try:
+            found.setdefault(profile_fingerprint(json.loads(path.read_text(encoding="utf-8"))), path.stem)
+        except (OSError, ValueError):
+            continue
+    return found
+
+
+def write_models(models, prefix, config_dir, performance_path):
+    """Write each model as config/<prefix>_###.json under the next free numbers, setting model["name"].
+
+    Holds the models lock, so searches running at the same time never take the same name. A
+    name is never reused, even one only in the discard folder or the performance log, and a
+    profile identical to one already in config/ or the discard folder is skipped, and that
+    model's name is set as model["existing"]. Returns the models written.
+    """
+    from model_library import models_lock
+    from performance_log import profile_fingerprint
+    pattern = re.compile(re.escape(prefix) + r"_(\d+)$")
+    written = []
+    Path(config_dir).mkdir(parents=True, exist_ok=True)
+    with models_lock(config_dir):
+        taken = used_names(config_dir, performance_path)
+        number = max((int(match[1]) for name in taken if (match := pattern.match(name))), default=0)
+        known = existing_fingerprints(config_dir)
+        for model in models:
+            existing = known.get(profile_fingerprint(model["profile"]))
+            if existing is not None:
+                model["existing"] = existing
+                continue
+            number += 1
+            model["name"] = f"{prefix}_{number:03d}"
+            with (Path(config_dir) / f"{model['name']}.json").open("w", encoding="utf-8") as handle:
+                json.dump(model["profile"], handle, indent=2)
+                handle.write("\n")
+            written.append(model)
+    return written
+
+
+# --- settings and command line -------------------------------------------------------
+
+# Optional sections, with their defaults; a settings file from an earlier version needs none of them.
+OPTIONAL_SETTINGS = {
+    "goals": None,  # goals file for the ranking (see model_assessor.py); None: search_config/goals.json if present
+    "references": None,  # profiles to learn from: paths or globs; None: every profile in config/
+    "models_dir": None,  # folder the models are written to and ranked in; None: config/
+    "reference_scores": True,  # weight seeds and the analyst by the references' logged (full-history) results
+    "variety": {"max_similarity": 0.8, "min_fitness": None, "require_train_outperformance": False},
+    "registry": {"enabled": True, "migrants": 10},
+    "ranking": {"enabled": True},
+}
+
+
+def with_optional_settings(settings):
+    for section, default in OPTIONAL_SETTINGS.items():
+        if isinstance(default, dict):
+            settings[section] = {**default, **(settings.get(section) or {})}
+        else:
+            settings.setdefault(section, default)
+    return settings
+
+
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument("--settings", default=str(DEFAULT_SETTINGS),
                         help="search settings file (default: search_config/model_search.json)")
     parser.add_argument("--product", help="override market.product")
     parser.add_argument("--prefix", help="override market.prefix")
-    for name in ("population", "keep", "generators", "evaluators", "batch-size", "min-generations",
-                 "max-generations", "seed"):
+    for name in ("population", "keep", "batch-size", "min-generations", "max-generations", "seed"):
         parser.add_argument(f"--{name}", type=int, help=f"override search.{name.replace('-', '_')}")
+    for name in ("generators", "evaluators"):
+        parser.add_argument(f"--{name}", help=f"override search.{name}: a number, or auto")
+    parser.add_argument("--instances", type=int, default=1,
+                        help="run this many searches at once, sharing the CPUs, the registry and the ranking")
+    parser.add_argument("--goals", help="goals file for the ranking (default: settings 'goals', else "
+                                        "search_config/goals.json if present)")
+    parser.add_argument("--references", nargs="+", metavar="PATTERN",
+                        help="learn from these profiles only (paths or globs, such as 'config/doge_*.json') "
+                             "instead of every profile in config/")
+    parser.add_argument("--models-dir", help="write and rank models in this folder instead of config/")
+    parser.add_argument("--no-reference-scores", action="store_true",
+                        help="use the references' structures only, not their logged results (which cover the "
+                             "full history, holdout included)")
+    parser.add_argument("--no-rank", action="store_true",
+                        help="skip ranking the currency's models and moving the bottom to config/discard/")
     parser.add_argument("--offline", action="store_true", help="use cached candles and the profile's fallback fee")
+    parser.add_argument("--compute-device", choices=("auto", "cpu", "cuda"), default="auto",
+                        help="auto (default) uses visible CUDA GPUs; cpu or cuda forces the device choice")
     parser.add_argument("--dry-run", action="store_true",
-                        help="keep the profiles in the run folder and leave the performance log alone")
+                        help="keep the profiles in the run folder; leave config/ and the performance log alone")
+    parser.add_argument("--friction-file", help=argparse.SUPPRESS)  # set by --instances for its searches
+    parser.add_argument("--share", help=argparse.SUPPRESS)  # "i/n": this search is the i-th of n (from 0)
+    parser.add_argument("--gpu-worker-slots", type=int, help=argparse.SUPPRESS)
     return parser.parse_args(argv)
 
 
@@ -876,26 +1158,140 @@ def apply_overrides(settings, args):
                 "max_generations", "seed"):
         if getattr(args, key) is not None:
             settings["search"][key] = getattr(args, key)
+    settings["search"]["compute_device"] = args.compute_device
+    if args.goals:
+        settings["goals"] = args.goals
+    if args.references:
+        settings["references"] = args.references
+    if args.models_dir:
+        settings["models_dir"] = args.models_dir
+    if args.no_reference_scores:
+        settings["reference_scores"] = False
     return settings
 
 
+def worker_count(value, instances=1, gpu_slots=0):
+    """CPU worker count plus this search's share of extra GPU-backed evaluator slots."""
+    from parallel_backtest import max_workers
+    if str(value).strip().lower() == "auto":
+        return max(1, (max_workers() + gpu_slots) // max(instances, 1))
+    return max(1, int(value)) + math.ceil(gpu_slots / max(instances, 1))
+
+
+def ranking_goals(settings):
+    """The goals the ranking uses: the settings' goals file, else search_config/goals.json, else none
+    (models are then ranked by score alone, with the default ranking settings)."""
+    from model_assessor import DEFAULT_GOALS, check_goals, load_goals
+    if settings.get("goals"):
+        return load_goals(ROOT / settings["goals"]), settings["goals"]
+    if DEFAULT_GOALS.exists():
+        return load_goals(DEFAULT_GOALS), str(DEFAULT_GOALS.relative_to(ROOT))
+    return check_goals({}), "no goals file (ranked by score)"
+
+
+def rank_market(settings, friction_inputs, say):
+    """Rank every model of the search's currency, wherever it sits in the library, and move the bottom to
+    its currency's discard folder (model_assessor.py)."""
+    from model_assessor import format_table, rank_and_discard
+    from model_library import library_root
+    from performance_log import DEFAULT_PATH as PERFORMANCE_LOG
+    goals, source = ranking_goals(settings)
+    product = settings["market"]["product"]
+    say(f"Ranking {product} models against {source}")
+    ranked, discarded = rank_and_discard(product, goals, friction_inputs, client=None,
+                                         workers=worker_count("auto"),
+                                         config_dir=library_root(models_dir(settings)),
+                                         performance_path=PERFORMANCE_LOG, say=say)
+    if ranked:
+        top = format_table(ranked[:10]).splitlines()
+        say("\n".join(["  " + line for line in top]))
+    return ranked, discarded, source
+
+
+def run_instances(args, argv, settings):
+    """Run `args.instances` searches at once, then rank once. Each gets its share of the CPUs and its
+    own seed; all share the market data and fees refreshed here, the registry and config/."""
+    import subprocess
+    import threading
+    count, market, search = args.instances, settings["market"], settings["search"]
+    print(f"Model search for {market['product']}: {count} searches at once; refreshing market data", flush=True)
+    friction_inputs = refresh_market(market["product"], market["granularities"], args.offline)
+    folder = SEARCH_DIR / f"{market['prefix']}_{datetime.now().strftime('%Y%m%d_%H%M%S')}_x{count}"
+    folder.mkdir(parents=True)
+    friction_file = folder / "friction.json"
+    friction_file.write_text(json.dumps(friction_inputs), encoding="utf-8")
+    base_seed = search["seed"] if search["seed"] is not None else random.SystemRandom().randrange(1 << 30)
+    from parallel_backtest import resolve_compute_device
+    compute_device, gpu_devices = resolve_compute_device(args.compute_device)
+    workers = {"generators": worker_count(search["generators"], count),
+               "evaluators": worker_count(search["evaluators"], count, len(gpu_devices))}
+    gpu_slot_counts = [len(gpu_devices) // count + (index < len(gpu_devices) % count)
+                       for index in range(count)]
+    print(f"  each search: {workers['generators']} generators, {workers['evaluators']} evaluators; seeds "
+          f"{base_seed} to {base_seed + count - 1}", flush=True)
+    forwarded, skip = [], False
+    for item in argv:  # everything but --instances, which the searches must not repeat
+        if skip:
+            skip = False
+        elif item == "--instances":
+            skip = True
+        elif not item.startswith("--instances="):
+            forwarded.append(item)
+    children = []
+    for index in range(count):
+        command = [sys.executable, str(Path(__file__).resolve()), *forwarded, "--friction-file", str(friction_file),
+                   "--no-rank", "--seed", str(base_seed + index), "--share", f"{index}/{count}",
+                   "--generators", str(workers["generators"]),
+                   "--evaluators", str(worker_count(search["evaluators"], count)),
+                   "--gpu-worker-slots", str(gpu_slot_counts[index])]
+        children.append(subprocess.Popen(command, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                         text=True, encoding="utf-8", errors="replace", bufsize=1))
+
+    def relay(number, child):
+        for line in child.stdout:
+            print(f"[{number}] {line}", end="", flush=True)
+
+    relays = [threading.Thread(target=relay, args=(number, child), daemon=True)
+              for number, child in enumerate(children, start=1)]
+    for thread in relays:
+        thread.start()
+    codes = [child.wait() for child in children]
+    for thread in relays:
+        thread.join()
+    failed = [number for number, code in enumerate(codes, start=1) if code]
+    print(f"{count - len(failed)} of {count} searches finished" + (f"; failed: {failed}" if failed else ""), flush=True)
+    if not args.dry_run and not args.no_rank and settings["ranking"]["enabled"]:
+        rank_market(settings, friction_inputs, lambda message: print(message, flush=True))
+    if failed:
+        sys.exit(1)
+
+
 def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
     args = parse_args(argv)
     try:
-        settings = apply_overrides(load_settings(args.settings), args)
+        settings = with_optional_settings(apply_overrides(load_settings(args.settings), args))
     except SettingsError as exc:
         sys.exit(str(exc))
+    if args.instances > 1:
+        return run_instances(args, argv, settings)
     market, search = settings["market"], settings["search"]
     product, prefix = market["product"], market["prefix"]
+    from parallel_backtest import resolve_compute_device
+    compute_device, gpu_devices = resolve_compute_device(search["compute_device"])
+    search["compute_device"] = compute_device
+    search["generators"] = worker_count(search["generators"])
+    gpu_worker_slots = len(gpu_devices) if args.gpu_worker_slots is None else args.gpu_worker_slots
+    if gpu_worker_slots < 0 or gpu_worker_slots > len(gpu_devices):
+        raise ValueError(f"GPU worker slots must be between 0 and {len(gpu_devices)}")
+    search["evaluators"] = worker_count(search["evaluators"], gpu_slots=gpu_worker_slots)
+    if search["seed"] is None:
+        search["seed"] = random.SystemRandom().randrange(1 << 30)
 
     from performance_log import DEFAULT_PATH as PERFORMANCE_LOG, describe_update, update_performance_log
 
-    existing = sorted(CONFIG_DIR.glob(f"{prefix}_[0-9][0-9][0-9].json"))
-    if existing and not args.dry_run:
-        sys.exit(f"config/ already has {len(existing)} {prefix}_###.json profiles; "
-                 f"move them or pick another --prefix.")
-
-    run_dir = SEARCH_DIR / f"{prefix}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    # The process ID keeps two searches started in the same second apart.
+    run_dir = SEARCH_DIR / f"{prefix}_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{os.getpid()}"
     run_dir.mkdir(parents=True)
     # The settings travel with the run, so its report can always be reproduced.
     (run_dir / "settings.json").write_text(json.dumps(settings, indent=2) + "\n", encoding="utf-8")
@@ -906,11 +1302,16 @@ def main(argv=None):
         log_file.write(message + "\n")
         log_file.flush()
 
-    say(f"Model search for {product} with {args.settings}: refreshing market data")
-    friction_inputs = refresh_market(product, market["granularities"], args.offline)
+    if args.friction_file:
+        say(f"Model search for {product} with {args.settings} (seed {search['seed']}): market data refreshed "
+            "by the launcher")
+        friction_inputs = json.loads(Path(args.friction_file).read_text(encoding="utf-8"))
+    else:
+        say(f"Model search for {product} with {args.settings} (seed {search['seed']}): refreshing market data")
+        friction_inputs = refresh_market(product, market["granularities"], args.offline)
     say(f"  fees: {friction_inputs.get('exchange_fees')}")
 
-    with (ROOT / market["template_profile"]).open(encoding="utf-8") as handle:
+    with profile_path(market["template_profile"]).open(encoding="utf-8") as handle:
         template = json.load(handle)
     library = expand_atoms(settings["atoms"])
     harvest, scored_reference = load_reference(library, PERFORMANCE_LOG, settings)
@@ -919,25 +1320,55 @@ def main(argv=None):
     say(f"Reference: {len(harvest.genomes)} of {len(harvest.genomes) + len(harvest.skipped)} profiles "
         f"recovered as genomes, {len(scored_reference)} with logged results; "
         f"{len(atoms)} atoms ({len(atoms) - len(library)} harvested from the references)")
-    reference_records = [(features(genome, atoms, options), score) for _, genome, score in scored_reference]
+    if not settings["reference_scores"]:
+        # Use the references' structures only: their logged full-history results would leak the holdout.
+        say("Reference scores off: references seed the search unranked and don't weight the analyst")
+        scored_reference = [(name, genome, 0.0) for name, genome in harvest.genomes]
+        reference_records = []
+    else:
+        reference_records = [(features(genome, atoms, options), score) for _, genome, score in scored_reference]
 
     train_start, holdout_start = _timestamp(settings["windows"]["train_start"]), _timestamp(settings["windows"]["holdout_start"])
+    registry = None
+    if settings["registry"]["enabled"]:
+        from backtest import DEFAULT_CACHE_DIR
+        from candle_store import CandleStore
+        from search_registry import SearchRegistry, context_key
+        store = CandleStore(DEFAULT_CACHE_DIR, read_only=True)
+        from backtest import BACKTEST_VERSION
+        # Fitness settings aren't part of it: scores are recomputed from the stored summaries.
+        context = context_key(product=product, windows=settings["windows"], backtest=BACKTEST_VERSION,
+                              template={k: v for k, v in template.items() if k not in ("strategy", "indicators")},
+                              fees=friction_inputs,
+                              candles={gran: store.fetched_range(product, gran) for gran in market["granularities"]})
+        registry = SearchRegistry(SEARCH_DIR / "registry.db", context, run_dir.name)
+        say(f"Registry: {registry.count()} models already scored under these conditions (context {context})")
+
     ctx = mp.get_context("spawn")
     gen_tasks, gen_results = ctx.Queue(), ctx.Queue()
     eval_tasks, eval_results = ctx.Queue(), ctx.Queue()
     analyst_tasks, analyst_results = ctx.Queue(), ctx.Queue()
     workers = [ctx.Process(target=generator_worker, args=(i, atoms, template, settings, gen_tasks, gen_results),
                            name=f"generator-{i + 1}") for i in range(search["generators"])]
-    workers += [ctx.Process(target=evaluator_worker, args=(settings, friction_inputs, train_start, holdout_start,
-                                                           eval_tasks, eval_results), name=f"evaluator-{i + 1}")
-                for i in range(search["evaluators"])]
+    workers += [
+        ctx.Process(
+            target=evaluator_worker,
+            args=(settings, friction_inputs, train_start, holdout_start, eval_tasks, eval_results,
+                  search["compute_device"],
+                  gpu_devices[i % len(gpu_devices)] if gpu_devices else 0),
+            name=f"evaluator-{i + 1}")
+        for i in range(search["evaluators"])
+    ]
     workers.append(ctx.Process(target=analyst_worker,
                                args=(reference_records, settings["analysis"], analyst_tasks, analyst_results),
                                name="analyst"))
     for worker in workers:
         worker.start()
-    say(f"Workers: {search['generators']} generators, {search['evaluators']} evaluator(s) "
-        f"(batches of {search['batch_size']}), 1 analyst")
+    gpu_slots = gpu_worker_slots
+    say(f"Workers: {search['generators']} generators, {search['evaluators']} evaluator(s)"
+        + (f" including {gpu_slots} GPU-added slot(s)" if gpu_slots else "")
+        + f" (batches of {search['batch_size']}), 1 analyst; compute device {search['compute_device']}"
+        + (f" across CUDA devices {gpu_devices}" if gpu_devices else ""))
 
     def receive(channel):
         """The next message from a worker queue; fails loudly if a worker has died."""
@@ -954,16 +1385,23 @@ def main(argv=None):
     seen = set()
     history = []
     batch_counter = 0
+    stats = {"reused": 0, "migrants": 0}
 
     # Generation 0 starts from the reference characteristics alone.
     analyst_tasks.put({"generation": 0, "records": []})
     weights = receive(analyst_results)["weights"]
     reference_seeds = sorted(scored_reference, key=lambda r: r[2], reverse=True)
     seeds = [("reference:" + name, json.loads(json.dumps(genome))) for name, genome, _ in reference_seeds]
+    if args.share:
+        # Searches launched together start from different reference models: each leads with its own share.
+        index, count = (int(part) for part in args.share.split("/"))
+        seeds = seeds[index::count] + [seed for position, seed in enumerate(seeds) if position % count != index]
     generators = search["generators"]
 
     def breed(generation, count, seeds=()):
-        elites = sorted((m for m in models.values() if "train" in m), key=lambda m: m["fitness"], reverse=True)
+        # Parents come from the best models that each behave differently.
+        elites = unique_by_behaviour(sorted((m for m in models.values() if "train" in m),
+                                            key=rank_key, reverse=True))
         elite_payload = [{"genome": m["genome"], "fitness": m["fitness"]} for m in elites[:search["elites"]]]
         made = []
         for round_ in range(6):
@@ -989,6 +1427,13 @@ def main(argv=None):
 
     def evaluate(candidates, mode="score"):
         nonlocal batch_counter
+        out = []
+        if mode == "score" and registry is not None:
+            # Models any search already scored under these conditions aren't backtested again.
+            known = registry.lookup(c["key"] for c in candidates)
+            out = [{"key": key, **rescore(scores, settings["fitness"])} for key, scores in known.items()]
+            stats["reused"] += len(known)
+            candidates = [c for c in candidates if c["key"] not in known]
         pending = {}
         for start in range(0, len(candidates), search["batch_size"]):
             batch = candidates[start:start + search["batch_size"]]
@@ -996,18 +1441,50 @@ def main(argv=None):
             pending[batch_counter] = len(batch)
             eval_tasks.put({"batch_id": batch_counter, "mode": mode,
                             "batch": [{"key": c["key"], "profile": c["profile"], "name": c.get("name")} for c in batch]})
-        out = []
+        fresh = []
         while pending:
             batch_id, results = receive(eval_results)
             pending.pop(batch_id)
-            out.extend(results)
-        return out
+            fresh.extend(results)
+        if mode == "score" and registry is not None:
+            genomes = {c["key"]: c["genome"] for c in candidates}
+            registry.record([{"key": r["key"], "genome": genomes[r["key"]], "train": r["train"],
+                              "holdout": r["holdout"], "fitness": selection_fitness(r)}
+                             for r in fresh if "train" in r])
+        return out + fresh
 
+    def welcome_migrants(generation):
+        """Add the best models other searches have found, so they can be parents here too."""
+        if registry is None or not settings["registry"]["migrants"]:
+            return 0
+        from performance_log import profile_fingerprint
+        joined = 0
+        for record in registry.best(settings["registry"]["migrants"],
+                                    key=lambda r: selection_fitness(rescore(r, settings["fitness"]))):
+            genome = record["genome"]
+            if record["key"] in models or genome.get("gran") not in market["granularities"]:
+                continue
+            if not all(expr in atoms for side in ("entry", "exit", "confirm") for expr in genome.get(side) or []):
+                continue  # built from conditions this search doesn't have
+            profile = build_profile(genome, atoms, template, product)
+            if profile_fingerprint(profile) != record["key"]:
+                continue  # built differently here (another template), so its scores don't apply
+            seen.add(record["key"])
+            models[record["key"]] = {
+                "key": record["key"], "origin": "migrant:" + record["instance"], "genome": genome,
+                "profile": profile, "features": features(genome, atoms, options), "generation": generation,
+                "train": record["train"], "holdout": record["holdout"], "fitness": selection_fitness(record)}
+            joined += 1
+        stats["migrants"] += joined
+        return joined
+
+    written, ranked, full = [], [], {}
     try:
         generation = 0
         while True:
             started = time.time()
             candidates = breed(generation, search["population"], seeds if generation == 0 else ())
+            reused_before = stats["reused"]
             results = {r["key"]: r for r in evaluate(candidates)}
             new_records, errors = [], 0
             for candidate in candidates:
@@ -1015,27 +1492,32 @@ def main(argv=None):
                 if "error" in result or "train" not in result:
                     errors += 1
                     continue
-                candidate.update(train=result["train"], holdout=result["holdout"], fitness=result["train"]["fitness"])
+                candidate.update(train=result["train"], holdout=result["holdout"], fitness=selection_fitness(result))
                 models[candidate["key"]] = candidate
                 new_records.append((candidate["features"], candidate["fitness"]))
+            migrants = welcome_migrants(generation)
             analyst_tasks.put({"generation": generation, "records": new_records})
             analysis = receive(analyst_results)
             weights = analysis["weights"]
             with (run_dir / f"characteristics_gen{generation:02d}.json").open("w", encoding="utf-8") as handle:
                 json.dump(analysis["report"], handle, indent=2)
 
-            ranked = sorted(models.values(), key=lambda m: m["fitness"], reverse=True)
+            ranked = sorted(models.values(), key=rank_key, reverse=True)
+            # Clones that trade identically would make the top 20 look settled; count each behaviour once.
+            ranked = unique_by_behaviour(ranked)
             best, top20 = ranked[0], ranked[:20]
             top20_mean = sum(m["fitness"] for m in top20) / len(top20)
             gen_best = max((c["fitness"] for c in candidates if "fitness" in c), default=float("nan"))
             origins = Counter(c["origin"].split(":")[0] for c in sorted(
                 (c for c in candidates if "fitness" in c), key=lambda c: c["fitness"], reverse=True)[:20])
             history.append({"generation": generation, "candidates": len(candidates), "errors": errors,
+                            "reused": stats["reused"] - reused_before, "migrants": migrants,
                             "generation_best": gen_best, "best_fitness": best["fitness"], "top20_mean": top20_mean,
                             "best_train_return": best["train"]["return"], "best_holdout_return": best["holdout"]["return"],
                             "top20_holdout_mean_return": sum(m["holdout"]["return"] for m in top20) / len(top20),
                             "seconds": round(time.time() - started, 1)})
-            say(f"Gen {generation:2d}: {len(candidates)} bred, {errors} failed | gen best {gen_best:+.3f} | "
+            say(f"Gen {generation:2d}: {len(candidates)} bred, {errors} failed, "
+                f"{stats['reused'] - reused_before} already scored, {migrants} migrants | gen best {gen_best:+.3f} | "
                 f"all-time best {best['fitness']:+.3f} (train {best['train']['return']:+.0%}, "
                 f"holdout {best['holdout']['return']:+.0%}, dd {best['train']['max_drawdown']:.0%}) | "
                 f"top-20 mean {top20_mean:+.3f} | top-20 of gen from {dict(origins)} | {time.time() - started:.0f}s")
@@ -1053,29 +1535,43 @@ def main(argv=None):
                 break
             generation += 1
 
-        # --- write the best models -------------------------------------------------------
-        ranked = sorted(models.values(), key=lambda m: m["fitness"], reverse=True)[:search["keep"]]
-        profile_dir = run_dir / "profiles" if args.dry_run else CONFIG_DIR
-        profile_dir.mkdir(exist_ok=True)
-        for rank, model in enumerate(ranked, start=1):
-            model["name"] = f"{prefix}_{rank:03d}"
-            with (profile_dir / f"{model['name']}.json").open("w", encoding="utf-8") as handle:
-                json.dump(model["profile"], handle, indent=2)
-                handle.write("\n")
-        say(f"Wrote {len(ranked)} profiles to {profile_dir}")
+        # --- write the best models, each behaving differently --------------------------
+        unique = unique_by_behaviour(sorted(models.values(), key=rank_key, reverse=True))
+        floor = settings["variety"].get("min_fitness")
+        eligible = [m for m in unique if floor is None or m["fitness"] >= floor]
+        if settings["variety"]["require_train_outperformance"]:
+            eligible = outperforming_buy_and_hold(eligible)
+        ranked = select_diverse(eligible, search["keep"], settings["variety"]["max_similarity"])
+        say(f"Variety: {len(models)} models scored, {len(unique)} with distinct trades; kept {len(ranked)} "
+            f"no more than {settings['variety']['max_similarity']:.0%} alike")
+        if settings["variety"]["require_train_outperformance"]:
+            say(f"Buy-and-hold gate: {len(eligible)} distinct models beat buy and hold in the training window")
+        if args.dry_run:
+            profile_dir = run_dir / "profiles"
+            profile_dir.mkdir(exist_ok=True)
+            for number, model in enumerate(ranked, start=1):
+                model["name"] = f"{prefix}_{number:03d}"
+                (profile_dir / f"{model['name']}.json").write_text(json.dumps(model["profile"], indent=2) + "\n",
+                                                                   encoding="utf-8")
+            written = ranked
+        else:
+            profile_dir = models_dir(settings)
+            profile_dir.mkdir(parents=True, exist_ok=True)
+            written = write_models(ranked, prefix, profile_dir, PERFORMANCE_LOG)
+        skipped = [m["existing"] for m in ranked if m.get("existing")]
+        say(f"Wrote {len(written)} profiles to {profile_dir}"
+            + (f"; {len(skipped)} already there, from an earlier or a parallel search: {', '.join(skipped)}"
+               if skipped else ""))
 
-        full = {r["key"]: r for r in evaluate(ranked, mode="full")}
-        entries = [(full[m["key"]]["result"], m["profile"]) for m in ranked if "result" in full.get(m["key"], {})]
+        full = {r["key"]: r for r in evaluate(written, mode="full")} if written else {}
+        entries = [(full[m["key"]]["result"], m["profile"]) for m in written if "result" in full.get(m["key"], {})]
         if args.dry_run:
             say("Dry run: performance log left untouched")
-        else:
+        elif entries:
             try:
                 say(describe_update(update_performance_log(entries, PERFORMANCE_LOG), PERFORMANCE_LOG))
             except OSError as exc:
                 say(f"Performance log not updated ({exc})")
-
-        write_outputs(run_dir, settings, args, models, ranked, full, history, harvest, friction_inputs)
-        say(f"Report: {run_dir / 'report.md'}")
     finally:
         for _ in range(search["generators"]):
             gen_tasks.put(None)
@@ -1086,10 +1582,22 @@ def main(argv=None):
             worker.join(timeout=10)
             if worker.is_alive():
                 worker.terminate()
+
+    # --- rank the currency's models; the bottom move to config/discard/ ----------------
+    ranking = None
+    try:
+        if not args.dry_run and not args.no_rank and settings["ranking"]["enabled"]:
+            ranking = rank_market(settings, friction_inputs, say)
+        if written:
+            write_outputs(run_dir, settings, args, models, written, full, history, harvest, friction_inputs,
+                          stats, ranking)
+            say(f"Report: {run_dir / 'report.md'}")
+    finally:
         log_file.close()
 
 
-def write_outputs(run_dir, settings, args, models, ranked, full, history, harvest, friction_inputs):
+def write_outputs(run_dir, settings, args, models, ranked, full, history, harvest, friction_inputs, stats=None,
+                  ranking=None):
     market, windows, fitness = settings["market"], settings["windows"], settings["fitness"]
     with (run_dir / "generations.csv").open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=list(history[0]))
@@ -1118,18 +1626,25 @@ def write_outputs(run_dir, settings, args, models, ranked, full, history, harves
     first = json.loads((run_dir / "characteristics_gen00.json").read_text(encoding="utf-8"))
     bh_train = ranked[0]["train"]["buy_and_hold"]
     bh_holdout = ranked[0]["holdout"]["buy_and_hold"]
-    destination = "the run folder (dry run)" if args.dry_run else f"`config/{market['prefix']}_###.json`"
+    destination = ("the run folder (dry run)" if args.dry_run else
+                   f"`config/` as {ranked[0]['name']} to {ranked[-1]['name']}")
+    stats = stats or {"reused": 0, "migrants": 0}
     lines = [
         f"# Model search: {market['product']}",
         "",
         f"Run {run_dir.name} with `{args.settings}` (copied to `settings.json`). {len(models)} unique models "
-        f"scored over {len(history)} generations; the top {len(ranked)} were written to {destination}.",
+        f"scored over {len(history)} generations; the top {len(ranked)}, each trading differently and no more "
+        f"than {settings['variety']['max_similarity']:.0%} alike, were written to {destination}.",
         "",
-        f"- Training window (selection): {windows['train_start']} to {windows['holdout_start']}; "
-        f"buy and hold {bh_train:+.1%}.",
-        f"- Holdout window (never used for selection): {windows['holdout_start']} to the latest candle; "
-        f"buy and hold {bh_holdout:+.1%}.",
+        f"- Shared registry: {stats['reused']} candidates were already scored by this or another search and "
+        f"not backtested again; {stats['migrants']} of other searches' best models joined as parents.",
+        f"- Training window (selection): {windows['train_start']} to {windows['holdout_start']}; the top "
+        f"model's buy and hold (from its first possible buy) {bh_train:+.1%}.",
+        f"- Holdout window (never used for selection): {windows['holdout_start']} to the latest candle; the top "
+        f"model's buy and hold {bh_holdout:+.1%}.",
         f"- Fees: {friction_inputs.get('exchange_fees')}; slippage and tax as in `{market['template_profile']}`.",
+        f"- Compute device: `{settings['search'].get('compute_device', 'cpu')}` for supported moving averages; "
+        "rule evaluation and the stateful trading simulation use the CPU.",
         f"- Fitness: annualized log growth plus {fitness['drawdown_weight']} x log(1 - max drawdown), less "
         f"{fitness['trade_penalty']} per trade under {fitness['min_trades']}.",
         "",
@@ -1174,6 +1689,13 @@ def write_outputs(run_dir, settings, args, models, ranked, full, history, harves
     if harvest.skipped:
         lines += ["", f"{len(harvest.skipped)} reference profiles were outside the search space and only lent their "
                   "conditions: " + ", ".join(name for name, _ in harvest.skipped) + "."]
+    if ranking is not None:
+        from model_assessor import format_table
+        ranked_all, discarded, source = ranking
+        lines += ["", f"## Ranking of every {market['product']} model", "",
+                  f"Against {source}, after backtesting all {len(ranked_all)} under the same conditions. "
+                  f"{sum(a['passes'] for a in ranked_all)} pass; {len(discarded)} moved to `config/discard/`.",
+                  "", "```text", format_table(ranked_all, discarded), "```"]
     (run_dir / "report.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 

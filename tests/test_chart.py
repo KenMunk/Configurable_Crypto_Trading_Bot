@@ -34,7 +34,14 @@ def test_chart_plots_price_trend_lines_and_trade_points():
     buys, sells = chart.ax.get_lines()[4:6]
     assert (buys.get_marker(), buys.get_color()) == ("^", BUY_COLOR)
     assert (sells.get_marker(), sells.get_color()) == ("v", SELL_COLOR)
-    assert list(buys.get_ydata()) == [result["trades"][0]["entry_price"]]
+    # The triangles sit at the chart's bottom edge (axes coordinates), at the trade's time, not on the price.
+    assert buys.get_transform() == chart.ax.get_xaxis_transform() and list(buys.get_ydata()) == [0.025]
+    assert list(buys.get_xdata()) == [np.datetime64(result["trades"][0]["entry_time"], "s")]
+    assert list(sells.get_ydata()) == [0.065]
+    # A vertical line marks each buy and sell through the whole chart.
+    buy_lines, sell_lines = (c for c in chart.ax.collections if c.get_transform() == chart.ax.get_xaxis_transform())
+    assert len(buy_lines.get_segments()) == len(result["trades"]) == len(sell_lines.get_segments())
+    assert [point[1] for point in buy_lines.get_segments()[0]] == [0, 1]
     assert chart.ax.get_yscale() == "log"
 
 
@@ -127,10 +134,44 @@ def test_model_value_chart_plots_value_against_buy_and_hold():
     assert labels == ["Starting capital (10,000)", "Buy and hold from 1970-01-01", "Model value"]
     assert chart.model_values[-1] == result["ending_equity"]
     assert chart.benchmark_values[-1] == 10_000 * (1 + result["buy_and_hold_return"])
+    assert len(chart.axes) == 2
+    assert chart.tax_reserve_ax.get_ylabel() == "Tax reserve (USD)"
+    assert chart.tax_reserve_ax.get_lines()[0].get_label() == "Tax reserve (USD)"
 
     x_pixel, y_pixel = chart.ax.transData.transform((chart.x_values[3], chart.model_values[3]))
     chart._on_move(SimpleNamespace(inaxes=chart.ax, xdata=chart.x_values[3], x=x_pixel, y=y_pixel))
     assert "Model value  10,000.00 (+0.00%)" in chart.tooltip.get_text()
+    assert "Tax reserve (USD)  0.00" in chart.tooltip.get_text()
+
+
+def test_model_value_chart_shows_monthly_tax_reserve_on_its_own_panel():
+    _, result = _chart_with_result()
+    reserve = [0.0] * len(result["series"]["time"])
+    reserve[7:9] = [50.0, 50.0]
+    result["series"]["tax_reserve"] = reserve
+    figure = Figure(figsize=(8, 4), dpi=100)
+    chart = ModelValueChart(figure, FigureCanvasAgg(figure))
+    chart.show(result)
+
+    assert list(chart.tax_reserve_ax.get_lines()[0].get_ydata()) == reserve
+    assert chart.tax_reserve_ax.get_ylim()[0] == 0
+
+
+def test_model_value_chart_labels_mixed_tax_reserve_currencies():
+    _, result = _chart_with_result()
+    other = dict(result)
+    other["product_id"] = "ETH-USDC"
+    other["model_name"] = "eth-model"
+    figure = Figure(figsize=(8, 4), dpi=100)
+    chart = ModelValueChart(figure, FigureCanvasAgg(figure))
+    chart.show([result, other])
+
+    assert chart.tax_reserve_ax.get_ylabel() == "Tax reserve (mixed quote currencies)"
+    labels = [line.get_label() for line in chart.tax_reserve_ax.get_lines()
+              if not line.get_label().startswith("_")]
+    assert labels == [
+        "Model 1 (USD)", "eth-model (USDC)",
+    ]
 
 
 def test_buy_and_hold_line_starts_where_the_model_could_first_buy_and_is_marked():

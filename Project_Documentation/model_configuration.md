@@ -300,6 +300,7 @@ The full language, with many examples, is in [Writing signal rules](indicator_re
 |---|---|---|---|
 | `hard_stop_trigger` | `true` or `false` | `true` | Whether the hard stop applies to this strategy. The stop also needs `safeguards.use_hard_stop: true` and a `safeguards.hard_stop_percentage`. |
 | `profit_lock_target` | Fraction, such as `0.08` | `0` (off) | Sells when the price reaches this far above the entry fill price. It is also the expected gain the [friction screen](#5-the-friction-screen-worked-through) tests; without a target, the screen is off. |
+| `profit_lock_trail` | Fraction from `0` up to (not including) `1`, such as `0.2` | `0` (off) | Needs `profit_lock_target`. Reaching the target then doesn't sell: it arms a trailing stop this far below the highest price since entry, from the next candle on, so the model keeps riding the run. Sells with the exit reason `TARGET_TRAIL`. On DOGE's sharp spikes this gave back more than it gained (a 15.96x model fell to 8-10x); test it before relying on it. |
 | `trailing_stop` | Fraction from `0` up to (not including) `1`, such as `0.1` | `0` (off) | Sells when the price falls this far below the highest price since entry. The highest price is taken through the previous candle, because a candle's high and low can't be ordered within it. |
 
 How the stops, the target and the exit rules interact within a candle is described in [How trades are simulated](simulator.md#8-how-trades-are-simulated).
@@ -355,7 +356,7 @@ These settings model the real-world costs every trade pays.
 | `fallback_commission_rate` | Fraction | `0.005` | Simulated | The **profile rate**: used when the source is `config` or the live lookup fails. `exchange_commission_rate` is an older name for the same setting and takes precedence if both are present. |
 | `fee_buffer_multiplier` | Number, typically `1.0` to `1.5` | `1.0` | Simulated | Multiplies whichever fee rate is in use, as a safety cushion. A 0.5% rate with `1.25` becomes 0.625% per fill. |
 | `slippage_buffer` | Fraction | `0` | Simulated | Price penalty on every market-style fill: buys fill this much higher and sells this much lower. |
-| `tax_buffer_rate` | Fraction, such as `0.313` | `0` | Simulated | Tax on net realized gains, settled once a year (see [Taxes](#how-taxes-are-settled)). The friction screen also uses it. |
+| `tax_buffer_rate` | Fraction, such as `0.313` | `0` | Simulated | Tax reserved from each profitable completed trade and paid monthly (see [Taxes](#how-taxes-are-settled)). The friction screen also uses it. |
 | `liquidity_fee_buffer` | Fraction | `0.5` | Simulated | A cushion used only by the friction screen: this fraction of the round-trip exchange fees plus the Bitcoin network fee for moving the position on-chain. It is never charged. |
 | `liquidity_buffer` | — | — | Not modeled yet | Superseded by `liquidity_fee_buffer`. The simulator ignores it. |
 | `rebalancing_cost_adjustment` | `true` or `false` | none | Not modeled yet | The simulator never resizes an open position. |
@@ -366,11 +367,11 @@ The Metrics tab shows the rates a run actually used and where they came from: `C
 
 #### How taxes are settled
 
-The simulator nets each calendar year's realized gains and losses. When the first candle of a new year arrives, it pays `tax_buffer_rate` on a net gain, from cash. A net loss is carried forward to offset later gains.
+The simulator reserves `tax_buffer_rate` of each profitable completed trade's net gain after fees. It moves that amount out of trading cash immediately, then pays the accumulated reserve at the first candle of the next UTC month. Losing trades do not offset tax reserved on profitable trades, either within the month or later.
 
-- Tax payments count as **withdrawals, not losses** in every drawdown figure.
-- The tax payment does not sell anything. If the model is fully invested at that moment, its cash balance can briefly go negative.
-- Tax on the final, unfinished year is reported as an estimate and is **not** deducted from the ending value.
+- The **Tax reserve** panel under Model value shows the amount withheld and awaiting payment; it returns to zero at the monthly payment. The reserve is excluded from the model's trading equity, so clearing it at payment does not create a second drop in equity.
+- The reserve is segregated from trading cash, so tax payments never sell holdings or force a strategy trade. Unrealized gains are not taxed.
+- Any reserve for the unfinished final month remains withheld and is reported as tax held for the next monthly payment.
 
 ### 4.5 `capital_allocation`
 
@@ -418,7 +419,7 @@ Pauses are shaded gray on the charts and listed in the Metrics tab.
 
 ### 4.8 `tax_allocation`
 
-`tax_allocation` is an optional block for a scheduled tax reserve. The simulator does not model it yet; it settles taxes yearly using `friction_model.tax_buffer_rate` instead. The trader engine keeps the block with the loaded profile, so future code can read it through `get_model_configuration(ticker)`. Nothing checks its values yet. The four research templates (`btc_sma_30_100`, `btc_ema_10_100`, `btc_growth_09` and `btc_trend_vote_4in_1out`) each include a monthly example.
+`tax_allocation` is an optional block for a scheduled tax reserve. The simulator does not use this schedule; it reserves tax per profitable trade using `friction_model.tax_buffer_rate` and pays the reserve monthly. The trader engine keeps the block with the loaded profile, so future code can read it through `get_model_configuration(ticker)`. Nothing checks its values yet. The four research templates (`btc_sma_30_100`, `btc_ema_10_100`, `btc_growth_09` and `btc_trend_vote_4in_1out`) each include a monthly example.
 
 | Field | Meaning |
 |---|---|

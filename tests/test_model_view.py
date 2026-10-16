@@ -1,5 +1,7 @@
 """Choosing which models the charts show: the Choose models dialog and the comparison table."""
 
+import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -23,9 +25,10 @@ def test_matching_models_needs_every_word_and_ignores_case():
 
 
 @pytest.fixture
-def window(monkeypatch):
+def window(monkeypatch, tmp_path):
     import simulator
 
+    monkeypatch.setattr(simulator, "CONFIG_DIRECTORY", tmp_path / "config")  # never the real model library
     try:
         root = tk.Tk()
     except tk.TclError:
@@ -302,3 +305,153 @@ def test_searching_the_list_keeps_models_it_hides_and_the_buttons_act_on_the_lis
     window.view_search_var.set("alpha")
     window._view_listed(False)  # would leave nothing on the chart
     assert _charted(window) == ["alpha"] and window.view_list_note.get() == "Choose at least one model"
+
+
+# --- currency folders and each currency's best model -------------------------------------
+
+def _library_window(monkeypatch, tmp_path):
+    """A window over a model library of three BTC models and one ETH model."""
+    import simulator
+    config = tmp_path / "library"
+    for name, product in (("alpha", "BTC-USD"), ("beta", "BTC-USD"), ("gamma", "BTC-USD"), ("delta", "ETH-USD")):
+        folder = config / product
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / f"{name}.json").write_text(json.dumps({**_profile(), "product_id": product}), encoding="utf-8")
+    monkeypatch.setattr(simulator, "CONFIG_DIRECTORY", config)
+    monkeypatch.setattr(simulator, "load_environment_config", lambda: {})
+    root = tk.Tk()
+    root.geometry("+-3000+-3000")
+    return simulator.SimulationWindow(root), config
+
+
+def _run_results():
+    candles = [_candle(i * 900, price) for i, price in enumerate(PRICES)]
+    results = []
+    for name, slow, product in (("alpha", 3, "BTC-USD"), ("beta", 5, "BTC-USD"), ("gamma", 4, "BTC-USD"),
+                                ("delta", 5, "ETH-USD")):
+        profile = _profile(product_id=product)
+        profile["indicators"]["slow_ema"]["period"] = slow
+        result = run_backtest(candles, profile)
+        result["model_name"], result["granularity"] = name, "FIFTEEN_MINUTE"
+        results.append(result)
+    return results
+
+
+def _names(window, starred_only=False):
+    rows = [window.model_list.get(i) for i in range(window.model_list.size())]
+    return [row.split()[-2] if row.startswith("\u2605") else row.split()[0]
+            for row in rows if not starred_only or row.startswith("\u2605")]
+
+
+def test_the_model_list_reads_currency_folders_and_filters_by_currency(monkeypatch, tmp_path):
+    window, _ = _library_window(monkeypatch, tmp_path)
+    try:
+        assert list(window.currency_picker["values"]) == ["All currencies", "BTC-USD", "ETH-USD"]
+        assert window.model_list.size() == 4
+
+        window.currency_var.set("ETH-USD")
+        window._fill_model_list()
+
+        assert _names(window) == ["delta"]
+    finally:
+        window.root.destroy()
+
+
+def test_after_a_run_each_currencys_best_model_is_recorded_starred_and_selected(monkeypatch, tmp_path):
+    from simulator import best_by_currency
+    window, config = _library_window(monkeypatch, tmp_path)
+    try:
+        results = _run_results()
+        best = sorted(results[position]["model_name"] for position in best_by_currency(results).values())
+
+        window.progress_queue.put(("done", results, "logged"))
+        window._poll_progress()
+
+        recorded = sorted(json.loads((config / product / "best_model.json").read_text(encoding="utf-8"))["model"]
+                          for product in ("BTC-USD", "ETH-USD"))
+        assert recorded == best
+        assert sorted(Path(path).stem for path in window.selected_model_paths()) == best
+        assert sorted(_names(window, starred_only=True)) == best
+        assert sorted(run["model_name"] for run in window.value_chart.runs) == best  # each currency's best
+        assert "best per currency: BTC-USD" in window.result_var.get()
+    finally:
+        window.root.destroy()
+
+
+def test_a_run_from_a_start_date_records_no_best_and_the_selection_can_be_kept(monkeypatch, tmp_path):
+    window, config = _library_window(monkeypatch, tmp_path)
+    try:
+        window.select_best_var.set(False)
+        before = window.selected_model_paths()
+        results = _run_results()
+        for result in results:
+            result["requested_start"] = 1_700_000_000  # not a full-history result
+
+        window.progress_queue.put(("done", results, "logged"))
+        window._poll_progress()
+
+        assert not list(config.rglob("best_model.json"))
+        assert window.selected_model_paths() == before
+    finally:
+        window.root.destroy()
+
+
+def test_each_currencys_best_model_is_selected_when_the_simulator_opens(monkeypatch, tmp_path):
+    from model_library import update_best
+    config = tmp_path / "library" / "ETH-USD"
+    config.mkdir(parents=True)
+    (config / "delta.json").write_text(json.dumps({**_profile(), "product_id": "ETH-USD"}), encoding="utf-8")
+    update_best("ETH-USD", "delta", config / "delta.json", 1.0, tmp_path / "library")
+    window, _ = _library_window(monkeypatch, tmp_path)
+    try:
+        assert [Path(path).stem for path in window.selected_model_paths()] == ["delta"]
+    finally:
+        window.root.destroy()
+
+
+# --- comparison filters and discarded models ------------------------------------------------
+
+def test_comparison_filters_compare_numbers_in_shown_units_and_match_text():
+    from simulator import parse_filter, row_matches
+    row = {"sort": {"return": 2.5, "trades": 14, "model": "doge_b_130", "max_drawdown": 0.3},
+           "display": {"return": "+250.00%", "trades": "14", "model": "doge_b_130", "max_drawdown": "30.0%"}}
+
+    assert parse_filter(">10 <=40") == [(">", 10.0), ("<=", 40.0)]
+    assert row_matches(row, {"return": ">100"}) and not row_matches(row, {"return": ">300"})
+    assert row_matches(row, {"trades": "10..20", "max_drawdown": "<35%"})
+    assert row_matches(row, {"model": "B_13"}) and not row_matches(row, {"model": "eth"})
+    assert not row_matches(row, {"trades": ">abc"})  # a malformed number matches nothing
+    assert row_matches(row, {"return": "  "})  # an empty filter is ignored
+
+
+def test_the_comparison_table_filters_rows_and_counts_them(window):
+    window.filter_vars["model"].set("a")  # alpha, beta, gamma all contain "a"
+    assert len(window.comparison_table.get_children()) == 3
+
+    window.filter_vars["model"].set("gam")
+    assert [window.comparison_rows[item]["result"]["model_name"] for item in window.comparison_table.get_children()] == [
+        "gamma"]
+    assert window.comparison_count_var.get() == "Showing 1 of 3 models"
+    window._sort_comparison("trades")  # sorting keeps hidden rows hidden
+    assert len(window.comparison_table.get_children()) == 1
+
+    window._clear_comparison_filters()
+    assert len(window.comparison_table.get_children()) == 3
+
+
+def test_discarded_models_are_listed_only_when_asked(monkeypatch, tmp_path):
+    window, config = _library_window(monkeypatch, tmp_path)
+    try:
+        (config / "BTC-USD" / "discard").mkdir()
+        (config / "BTC-USD" / "discard" / "old.json").write_text(
+            json.dumps({**_profile(), "product_id": "BTC-USD"}), encoding="utf-8")
+        window._refresh_models()
+        assert "old" not in _names(window)
+
+        window.include_discarded_var.set(True)
+        window._refresh_models()
+
+        rows = [window.model_list.get(i) for i in range(window.model_list.size())]
+        assert any(row.split()[0] == "old" and "discarded" in row for row in rows)
+    finally:
+        window.root.destroy()

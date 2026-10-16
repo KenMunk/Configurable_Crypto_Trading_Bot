@@ -144,6 +144,20 @@ def test_backtest_enters_on_uptrend_and_exits_on_trend_reversal():
     assert progress[-1] == 1.0
 
 
+def test_backtest_reports_default_cpu_compute_device():
+    candles = [_candle(i * 900, price) for i, price in enumerate([100, 101, 102, 103, 104, 105])]
+
+    result = run_backtest(candles, _profile())
+
+    assert result["compute_device"] == "cpu"
+    assert result["gpu_indicators"] == []
+
+
+def test_backtest_rejects_unknown_compute_device():
+    with pytest.raises(ValueError, match="Unsupported compute_device"):
+        run_backtest([_candle(0, 100)], _profile(), compute_device="tpu")
+
+
 def test_backtest_hard_stop_fills_at_stop_price():
     prices = [100] * 6 + [101, 102]
     candles = [_candle(i * 900, p) for i, p in enumerate(prices)]
@@ -219,6 +233,8 @@ def test_backtest_records_model_value_for_every_candle():
 
     equity = result["series"]["equity"]
     assert len(equity) == len(prices)
+    assert len(result["series"]["tax_reserve"]) == len(prices)
+    assert not any(result["series"]["tax_reserve"])
     assert equity[0] == result["starting_capital"]
     assert equity[-1] == result["ending_equity"]
     assert result["trades"][0]["equity_after"] == result["ending_equity"]
@@ -251,7 +267,8 @@ def test_invalid_starting_value_is_rejected(bad):
 def test_trade_rows_and_summary_describe_each_outcome():
     trades = [
         {"entry_time": 0, "exit_time": 2 * 86_400 + 3_600, "entry_price": 100.0, "exit_price": 110.0,
-         "position_cost": 2_500.0, "fees": 45.0, "pnl": 240.0, "return": 0.096, "equity_after": 10_240.0,
+         "position_cost": 2_500.0, "fees": 45.0, "pnl": 240.0, "tax_withheld": 24.0, "net_pnl": 216.0,
+         "return": 0.0864, "equity_after": 10_216.0,
          "entry_reason": "EMA_TREND", "exit_reason": "PROFIT_LOCK"},
         {"entry_time": 3 * 86_400, "exit_time": 3 * 86_400 + 2_700, "entry_price": 110.0,
          "exit_price": 106.7, "position_cost": 2_560.0, "fees": 45.5, "pnl": -90.0, "return": -0.035,
@@ -264,9 +281,11 @@ def test_trade_rows_and_summary_describe_each_outcome():
     assert rows[0]["display"]["held"] == "2d 1h"
     assert rows[1]["display"]["held"] == "45m"
     assert [row["display"]["outcome"] for row in rows] == ["Win", "Loss"]
+    assert rows[0]["display"]["pnl"] == "+216.00"
+    assert rows[0]["display"]["tax"] == "24.00"
     assert rows[1]["display"]["pnl"] == "-90.00"
     assert sorted(rows, key=lambda row: row["sort"]["return"])[0] is rows[1]
     assert "2 trades: 1 wins, 1 losses (50.0% win rate)" in summary
-    assert "Net P&L +150.00" in summary
+    assert "Net P&L +126.00" in summary
     assert "PROFIT_LOCK 1" in summary and "HARD_STOP 1" in summary
     assert trade_summary([]) == "No trades were made in this simulation"

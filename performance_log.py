@@ -11,14 +11,14 @@ CSV of its own (write_shard), and one gatherer merges finished shards into the s
 (gather_shards), deleting each shard once its rows are in.
 """
 
-import contextlib
 import csv
 import hashlib
 import json
 import os
-import time
 from datetime import datetime, timezone
 from pathlib import Path
+
+from file_lock import file_lock
 
 DEFAULT_PATH = Path(__file__).parent / "data" / "model_performance.csv"
 SHARD_DIR = DEFAULT_PATH.parent / "performance_shards"
@@ -80,39 +80,15 @@ def performance_row(result, profile):
         "trades": str(result["trade_count"]),
         "win_rate_pct": _number(result["win_rate"] * 100),
         "fees": _number(result["fees_paid"]),
-        "taxes": _number(result["taxes_paid"]),
+        "taxes": _number(result["taxes_paid"] + result.get("taxes_reserved", 0.0)),
         "blocked_signals": str(result["screened_signals"]),
         "flash_buys": str(len(result["flash_crash_buys"])),
     }
 
 
-@contextlib.contextmanager
 def _locked(path):
     """Hold `path`.lock, so one update at a time, in any thread or process, reads and replaces `path`."""
-    lock = path.with_name(path.name + ".lock")
-    lock.parent.mkdir(parents=True, exist_ok=True)
-    timeout = LOCK_TIMEOUT_SECONDS
-    deadline = time.monotonic() + timeout
-    while True:
-        try:
-            handle = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            break
-        except FileExistsError:
-            try:
-                if time.time() - lock.stat().st_mtime > STALE_LOCK_SECONDS:
-                    lock.unlink(missing_ok=True)
-                    continue
-            except FileNotFoundError:
-                continue  # released between the two calls
-            if time.monotonic() > deadline:
-                raise TimeoutError(f"{lock} has been held for over {timeout}s; delete it if no run is recording")
-            time.sleep(0.05)
-    try:
-        os.write(handle, str(os.getpid()).encode())
-        os.close(handle)
-        yield
-    finally:
-        lock.unlink(missing_ok=True)
+    return file_lock(path.with_name(path.name + ".lock"), timeout=LOCK_TIMEOUT_SECONDS, stale=STALE_LOCK_SECONDS)
 
 
 def update_performance_log(entries, path=DEFAULT_PATH, now=None):

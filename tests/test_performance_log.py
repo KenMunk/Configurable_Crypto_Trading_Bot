@@ -53,6 +53,16 @@ def test_new_models_are_added_with_their_metrics(tmp_path):
         assert next(csv.reader(handle)) == COLUMNS
 
 
+def test_performance_tax_total_includes_the_unpaid_monthly_reserve():
+    result, profile = _run("a")
+    result["taxes_paid"] = 125.0
+    result["taxes_reserved"] = 25.0
+
+    row = performance_row(result, profile)
+
+    assert row["taxes"] == "150"
+
+
 def test_an_identical_run_leaves_the_file_untouched(tmp_path):
     path = tmp_path / "model_performance.csv"
     update_performance_log([_run("a")], path, now=FIRST)

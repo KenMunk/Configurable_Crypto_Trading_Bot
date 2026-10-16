@@ -15,8 +15,10 @@ Each run splits the work into three roles, so only one of them ever writes to ea
                                 as they arrive, under the log's lock, and deletes them.
 
 Workers are processes, not threads: the backtest loop is plain Python, which threads would
-run one at a time. Each worker loads each market's candles once and reuses them for every
-model it runs on that market, so memory grows with the worker count.
+run one at a time. CUDA mode adds one worker slot per visible GPU to the CPU worker capacity;
+supported indicators can run on the GPU, while the trading simulation stays on CPU. Each
+worker loads each market's candles once and reuses them for every model it runs on that market,
+so memory grows with the worker count.
 
 A shard the gatherer can't merge (say the CSV is open in Excel) stays on disk, and
 `--gather` (or gather_shards) merges it later. The simulator window uses run_parallel in its
@@ -83,15 +85,39 @@ def parse_workers(text):
     return min(workers, max_workers())
 
 
+def resolve_compute_device(compute_device):
+    """Resolve automatic GPU selection or validate an explicitly requested CUDA backend."""
+    if compute_device == "auto":
+        from gpu_indicators import available_devices
+
+        devices = available_devices()
+        return ("cuda", devices) if devices else ("cpu", [])
+    if compute_device == "cuda":
+        from gpu_indicators import require_devices
+
+        return "cuda", require_devices()
+    if compute_device == "cpu":
+        return "cpu", []
+    raise ValueError(f"Unsupported compute_device {compute_device!r}; use 'auto', 'cpu' or 'cuda'")
+
+
+def effective_worker_count(model_count, workers=None, gpu_slots=0):
+    """CPU worker budget plus one extra worker slot per available GPU, capped by queued models."""
+    cpu_workers = max(1, min(workers or max_workers(), max_workers()))
+    return min(model_count, cpu_workers + gpu_slots) if model_count else 1
+
+
 # --- worker processes ----------------------------------------------------------------
 
 _worker = {}  # this process's settings, read-only store and loaded markets
 
 
-def _start_worker(cache_dir, friction_inputs, start_time, wait_for_fresh_signal, shard_dir):
+def _start_worker(cache_dir, friction_inputs, start_time, wait_for_fresh_signal, shard_dir,
+                  compute_device, gpu_devices):
     _worker.update(store=CandleStore(cache_dir, read_only=True), friction_inputs=friction_inputs,
                    start_time=start_time, wait=wait_for_fresh_signal, markets={},
-                   shard_dir=None if shard_dir is None else Path(shard_dir))
+                   shard_dir=None if shard_dir is None else Path(shard_dir),
+                   compute_device=compute_device, gpu_devices=gpu_devices)
 
 
 def _market(product_id, granularity, start, end):
@@ -120,7 +146,10 @@ def _backtest_task(index, name, profile, market, keep_heavy):
     try:
         product_id, granularity, start, end = market
         result = run_backtest(_market(*market), profile, friction=FrictionModel(profile, _worker["friction_inputs"]),
-                              start_time=_worker["start_time"], wait_for_fresh_signal=_worker["wait"])
+                              start_time=_worker["start_time"], wait_for_fresh_signal=_worker["wait"],
+                              compute_device=_worker["compute_device"],
+                              device_id=(_worker["gpu_devices"][index % len(_worker["gpu_devices"])]
+                                         if _worker["gpu_devices"] else 0))
         result["model_name"], result["granularity"] = name, granularity
         if _worker["shard_dir"] is not None:
             reply["shard"] = write_shard([performance_row(result, profile)],
@@ -195,7 +224,7 @@ class _Gatherer(threading.Thread):
 
 def run_parallel(client, models, workers=None, start_time=None, wait_for_fresh_signal=False,
                  friction_inputs=None, cache_dir=DEFAULT_CACHE_DIR, performance_path=PERFORMANCE_LOG,
-                 shard_root=None, progress=None, keep_heavy=True, now=None):
+                 shard_root=None, progress=None, keep_heavy=True, now=None, compute_device="auto"):
     """Backtest each (name, profile) in `models` on `workers` processes; see the module docstring.
 
     `workers` defaults to max_workers() and never exceeds it, nor the number of models.
@@ -210,7 +239,10 @@ def run_parallel(client, models, workers=None, start_time=None, wait_for_fresh_s
     "logged": a status line for the performance log}.
     """
     progress = progress or (lambda phase, fraction, message: None)
-    workers = max(1, min(workers or max_workers(), max_workers(), len(models)))
+    compute_device, gpu_devices = resolve_compute_device(compute_device)
+    cpu_workers = max(1, min(workers or max_workers(), max_workers()))
+    gpu_workers = min(len(gpu_devices), max(0, len(models) - cpu_workers))
+    workers = effective_worker_count(len(models), cpu_workers, gpu_workers)
     run_id = datetime.now().strftime("%Y%m%d_%H%M%S_") + str(os.getpid())
     shard_dir = None if performance_path is None else (
         Path(shard_root or Path(performance_path).parent / SHARD_DIR.name) / run_id)
@@ -230,7 +262,8 @@ def run_parallel(client, models, workers=None, start_time=None, wait_for_fresh_s
     writer = ThreadPoolExecutor(max_workers=1, thread_name_prefix="candle-writer")
     pool = ProcessPoolExecutor(
         max_workers=workers, mp_context=mp.get_context("spawn"), initializer=_start_worker,
-        initargs=(cache_dir, friction_inputs, start_time, wait_for_fresh_signal, shard_dir))
+        initargs=(cache_dir, friction_inputs, start_time, wait_for_fresh_signal, shard_dir,
+                  compute_device, gpu_devices))
     try:
         downloads = {}
         for number, ((product_id, granularity), market) in enumerate(markets.items()):
@@ -241,7 +274,12 @@ def run_parallel(client, models, workers=None, start_time=None, wait_for_fresh_s
                                     *market["window"], report)] = (product_id, granularity)
 
         pending, done_count = set(downloads), 0
-        progress("simulation", 0.0, f"0 of {len(models)} models done on {workers} workers")
+        worker_description = f"{workers} workers"
+        if gpu_workers:
+            worker_description += f" ({workers - gpu_workers} CPU-capacity + {gpu_workers} GPU-added)"
+        if gpu_devices:
+            worker_description += f"; CUDA devices {gpu_devices}"
+        progress("simulation", 0.0, f"0 of {len(models)} models done on {worker_description}")
         while pending:
             finished, pending = wait(pending, return_when=FIRST_COMPLETED)
             for future in finished:
@@ -293,16 +331,29 @@ def run_parallel(client, models, workers=None, start_time=None, wait_for_fresh_s
 
 # --- command line --------------------------------------------------------------------
 
+def market_inputs(profiles, offline=False):
+    """(client, friction inputs) for running `profiles`: a Coinbase client and the live fees, or with
+    `offline` no client (cached candles only) and each profile's fallback fees."""
+    if offline:
+        return None, OFFLINE_FRICTION
+    from engine import QuantitativeTradingEngine
+    from friction import fetch_friction_inputs
+    client = QuantitativeTradingEngine(base_directory=".", node_is_primary=False).create_coinbase_client()
+    return client, fetch_friction_inputs(client, profiles)
+
+
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument("profiles", nargs="*", help="model profile JSON files to backtest")
     parser.add_argument("--workers", type=parse_workers, default="auto",
-                        help=f"worker processes: auto (the default) or a number, at most {max_workers()} "
-                             f"here (one per CPU but {RESERVED_CPUS})")
+                        help=f"CPU-capacity worker processes: auto (the default) or a number, at most "
+                             f"{max_workers()} here (one per CPU but {RESERVED_CPUS}); CUDA adds a slot per GPU")
     parser.add_argument("--start", help="start testing from this UTC date (YYYY-MM-DD); indicators still warm up")
     parser.add_argument("--fresh-signal", action="store_true", help="wait for a fresh entry signal at the start")
     parser.add_argument("--offline", action="store_true",
                         help="use cached candles only, and each profile's fallback fee")
+    parser.add_argument("--compute-device", choices=("auto", "cpu", "cuda"), default="auto",
+                        help="auto (default) uses visible CUDA GPUs; cpu or cuda forces the device choice")
     parser.add_argument("--no-log", action="store_true", help="leave the performance log alone")
     parser.add_argument("--gather", action="store_true",
                         help="merge result shards left by earlier runs into the performance log, then exit")
@@ -333,12 +384,7 @@ def main(argv=None):
     if problems:
         sys.exit("Fix these profiles first (the simulator's Load Profile lists every problem):\n" + "\n".join(problems))
 
-    client, friction_inputs = None, OFFLINE_FRICTION
-    if not args.offline:
-        from engine import QuantitativeTradingEngine
-        from friction import fetch_friction_inputs
-        client = QuantitativeTradingEngine(base_directory=".", node_is_primary=False).create_coinbase_client()
-        friction_inputs = fetch_friction_inputs(client, profiles)
+    client, friction_inputs = market_inputs(profiles, args.offline)
 
     last = {}
 
@@ -349,11 +395,17 @@ def main(argv=None):
             print(f"  {phase:10s} {fraction:4.0%}  {message}", flush=True)
 
     started = time.monotonic()
-    print(f"Backtesting {len(models)} model(s) on {min(args.workers, len(models))} worker(s)", flush=True)
+    resolved_device, devices = resolve_compute_device(args.compute_device)
+    cpu_slots = min(args.workers, max_workers())
+    gpu_slots = min(len(devices), max(0, len(models) - cpu_slots))
+    worker_count = effective_worker_count(len(models), cpu_slots, gpu_slots)
+    extra = f" ({cpu_slots} CPU-capacity + {gpu_slots} GPU-added)" if gpu_slots else ""
+    device_description = f" using CUDA devices {devices}" if devices else ""
+    print(f"Backtesting {len(models)} model(s) on {worker_count} worker(s){extra}{device_description}", flush=True)
     run = run_parallel(client, models, workers=args.workers, start_time=parse_start_date(args.start or ""),
                        wait_for_fresh_signal=args.fresh_signal, friction_inputs=friction_inputs,
                        performance_path=None if args.no_log else PERFORMANCE_LOG, progress=progress,
-                       keep_heavy=False)
+                       keep_heavy=False, compute_device=resolved_device)
     print(f"\nFinished in {time.monotonic() - started:,.0f}s\n")
     print(f"{'model':40s} {'return':>12s} {'buy & hold':>12s} {'max dd':>8s} {'trades':>7s}")
     for (name, _), result in zip(models, run["results"]):

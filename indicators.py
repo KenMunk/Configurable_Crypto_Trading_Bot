@@ -526,13 +526,16 @@ class IndicatorContext:
     the same candles.
     """
 
-    def __init__(self, candles, definitions, granularity_seconds):
+    def __init__(self, candles, definitions, granularity_seconds, compute_device="cpu", device_id=0):
         self.metrics = candles if isinstance(candles, MetricCache) else MetricCache(candles)
         arrays = self.metrics.arrays
         self.time = arrays["time"]
         self.open, self.high, self.low, self.close, self.volume = (arrays[field] for field in CANDLE_ARRAYS)
         self.granularity_seconds = granularity_seconds
         self.definitions = definitions
+        self.compute_device = compute_device
+        self.device_id = device_id
+        self.gpu_indicators = []
         self.values = {}
         self._computing = []
 
@@ -623,7 +626,19 @@ class IndicatorContext:
             # `first` lets a storing MetricCache compute only the candles from that index on.
             def compute(first=0):
                 context = self if not first else IndicatorContext(
-                    self.metrics.tail(first), self.definitions, self.granularity_seconds)
+                    self.metrics.tail(first), self.definitions, self.granularity_seconds,
+                    compute_device=self.compute_device, device_id=self.device_id)
+                if self.compute_device == "cuda":
+                    from gpu_indicators import SUPPORTED_INDICATORS, compute_moving_average
+
+                    indicator_type = definition["type"]
+                    if indicator_type in SUPPORTED_INDICATORS:
+                        result = compute_moving_average(
+                            indicator_type, context.source(parameters["source"]), parameters["period"],
+                            device_id=self.device_id)
+                        if name not in self.gpu_indicators:
+                            self.gpu_indicators.append(name)
+                        return result
                 return function(context, parameters)
 
             result = self.metrics.get(self.metric_key(name), compute, self.lookback(name))

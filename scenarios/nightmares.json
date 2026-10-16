@@ -1,0 +1,102 @@
+{
+  "scenarios": [
+    {
+      "name": "Nightmare: exchange collapse, -80% in 2 days",
+      "type": "crash",
+      "placement": "append",
+      "at": "",
+      "seed": 101,
+      "chain": false,
+      "drop": 0.8,
+      "days": 2.0,
+      "recovery_days": 10.0,
+      "recovery": 0.05,
+      "volatility": 1.5
+    },
+    {
+      "name": "then bleeds -40% over 6 months",
+      "type": "bear",
+      "placement": "append",
+      "at": "",
+      "seed": 102,
+      "chain": true,
+      "drop": 0.4,
+      "days": 180.0,
+      "volatility": 1.2
+    },
+    {
+      "name": "Nightmare: euphoria +300% in a month, then a -90% rug pull",
+      "type": "pump",
+      "placement": "append",
+      "at": "",
+      "seed": 103,
+      "chain": false,
+      "rise": 3.0,
+      "days": 30.0,
+      "drop": 0.9,
+      "collapse_days": 7.0,
+      "volatility": 1.5
+    },
+    {
+      "name": "Nightmare: whipsaw hell, +-35% at 3x volatility for 6 months",
+      "type": "sideways",
+      "placement": "append",
+      "at": "",
+      "seed": 104,
+      "chain": false,
+      "range": 0.35,
+      "days": 180.0,
+      "volatility": 3.0
+    },
+    {
+      "name": "Nightmare: death spiral, -95% over 2 years",
+      "type": "bear",
+      "placement": "append",
+      "at": "",
+      "seed": 105,
+      "chain": false,
+      "drop": 0.95,
+      "days": 730.0,
+      "volatility": 1.3
+    },
+    {
+      "name": "Nightmare: crash cascade, -35%",
+      "type": "crash",
+      "placement": "append",
+      "at": "",
+      "seed": 106,
+      "chain": false,
+      "drop": 0.35,
+      "days": 4.0,
+      "recovery_days": 25.0,
+      "recovery": 0.5,
+      "volatility": 1.3
+    },
+    {
+      "name": "-35% again",
+      "type": "crash",
+      "placement": "append",
+      "at": "",
+      "seed": 107,
+      "chain": true,
+      "drop": 0.35,
+      "days": 4.0,
+      "recovery_days": 25.0,
+      "recovery": 0.5,
+      "volatility": 1.3
+    },
+    {
+      "name": "-35% a third time",
+      "type": "crash",
+      "placement": "append",
+      "at": "",
+      "seed": 108,
+      "chain": true,
+      "drop": 0.35,
+      "days": 4.0,
+      "recovery_days": 25.0,
+      "recovery": 0.3,
+      "volatility": 1.3
+    }
+  ]
+}

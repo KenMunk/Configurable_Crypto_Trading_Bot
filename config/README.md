@@ -1,6 +1,24 @@
 # config/: model profiles
 
-This folder holds the **model profiles**: JSON files that each describe one complete trading strategy. The simulator lists every `*.json` file in this folder (not in subfolders) in its **Models** list.
+This folder holds the **model profiles**: JSON files that each describe one complete trading strategy. They are kept in **one folder per currency**, named after the product the models trade:
+
+```text
+config/
+├── DOGE-USD/             the DOGE-USD models
+│   ├── discard/          models a ranking set aside, with discard_log.csv
+│   └── best_model.json   the best DOGE-USD model the simulator has tested
+├── BTC-USD/ ...
+├── *.json                profiles from before currency folders (still read)
+└── .example/             public templates
+```
+
+The simulator lists the models in every currency folder, plus any profiles still at the top of this folder, in its **Models** list, with a **Currency** filter. The model search writes new models into its currency's folder. To move older profiles at the top of this folder (and in `config/discard/`) into their currency's folders, run:
+
+```bash
+python model_assessor.py --organize
+```
+
+A profile without a `product_id`, or whose name is already taken in its currency's folder, stays where it is and is listed.
 
 ## What's here
 
@@ -8,6 +26,10 @@ This folder holds the **model profiles**: JSON files that each describe one comp
 |---|---|---|
 | `*.json` | **Ignored** | Your private model profiles. Git never sees them. |
 | [.example/](.example/) | Tracked | Public template profiles to copy from. |
+| `<PRODUCT>/` | **Ignored** | One folder per currency, such as `DOGE-USD/`, holding its models. |
+| `<PRODUCT>/discard/` | **Ignored** | Models the [ranking](../search_config/README.md#ranking-and-the-discard-folder) set aside, with `discard_log.csv` recording why. The simulator doesn't list them. Bring one back with `python model_assessor.py --restore <name>`. |
+| `<PRODUCT>/best_model.json` | **Ignored** | The currency's best model, recorded by the simulator after a full-history run, and starred and pre-selected in its Models list. |
+| `.models.lock` | **Ignored** | Exists only while a search or the assessor is naming, writing or moving models. |
 | `.gitkeep` | Tracked | Keeps this folder in the repository while it holds no tracked profiles. |
 | `README.md` | Tracked | This file. |
 

@@ -86,13 +86,24 @@ From top to bottom:
 
 ### Models
 
-The list shows every `.json` file in `config/`, named after the file (`btc_macro_horizon.json` appears as `btc_macro_horizon`).
+Models are kept in one folder per currency, such as `config/DOGE-USD/` (see [config/README.md](../config/README.md)). The list shows every model in them, and any older profiles still at the top of `config/`, each named after its file with its currency beside it: `doge_b_130   (DOGE-USD)`.
 
-- Click to select one model. Ctrl-click or Shift-click to select several, or use **Select all**. Every selected model is tested in the same run.
-- When the window opens, `btc_macro_horizon` is selected if it exists; otherwise the first model is.
+- **Currency**, above the list, shows one currency's models or all of them. Models you selected stay selected while the filter hides them.
+- Models a ranking moved to a currency's `discard/` folder aren't listed. Tick **Include discarded models** to list them too, after the others and marked `discarded`; you can then select and test them like any other.
+- Click to select one model. Ctrl-click or Shift-click to select several, or use **Select all**, which selects every model the list shows. Every selected model is tested in the same run.
+- A **★** marks each currency's best model: the one with the highest full-history return the simulator has tested for that currency (see below).
+- When the window opens, each currency's ★ model is selected. Before any has been recorded, `btc_macro_horizon` is selected if it exists; otherwise the first model is.
 - **Add file...** adds profiles from anywhere on disk to the list and selects them, along with the models already selected.
 - **Refresh** picks up files added to or removed from `config/`, and keeps your selection. Files added with **Add file...** stay in the list while they still exist.
 - If two files share a name, the second appears as `name (2)`.
+
+**Each currency's historically best models.** A **\u25b2** marks each currency's top models by full-history growth in the performance log (5 by default; set in **Test options...**). A row logged for an earlier version of a profile doesn't count. **Select top models** selects them, or only the chosen currency's when the Currency filter is set, so testing can focus on the strongest candidates.
+
+**Each currency's best model.** When a run finishes, the simulator finds the best model of each currency it tested, by return, and:
+
+- **records it** in that currency's folder as `best_model.json`, when the run tested the full history (no start date) and the model beats the return already recorded. A run of a single weaker model never replaces a better record, and a record whose model has been deleted or discarded no longer counts.
+- **selects it** in the Models list, in place of your selection, so the next run starts from the best of each currency. Untick **After a run, select the best model of each currency tested** to keep your own selection.
+- **shows it**: with several currencies, the charts show each currency's best; with one, its best few, as before. The status line lists each currency's best, such as `best per currency: BTC-USD btc_15m_02 +7148%, DOGE-USD doge_b_130 +2270%`.
 
 ### Start testing from
 
@@ -172,9 +183,66 @@ When you click **Run Simulation**, the simulator works through these steps:
 
 There is no cancel button. Closing the window stops a run. A download interrupted that way is not saved, and the next run fetches that range again.
 
+### Synthetic scenarios
+
+History is one path the market happened to take. Synthetic scenarios test how models cope with others: a crash, a long bear market, a pump and collapse, a calm rally, sideways chop, a volatility shock, or many random paths stitched from real history.
+
+**Test options...**, above the buttons, opens the options window; the line beside it shows the current choice.
+
+- **Data to test on**: **Historic data only** (as before), **Historic data plus synthetic scenarios**, or **Synthetic scenarios only**.
+- **Focus**: how many of each currency's historically best models to mark \u25b2 (see [Models](#models)).
+- **Stress test**: see [Stress tests](#stress-tests) below.
+- **Synthetic scenarios**: the scenario set to use, from `scenarios/`, listed as **modules**. Select one to edit it on the right (fields the type doesn't use are greyed out) and click **Apply changes to the scenario**.
+  - **Chains.** A module with **Continues the scenario above (chained)** ticked joins the run of the module above it: the run's modules play one after another as one continuous path, each starting where the one before ended, such as a crash, then three months of chop, then a calm rally. The **Run** column shows each module's run and step (`Run 3 · step 2 of 3`), and chained modules are shown in blue. **Chain to above** and **Unchain** do the same from the buttons. A run's placement (after history, or at a date) is its first module's.
+  - **Drag a row** to move it; **Move up/down** do the same. **Duplicate** copies the selected module right after it (a chained copy joins the same run), and **Add new** and **Remove** edit the list.
+  - **Save set** and **Save set as...** write the set. **Preview the selected module's run** draws the whole run on the chosen market's history (for runs with several paths, up to 10 of them), with a red line where it starts.
+
+  Every scenario type and setting is described in [scenarios/README.md](../scenarios/README.md). Synthetic paths look like real markets: crashes fall fast and slow down, pumps accelerate into the top, recoveries ease in, and every candle moves as much as the market's own do, with fat tails and calm and violent stretches, while each phase still ends where it says.
+- **Save** keeps the options (in `data/simulator_options.json`) for the next session.
+
+With synthetic data, each selected model also runs on every path of every scenario, built from its market's history at its candle size. These runs:
+
+- are named `<model> | <scenario>` (with ` #n` for each path of a multi-path scenario) and appear in the Comparison table, whose **Data** column names the scenario (`Historic` for real history). Filter it to compare one scenario;
+- are measured from the scenario's first candle, with indicators warmed up on real history, so Return is the model's result through the scenario and Buy & hold is the market's;
+- are never recorded in the performance log or as a currency's best model: only historic results are.
+
+The **Scenarios** tab shows one row per model and one column per data source: the historic return, then each scenario's return (for several paths, the median with the worst path), the model's **Worst scenario**, and in how many scenario runs it **Beat buy & hold**. Rows are sorted by the worst scenario, so the most robust models come first. Synthetic runs go one after another, after any parallel historic run; resampled scenarios with many paths multiply the work.
+
+A scenario only tests what it describes. The calm-trend DOGE models, for example, stay in cash through the default crash, bear, pump and volatility scenarios (0% while the market falls up to 70%), and only trade in a calm rally: that shows both their protection and what they need to make money.
+
+### Stress tests
+
+A stress test pushes the selected models through a fixed set of scenario combinations, to find their limits. Choose **Stress test** in **Test options...**, select the models to test (for example with **Select top models**), and click **Run Simulation**. Each model is run on its real history alone, as its **baseline**, then on every combination of the **stress test plan**, twice: **alone**, measured from the scenario's first candle, and **with history**, over the whole real history with the scenario appended, which shows whether a scenario wipes out the model's historic gains. Resampled scenarios contribute up to the number of paths set in the Stress test line.
+
+**The stress test plan** is the list of combinations, kept in `scenarios/stress_plan.json` and edited on the **Stress test plan** tab of Test options. The first time, it is the built-in baseline: every built-in scenario run and nightmare on its own, plus 20 fixed pairs (one straight after the other), 33 combinations in all. Every stress test runs the same plan until you change it, so results are comparable from run to run. On the tab:
+
+- **Add combination...** picks runs, in the order they should play, from the current scenario set and the nightmares; each continues from the one before.
+- **Duplicate**, **Remove**, **Rename...** and dragging rows edit the list; the Nightmare column marks combinations with a nightmare in them.
+- **Save** (at the bottom of the window) keeps your plan for every future run. **Reset to default** brings back the built-in baseline.
+
+Each combination keeps its own copy of its scenario modules, so editing or deleting a scenario set later doesn't change the plan: the baseline stays the baseline.
+
+The nightmares live in `scenarios/nightmares.json`, a scenario set you can open and edit like any other. It starts with five:
+
+| Nightmare | What happens |
+|---|---|
+| Exchange collapse | -80% in two days, almost no bounce, then a further -40% bleed over six months |
+| Euphoria then rug pull | +300% in a month, then -90% in a week |
+| Whipsaw hell | Swings of about 35% either way at three times the market's volatility for six months |
+| Death spiral | -95% over two years, with relief rallies |
+| Crash cascade | Three -35% crashes, each after a partial recovery |
+
+When the test finishes, the simulator writes a report folder, `data/stress_reports/<time>/`, and opens its summary in your browser:
+
+- **index.html** ranks the tested models by their worst result, most robust first, with each one's historic baseline, runs, how many lost money, how many beat buy and hold, its median and worst return, worst drawdown, nightmares lost, and a verdict.
+- **<model>.html**, one per model: the verdict (for example *Robust: it never lost more than 18%; beat buy and hold in 46 of 54 runs; in nightmares it lost money in 1 of 24*), headline numbers, the equity curves of its four worst runs against the market, and for each measurement (alone, with history) a chart of the model against buy and hold in every combination and a table with return, buy and hold, the difference, drawdown, trades, win rate, fees, taxes, and whether it lost money or beat buy and hold. Nightmare rows are marked ⚠.
+- **results.csv**: every run's numbers, for a spreadsheet.
+
+Verdicts: **Fragile** when the worst run lost half or more; **Weak** when more than half of the runs lost money; **Robust** when no run lost more than 20%; **Mixed** otherwise. The results also fill the Comparison and Scenarios tabs. Like other synthetic results, nothing from a stress test is logged or recorded as a currency's best model, its baseline included.
+
 ### Running models in parallel
 
-In parallel mode with **Workers** at `auto` or above 1, or from the command line, models are backtested at the same time on separate worker processes. Each run gives every shared file a single writer, so runs never collide:
+In parallel mode with **Workers** at `auto` or above 1, or from the command line, models are backtested at the same time on separate worker processes. CUDA is selected automatically when a usable GPU is available; one GPU-backed worker slot per visible CUDA device is added to the CPU worker capacity. Each run gives every shared file a single writer, so runs never collide:
 
 | Role | How many | Reads | Writes |
 |---|---|---|---|
@@ -193,10 +261,13 @@ python parallel_backtest.py config/btc_15m_*.json                # auto: one wor
 python parallel_backtest.py config/btc_15m_*.json --workers 4
 python parallel_backtest.py config/*.json --start 2021-01-01 --fresh-signal
 python parallel_backtest.py config/*.json --offline --no-log     # cached candles, fallback fees, no log
+python parallel_backtest.py config/ETH-USD/eth_*.json --compute-device cuda --workers 4
 python parallel_backtest.py --gather                             # merge shards a failed merge left behind
 ```
 
-`--workers` takes `auto` (the default) or a number, lowered to one per CPU but two. The CPU count is the logical cores Python may use (`os.process_cpu_count()`), so on a processor with hyper-threading it is twice the physical cores. A run never starts more workers than it has models. It prints a table of each model's return, buy and hold, maximum drawdown and trade count. Without `--offline`, it needs the same `.env` key as the window.
+`--workers` takes `auto` (the default) or a number, lowered to one per CPU but two; CUDA adds one worker slot per visible device. The CPU count is the logical cores Python may use (`os.process_cpu_count()`), so on a processor with hyper-threading it is twice the physical cores. A run never starts more workers than it has models. It prints a table of each model's return, buy and hold, maximum drawdown and trade count. Without `--offline`, it needs the same `.env` key as the window.
+
+CUDA is optional. Install `requirements-gpu.txt`; parallel simulations/backtests and model search use CUDA automatically when the optional dependencies and a visible GPU are available. `--compute-device cpu` forces CPU-only execution, while `--compute-device cuda` requires CUDA and reports an error if it is unavailable. CUDA adds one worker slot per visible device alongside the CPU worker capacity. Supported SMA, EMA, WMA, DEMA, TEMA and HMA indicators run on the GPU; calculations return to the CPU before rule evaluation and the stateful trading simulation, so fills, stops, fees and monthly tax-reserve handling remain CPU-based. Other indicators also continue to use the CPU. GPU worker processes still run the stateful simulation on CPU, and data transfers can outweigh indicator offload; GPU slots may not improve throughput when CPU simulation is the bottleneck, so benchmark representative profiles and candle ranges.
 
 **Several runs at once.** The database is kept in WAL mode, so a reader never waits for a writer, and every connection waits up to 60 seconds for another's write to finish. You can therefore run the window, a command-line run and `model_search.py` at the same time; their downloads queue up rather than fail. The performance log is protected by a lock file; see [Model performance log](#model-performance-log).
 
@@ -265,7 +336,17 @@ All times are in UTC.
 
 ### Comparison
 
-The Comparison tab has one row per model, sorted by return with the best first. A line above the table gives the number of models and the best one, and, with a start date, when the test started. Click a column heading to sort by it, and click again to reverse. Number columns sort largest first, and text columns A to Z.
+The Comparison tab has one row per model, sorted by return with the best first. A line above the table gives the number of models and the best one, and, with a start date, when the test started. Click a column heading to sort by it, and click again to reverse. Number columns sort largest first, and text columns A to Z. The table scrolls sideways and up and down.
+
+**Filters.** Under each column heading is a filter box. Rows must pass every filter you fill in, and the line above the table counts them, such as `Showing 12 of 300 models`; **Clear filters** empties every box. Sorting keeps the filters.
+
+| Column | Type | Example |
+|---|---|---|
+| Numbers (Start, End, Trades, Fees, Taxes, Flash buys, Blocked signals) | a comparison: `>`, `>=`, `<`, `<=`, `=` or `!=`, a range `low..high` (inclusive, either end optional), or several separated by spaces, all of which must hold | `>=12`, `10..20`, `>5 <50` |
+| Percentages (Return, Buy & hold, vs Buy & hold, Max drawdown, Worst in window, Win rate) | the same, in percent as shown | `>100` for more than +100%, `<40` for a drawdown under 40% |
+| Text and dates (Model, Product, Candles, First buy, B&H start) | any part of the text, ignoring case | `doge_b`, `SIX_HOUR`, `2024` |
+
+A number filter that isn't a number, such as `>abc`, matches nothing.
 
 To chart some of the models, select their rows (Ctrl-click or Shift-click for several) and click **Chart selected models** above the table, or press **Enter**. The charts then show only those models (see [Showing model](#showing-model)), with the selected row highest in the table on show. With several models selected, the **Model value** tab opens; with one, the **Chart** tab. Rows not in the charts' view are shown in gray. Double-click a model to open its chart; a gray model is added to the view.
 
@@ -282,7 +363,7 @@ To chart some of the models, select their rows (Ctrl-click or Shift-click for se
 | Worst in window | The largest fall from the highest value within the trailing window (`safeguards.drawdown_window`, or 180 days when it is not set), shown with the window, such as `12.34% / 180d`. |
 | Flash buys | The number of flash-crash limit buys that filled and were sold when their crash recovered. Buys still held at the end are not counted. |
 | Trades, Win rate | Completed trades, flash-crash buys included, and the share of them with a positive profit after fees. |
-| Fees, Taxes | Total commissions paid, and total tax paid at year boundaries. |
+| Fees, Taxes | Total commissions paid and tax withheld, including any reserve awaiting the next monthly payment. |
 | Blocked signals | Entry signals the [friction screen](model_configuration.md#5-the-friction-screen-worked-through) rejected. |
 
 ### Chart
@@ -291,7 +372,7 @@ The Chart tab draws the chosen model on a log price scale:
 
 - the close price, with every price-scale indicator (moving averages, VWAP, band and channel lines)
 - a separate panel under the price for each oscillator (RSI, MACD, ADX and so on), with its conventional reference levels
-- ▲ buy and ▼ sell markers at the fill prices
+- a thin green line through the chart at each buy and a red one at each sell, with a ▲ (buy) or ▼ (sell) in a strip kept clear along the bottom edge, so the marks never cover the price or indicator lines (with a price floor set, the strip isn't reserved)
 - gray shading where trading was paused by the drawdown limit
 
 The subtitle gives the model's trade count and return. Hover anywhere to see a crosshair and a tooltip listing the close and every indicator's value at that candle; an indicator still in its warm-up shows `warming up`. Use the toolbar to zoom, pan, go back, or save the chart as an image. All panels share one time axis, so zooming one zooms them all.
@@ -310,7 +391,7 @@ For how indicators are drawn and how to hide some, see [Charts and tooltips](ind
 
 ### Model value
 
-The Model value tab draws the value over time of every model in view on one chart: after a run, every model, or the 8 best by return when there are more (see [Showing model](#showing-model)).
+The Model value tab draws the value over time of every model in view on one chart: after a run, every model, or the 8 best by return when there are more (see [Showing model](#showing-model)). A second panel below it tracks each model's tax reserve, which builds as profitable trades close and returns to zero at each monthly payment.
 
 **Models on the chart**, the list on the left, picks which models it draws. It lists every model of the run, best return first, with its return:
 
@@ -325,7 +406,7 @@ The chart has these reference lines:
 - a horizontal line at the starting capital, one for each different starting capital
 - a gray **buy and hold** line for each product and starting capital. It stays at the starting capital until the model could first buy, then follows the price from that candle's close. An open circle marks where it starts, and the legend gives the date. With several models, it uses the start of the model chosen in **Showing model** (or, for another product or starting capital, of the first model with that product and starting capital), and the legend names that model.
 
-With one model, the chart labels the start and end values, the subtitle gives the model's return and the buy-and-hold return with its start date, and gray shading marks drawdown pauses. With several models, the legend shows each model's ending value and return, the subtitle names the best model, and the model chosen in **Showing model** is drawn slightly heavier. Hover to read every model's value and buy-and-hold value at one moment, each with its return.
+With one model, the chart labels the start and end values, the subtitle gives the model's return and the buy-and-hold return with its start date, and gray shading marks drawdown pauses. With several models, the legend shows each model's ending value and return, the subtitle names the best model, and the model chosen in **Showing model** is drawn slightly heavier. Hover to read every model's value, tax reserve and buy-and-hold value at one moment, each with its return where applicable.
 
 **Lowest value shown** works like the Chart tab's floor, in value units. For example, set it to the starting capital to hide the part of the chart below it. Each tab keeps its own floor.
 
@@ -334,7 +415,7 @@ With one model, the chart labels the start and end values, the subtitle gives th
 The Trades tab lists every completed trade of the chosen model, flash-crash buys included, with a summary above the table:
 
 - wins and losses
-- net P&L
+- net P&L after fees and per-trade tax reserve
 - average, best and worst return
 - a count of each exit reason
 
@@ -347,7 +428,8 @@ Click a column heading to sort by it, and click again to reverse. Double-click a
 | Held | How long the position was open, such as `3d 4h` or `2h 15m`. |
 | Position | The cash committed to the trade, including the entry fee. |
 | Fees | The fees for both ends of the trade. |
-| P&L, Return | The profit after fees and before tax, in currency and as a fraction of Position. |
+| Net P&L, Return | The profit after fees and per-trade tax reserve, in currency and as a fraction of Position. |
+| Tax reserved | The amount set aside from this trade's positive net gain. |
 | Outcome | `Win` if the P&L is positive, otherwise `Loss`. |
 | Value after | The model's total value after the exit. |
 | Exit reason | Why the trade closed (see [Exit reasons](#exit-reasons)). |
@@ -361,7 +443,7 @@ The Metrics tab holds the full text report for the chosen model, headed by its n
 - the maximum drawdown, the worst drawdown within the window, trades and win rate, fees paid with the rate per fill, and whether a position is open at the end
 - the indicators and rules
 - the **friction model** actually used: fee rates and their source, slippage, the liquidity buffer, tax, the friction-screen verdict and **Entry signals blocked by the screen**
-- the tax paid each year, with any loss carried forward, and the estimated tax for the unfinished final year
+- the tax paid each month and the reserve still held for the unfinished final month
 - flash-crash events, each with its low and how long it took to recover, and the last 10 flash-crash fills
 - drawdown pauses, with when each resumed
 - the last 10 trades
@@ -391,7 +473,7 @@ Rows are keyed by the model's name, which is its file name, and sorted by it. Th
 | `buy_and_hold_multiple`, `buy_and_hold_return_pct` | The benchmark's result from `buy_and_hold_start`. |
 | `vs_buy_and_hold_pct` | How much bigger (+) or smaller (−) the model's ending value is than buy and hold's, in percent. |
 | `max_drawdown_pct`, `worst_in_window_pct`, `drawdown_window` | The drawdowns, as in the Comparison tab. |
-| `trades`, `win_rate_pct`, `fees`, `taxes`, `blocked_signals`, `flash_buys` | Trading activity and costs. |
+| `trades`, `win_rate_pct`, `fees`, `taxes`, `blocked_signals`, `flash_buys` | Trading activity and costs; `taxes` includes both paid tax and any reserve still held for the next monthly payment. |
 | `first_recorded_utc`, `last_changed_utc` | When the model's row was first written, and when its results last changed, such as `2026-10-14 09:30:00 UTC`. These two are not compared when deciding whether a run changed anything. |
 
 Numbers are plain values without thousands separators or % signs, so they sort and chart correctly. If the file is open in Excel, Windows locks it: the run still completes and shows its results, but the status line says the file was not updated. Close it and run again to record the results.
@@ -415,7 +497,7 @@ The backtest (`backtest.py`) is a long-only, spot simulation. It holds at most o
 ### Order of events in each candle
 
 1. **New UTC day:** the `max_orders_per_day` count resets.
-2. **New calendar year:** tax on the finished year is settled (see [Taxes](#taxes)).
+2. **New calendar month:** pay the prior month's segregated tax reserve (see [Taxes](#taxes)).
 3. **Flash crashes**, if `flash_crash_buy` is set: any resting limit buy the candle traded down to fills, each level once per crash. What those buys hold is sold at the close of the candle in which the crash recovers.
 4. **Exits**, if a position is open, checked in priority order:
    1. **Stops.** These are the hard stop, the trailing stop and the drawdown stop. If the candle's low reaches any of them, the highest one triggered fills.
@@ -467,7 +549,7 @@ The backtest (`backtest.py`) is a long-only, spot simulation. It holds at most o
 
 ### Taxes
 
-Each calendar year's realized gains and losses are netted. When the first candle of the next year arrives, `tax_buffer_rate` is paid on a net gain, from cash, and a net loss is carried forward. Tax payments count as withdrawals, not trading losses, in all drawdown figures. Tax on the unfinished final year is reported as an estimate and is not deducted from the ending value.
+Each completed trade with a positive net gain reserves `tax_buffer_rate` of that gain from trading cash. Losses do not offset tax reserved on other trades. The segregated reserve is paid at the first candle of the next UTC month, and the Tax reserve panel under Model value drops to zero at that point. Trading equity is reduced when tax is withheld, not again when the reserve is paid, and no holdings are sold to make the payment. An unfinished month's reserve remains withheld at the end of the test.
 
 ### Drawdown limit
 
@@ -527,8 +609,8 @@ Backtests flatter strategies. Keep these limits in mind:
 
 - **Fills are idealized.** Orders fill at candle prices, plus your slippage setting, whatever their size.
 - **Today's fee tier is applied to the whole history.**
-- **Taxes are one flat rate** on calendar-year net gains. Short-term and long-term rates are not distinguished.
-- **An open position at the end is valued at the last close**, without selling costs, and so are flash-crash buys still held. The final year's estimated tax is not deducted.
+- **Taxes use one flat rate** on each profitable trade's net realized gain after fees. Losses do not offset another trade's reserve; short-term and long-term rates are not distinguished.
+- **An open position at the end is valued at the last close**, without selling costs, and so are flash-crash buys still held. Tax already reserved from profitable trades is excluded from ending equity, including any reserve for the unfinished final month.
 - **Idle cash earns nothing.**
 - **Flash-crash profits are an upper bound.** Candles can't show whether a resting order would really have filled.
 - **Gaps in the data shift periods.** Periods count candles, and candle data has gaps where nothing traded, so a period can span more time than its nominal length on a quiet product.
@@ -612,13 +694,13 @@ The main keys of the result dictionary are:
 - `ready_to_trade`, the first candle on which every entry rule could be evaluated (`None` if never)
 - `buy_and_hold_return`, measured from `buy_and_hold_start` (`ready_to_trade`, or the first buy if that came sooner), and `buy_and_hold_from_test_start`
 - `max_drawdown`, `max_window_drawdown` and `drawdown_window`
-- `trade_count`, `win_rate`, `fees_paid`, `commission_rate`, `taxes_paid` and `screened_signals`
-- `tax_payments`, one per settled year, and `estimated_tax_due` for the unfinished final year
-- `trades`, a list of dictionaries with entry and exit times, prices, P&L, fees and reasons
+- `trade_count`, `win_rate`, `fees_paid`, `commission_rate`, `taxes_paid`, `taxes_reserved` and `screened_signals`
+- `tax_payments`, one per month boundary, and `estimated_tax_due` for the unfinished final month's reserve
+- `trades`, a list of dictionaries with entry and exit times, prices, pre-tax `pnl`, `tax_withheld`, after-tax `net_pnl`, fees and reasons
 - `flash_crash_buys` (the sold flash-crash buys), `flash_crash_events` and `open_flash_lots`
 - `open_position` and `drawdown_pauses`
 - `friction`, which describes the rates used
-- `series`, the time, close, equity and indicator arrays behind the charts
+- `series`, the time, close, equity, tax-reserve and indicator arrays behind the charts
 
 All times are Unix timestamps in seconds, UTC.
 

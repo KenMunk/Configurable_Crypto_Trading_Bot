@@ -131,7 +131,7 @@ def test_comparison_rows_format_headline_results():
               "starting_capital": 10_000.0, "ending_equity": 921_352.4, "total_return": 91.135,
               "buy_and_hold_return": 136.5, "max_drawdown": 0.6, "trade_count": 14, "win_rate": 0.5,
               "max_window_drawdown": 0.1, "drawdown_window": "180d", "flash_crash_buys": [{}, {}],
-              "fees_paid": 166_879.0, "taxes_paid": 520_494.0, "screened_signals": 0}
+              "fees_paid": 166_879.0, "taxes_paid": 520_494.0, "taxes_reserved": 500.0, "screened_signals": 0}
 
     row = comparison_rows([result])[0]
 
@@ -141,6 +141,7 @@ def test_comparison_rows_format_headline_results():
     assert row["sort"]["versus"] == pytest.approx(92.135 / 137.5 - 1)
     assert row["sort"]["first_buy"] == float("inf")
     assert row["display"]["end"] == "921,352.40"
+    assert row["display"]["taxes"] == "520,994.00"
     assert row["display"]["return"] == "+9113.50%"
     assert row["display"]["max_drawdown"] == "60.0%"
     assert row["display"]["window_drawdown"] == "10.00% / 180d"

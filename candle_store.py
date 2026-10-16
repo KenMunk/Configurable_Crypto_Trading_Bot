@@ -65,6 +65,25 @@ CREATE TABLE IF NOT EXISTS metric_columns (
 """
 
 
+def use_wal(connection, timeout=BUSY_TIMEOUT_SECONDS):
+    """Put the connection's database in WAL mode (it persists in the file), waiting out other connections.
+
+    Switching a database to WAL needs it to itself for a moment, and SQLite reports "database
+    is locked" at once rather than waiting when another connection holds it, as happens when
+    several processes open a new database together. So the switch is retried.
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            if connection.execute("PRAGMA journal_mode").fetchone()[0].lower() != "wal":
+                connection.execute("PRAGMA journal_mode = WAL")
+            return
+        except sqlite3.OperationalError as exc:
+            if "locked" not in str(exc) or time.monotonic() > deadline:
+                raise
+            time.sleep(0.05)
+
+
 def _quote(identifier):
     return '"' + identifier.replace('"', '""') + '"'
 
@@ -110,7 +129,7 @@ class CandleStore:
                 connection.execute("PRAGMA query_only = ON")
             else:
                 # WAL persists in the file: readers see the last commit while a write is under way.
-                connection.execute("PRAGMA journal_mode = WAL")
+                use_wal(connection)
                 connection.executescript(SCHEMA)
             with connection:
                 yield connection
@@ -145,6 +164,18 @@ class CandleStore:
         candles = [{"start": r[0], "open": r[1], "high": r[2], "low": r[3], "close": r[4], "volume": r[5]}
                    for r in rows]
         return candles, fetched[0], fetched[1]
+
+    def fetched_range(self, product_id, granularity):
+        """[fetched_start, fetched_end) downloaded for the market, without reading its candles; None if none."""
+        if not self.path.exists():
+            return None
+        with self._connect() as connection:
+            if not connection.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'candle_tables'").fetchone():
+                return None
+            row = connection.execute("SELECT fetched_start, fetched_end FROM candle_tables WHERE table_name = ?",
+                                     (self.table_name(product_id, granularity),)).fetchone()
+        return None if row is None else (row[0], row[1])
 
     def save(self, product_id, granularity, candles, fetched_start, fetched_end):
         """Add candles to the market's table and record the time range now downloaded.

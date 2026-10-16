@@ -6,7 +6,7 @@ import parallel_backtest
 from backtest import load_cached_candles, run_backtest
 from candle_store import CandleStore
 from friction import FrictionModel
-from parallel_backtest import run_parallel
+from parallel_backtest import effective_worker_count, resolve_compute_device, run_parallel
 from tests.test_backtest import FakeCandleClient, _profile
 from tests.test_indicators import FIFTEEN_MINUTES, _candles
 
@@ -53,6 +53,7 @@ def test_parallel_results_match_one_after_another_and_every_model_is_logged(cach
         assert result["ending_equity"] == pytest.approx(expected["ending_equity"])
         assert result["trade_count"] == expected["trade_count"]
         assert result["series"]["equity"] == pytest.approx(expected["series"]["equity"])
+        assert result["series"]["tax_reserve"] == pytest.approx(expected["series"]["tax_reserve"])
     assert sorted(_log(log)) == ["btc_cci", "btc_ema", "eth_cci", "eth_ema"]
     assert run["logged"] == "model_performance.csv: 4 added"
     assert not any((cached_markets / "performance_shards").iterdir())  # every shard merged and removed
@@ -94,9 +95,46 @@ def test_a_run_never_uses_more_workers_than_every_cpu_but_two(cached_markets, mo
     phases = []
 
     run_parallel(None, _models(), workers=16, cache_dir=cached_markets, performance_path=None,
-                 progress=lambda phase, fraction, message: phases.append(message))
+                 progress=lambda phase, fraction, message: phases.append(message), compute_device="cpu")
 
     assert "0 of 4 models done on 2 workers" in phases
+
+
+def test_gpu_slots_add_to_cpu_worker_capacity(monkeypatch):
+    monkeypatch.setattr(parallel_backtest, "cpu_count", lambda: 6)
+
+    assert effective_worker_count(10, workers=4, gpu_slots=2) == 6
+    assert effective_worker_count(5, workers=4, gpu_slots=2) == 5
+    assert effective_worker_count(10, workers=4, gpu_slots=0) == 4
+
+
+def test_automatic_device_uses_gpus_when_available_and_otherwise_uses_cpu(monkeypatch):
+    import gpu_indicators
+
+    monkeypatch.setattr(gpu_indicators, "available_devices", lambda: [0, 1])
+    assert resolve_compute_device("auto") == ("cuda", [0, 1])
+    monkeypatch.setattr(gpu_indicators, "available_devices", lambda: [])
+    assert resolve_compute_device("auto") == ("cpu", [])
+
+
+def test_cuda_backtests_add_one_worker_slot_per_visible_gpu(cached_markets, monkeypatch):
+    import gpu_indicators
+
+    devices = gpu_indicators.available_devices()
+    if not devices:
+        pytest.skip("CUDA devices are unavailable")
+    phases = []
+    run = run_parallel(None, _models(), workers=2, cache_dir=cached_markets, performance_path=None,
+                       progress=lambda phase, fraction, message: phases.append(message),
+                       compute_device="cuda")
+
+    assert run["errors"] == {}
+    expected_gpu_slots = min(len(devices), 2)
+    assert any(message.startswith(
+        f"0 of 4 models done on {2 + expected_gpu_slots} workers "
+        f"(2 CPU-capacity + {expected_gpu_slots} GPU-added)")
+               for message in phases)
+    assert all(result["compute_device"] == "cuda" for result in run["results"])
 
 
 def test_light_results_leave_out_the_charted_series(cached_markets):

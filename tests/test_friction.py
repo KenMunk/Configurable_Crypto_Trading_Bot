@@ -1,3 +1,4 @@
+from datetime import datetime, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -87,35 +88,50 @@ def test_fetch_friction_inputs_records_failures_instead_of_raising(monkeypatch):
     assert "offline" in inputs["network_fee_error"]
 
 
-def _yearly_candles():
-    """A profitable trade in the first year and a losing one in the next."""
-    year = 365 * 86_400
-    prices = [100] * 6 + [101, 102, 103, 104, 105, 110] + [100, 95, 90, 85]
-    candles = [_candle(i * 900, p) for i, p in enumerate(prices)]
-    later = [100] * 6 + [101, 102, 103] + [90, 85, 80, 75]
-    candles += [_candle(year + 2 * 86_400 + i * 900, p) for i, p in enumerate(later)]
-    candles.append(_candle(2 * year + 3 * 86_400, 75))
+def _monthly_candles():
+    """A winning trade, a losing trade and an open position spanning a month boundary."""
+    start = int(datetime(2021, 1, 15, tzinfo=timezone.utc).timestamp())
+    prices = [100, 110, 200, 120, 1, 120]
+    candles = [_candle(start + i * 900, price) for i, price in enumerate(prices)]
+    month_start = int(datetime(2021, 2, 1, tzinfo=timezone.utc).timestamp())
+    candles.append(_candle(month_start, 120))
     return candles
 
 
-def test_taxes_are_settled_yearly_on_net_gains_with_losses_carried_forward():
-    profile = _profile(friction_model={"exchange_commission_rate": 0.0, "slippage_buffer": 0.0,
-                                       "tax_buffer_rate": 0.3})
+def test_per_trade_tax_reserves_are_paid_monthly_and_losses_do_not_offset_them():
+    profile = _profile(
+        friction_model={"exchange_commission_rate": 0.0, "slippage_buffer": 0.0, "tax_buffer_rate": 0.3},
+        strategy={"direction": "LONG_ONLY",
+                  "entry_signal": {"all": ["close > 105", "close < 150"]},
+                  "exit_signal": {"any": ["close > 190", "close < 110"]}},
+    )
     profile["capital_allocation"]["target_position_fraction"] = 0.5
-    profile["strategy"]["exit_signal"]["profit_lock_target"] = 0.05
-    profile["execution"] = {"max_orders_per_day": 2}  # no re-entry after the first year's win
 
-    result = run_backtest(_yearly_candles(), profile)
+    result = run_backtest(_monthly_candles(), profile)
 
-    first, second = result["tax_payments"][:2]
-    assert first["net_realized_gain"] > 0
-    assert first["tax"] == pytest.approx(first["net_realized_gain"] * 0.3)
-    assert second["net_realized_gain"] < 0
-    assert second["tax"] == 0
-    assert second["loss_carryforward"] == pytest.approx(-second["net_realized_gain"])
-    assert result["taxes_paid"] == pytest.approx(first["tax"])
-    realized = sum(trade["pnl"] for trade in result["trades"])
-    assert result["ending_equity"] == pytest.approx(10_000 + realized - first["tax"])
+    winning_trade, losing_trade = result["trades"]
+    jan_payment = next(payment for payment in result["tax_payments"]
+                       if payment["year"] == 2021 and payment["month"] == 1)
+    tax_due = winning_trade["pnl"] * 0.3
+    assert winning_trade["pnl"] > 0
+    assert winning_trade["tax_withheld"] == pytest.approx(tax_due)
+    assert winning_trade["net_pnl"] == pytest.approx(winning_trade["pnl"] - tax_due)
+    assert losing_trade["pnl"] < 0 and losing_trade["tax_withheld"] == 0
+    assert result["series"]["tax_reserve"][2] == pytest.approx(tax_due)
+    assert result["series"]["tax_reserve"][4] == pytest.approx(tax_due)
+    assert result["series"]["tax_reserve"][-1] == 0
+    assert jan_payment["tax"] == pytest.approx(tax_due)
+    assert jan_payment["taxable_gain"] == pytest.approx(winning_trade["pnl"])
+    assert result["taxes_paid"] == pytest.approx(tax_due)
+    assert result["taxes_reserved"] == 0
+    assert result["open_position"]  # monthly payment does not sell holdings
+    assert all(trade["exit_reason"] != "TAX_SALE" for trade in result["trades"])
+    assert result["series"]["equity"][-1] == pytest.approx(result["series"]["equity"][-2])
+
+    from simulator import format_friction
+    report = "\n".join(format_friction(result))
+    assert "2021-01" in report and "tax paid" in report
+    assert "Tax held for the next monthly payment: 0.00" in report
 
 
 def test_backtest_skips_signals_that_fail_the_friction_screen():

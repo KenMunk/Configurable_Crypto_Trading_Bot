@@ -131,3 +131,195 @@ def test_features_bucket_settings_into_the_configured_options():
 
 if __name__ == "__main__":
     pytest.main([__file__])
+
+
+# --- variety, naming and settings for parallel searches ------------------------------
+
+from model_search import (outperforming_buy_and_hold, select_diverse, signature, similarity, unique_by_behaviour,
+                          with_optional_settings, worker_count, write_models)  # noqa: E402
+
+
+def _scored(key, entry, exits, gran="ONE_DAY", ret=1.0, buy_and_hold=0.0, trades=5, fitness=0.0):
+    summary = {"return": ret, "buy_and_hold": buy_and_hold, "max_drawdown": 0.3, "trades": trades}
+    return {"key": key, "fitness": fitness, "train": summary, "holdout": summary, "profile": {"key": key},
+            "genome": {"gran": gran, "entry": entry, "exit": exits, "confirm": []}}
+
+
+def test_models_that_trade_identically_count_once():
+    best = _scored("a", ["x"], ["y"], fitness=2)
+    same_trades = _scored("b", ["x", "z"], ["y"], fitness=1)  # a redundant extra condition
+    different = _scored("c", ["x"], ["y"], ret=2.0)
+
+    assert signature(best) == signature(same_trades) != signature(different)
+    assert [m["key"] for m in unique_by_behaviour([best, same_trades, different])] == ["a", "c"]
+
+
+def test_similarity_is_the_share_of_conditions_in_common():
+    a = {"gran": "ONE_DAY", "entry": ["p", "q"], "exit": ["r"]}
+    assert similarity(a, {"gran": "ONE_DAY", "entry": ["p"], "exit": ["r", "s"]}) == 0.5
+    assert similarity(a, {**a, "gran": "SIX_HOUR"}) == 0.0
+    assert similarity(a, a) == 1.0
+
+
+def test_the_kept_models_are_diverse():
+    models = [_scored("a", ["p", "q", "r"], ["s"], ret=4.0), _scored("b", ["p", "q", "r"], ["t"], ret=3.0),
+              _scored("c", ["u"], ["v"], ret=2.0), _scored("d", ["p", "q", "r"], ["s", "w"], ret=1.0)]
+
+    assert [m["key"] for m in select_diverse(models, 10, max_similarity=0.5)] == ["a", "c"]  # b shares 3 of 5
+    assert [m["key"] for m in select_diverse(models, 10, max_similarity=1.0)] == ["a", "b", "c", "d"]
+    assert [m["key"] for m in select_diverse(models, 1, max_similarity=1.0)] == ["a"]
+
+
+def test_buy_and_hold_gate_keeps_only_training_outperformers():
+    models = [_scored("beats", ["a"], ["b"], ret=0.2, buy_and_hold=0.1),
+              _scored("ties", ["c"], ["d"], ret=0.1, buy_and_hold=0.1),
+              _scored("trails", ["e"], ["f"], ret=0.05, buy_and_hold=0.1)]
+
+    assert [model["key"] for model in outperforming_buy_and_hold(models)] == ["beats"]
+
+
+def test_new_models_take_the_next_unused_names_and_skip_existing_profiles(tmp_path):
+    config, log = tmp_path / "config", tmp_path / "model_performance.csv"
+    (config / "discard").mkdir(parents=True)
+    (config / "eth_002.json").write_text(json.dumps({"key": "old"}), encoding="utf-8")
+    (config / "discard" / "eth_007.json").write_text(json.dumps({"key": "dropped"}), encoding="utf-8")
+    log.write_text("model\neth_009\n", encoding="utf-8")  # a name only the log remembers
+    models = [_scored("new1", [], []), _scored("dropped", [], []), _scored("new2", [], [])]
+
+    written = write_models(models, "eth", config, log)
+
+    assert [m["name"] for m in written] == ["eth_010", "eth_011"]  # "dropped" is already in the discard folder
+    assert json.loads((config / "eth_011.json").read_text(encoding="utf-8")) == {"key": "new2"}
+    assert not (config / ".models.lock").exists()
+
+
+def test_parallel_writers_never_share_a_name(tmp_path):
+    import threading
+    config, log = tmp_path / "config", tmp_path / "model_performance.csv"
+    config.mkdir()
+    results = []
+    threads = [threading.Thread(target=lambda n=n: results.extend(
+        m["name"] for m in write_models([_scored(f"{n}-{i}", [], []) for i in range(10)], "doge", config, log)))
+               for n in range(4)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert len(results) == len(set(results)) == 40
+    assert len(list(config.glob("doge_*.json"))) == 40
+
+
+def test_older_settings_files_get_the_new_sections_by_default():
+    settings = with_optional_settings({"variety": {"max_similarity": 0.5}})
+
+    assert settings["variety"] == {
+        "max_similarity": 0.5, "min_fitness": None, "require_train_outperformance": False}
+    assert settings["registry"] == {"enabled": True, "migrants": 10}
+    assert settings["ranking"] == {"enabled": True} and settings["goals"] is None
+
+
+def test_auto_workers_share_the_cpus_between_searches(monkeypatch):
+    import parallel_backtest
+    monkeypatch.setattr(parallel_backtest, "cpu_count", lambda: 12)
+    assert worker_count("auto") == 10
+    assert worker_count("auto", instances=3) == 3
+    assert worker_count("auto", instances=20) == 1
+    assert worker_count(4) == worker_count("4") == 4
+    assert worker_count("auto", gpu_slots=2) == 12
+    assert worker_count("auto", instances=3, gpu_slots=2) == 4
+    assert worker_count(4, gpu_slots=2) == 6
+
+
+def test_a_search_can_learn_from_chosen_profiles_and_write_to_its_own_folder(tmp_path, monkeypatch):
+    import model_search
+    monkeypatch.setattr(model_search, "ROOT", tmp_path)
+    monkeypatch.setattr(model_search, "CONFIG_DIR", tmp_path / "config")
+    (tmp_path / "config").mkdir()
+    for name in ("doge_001", "doge_002", "btc_001"):
+        (tmp_path / "config" / f"{name}.json").write_text("{}", encoding="utf-8")
+
+    assert [p.stem for p in model_search.reference_paths({})] == ["btc_001", "doge_001", "doge_002"]
+    chosen = model_search.reference_paths({"references": ["config/doge_*.json", "config/btc_001.json"]})
+    assert [p.stem for p in chosen] == ["doge_001", "doge_002", "btc_001"]
+    with pytest.raises(SettingsError, match="matches no profile"):
+        model_search.reference_paths({"references": ["config/eth_*.json"]})
+
+    (tmp_path / "config" / "DOGE-USD").mkdir()
+    (tmp_path / "config" / "DOGE-USD" / "doge_003.json").write_text("{}", encoding="utf-8")
+    assert [p.stem for p in model_search.reference_paths({})] == ["btc_001", "doge_001", "doge_002", "doge_003"]
+    assert model_search.models_dir({"market": {"product": "DOGE-USD"}}) == tmp_path / "config" / "DOGE-USD"
+    # A reference written before currency folders still finds its model after the move.
+    assert [p.stem for p in model_search.reference_paths({"references": ["config/doge_003.json"]})] == ["doge_003"]
+    assert [p.stem for p in model_search.reference_paths({"references": ["config/doge_00*.json"]})] == [
+        "doge_001", "doge_002"]  # a glob matching at the top level isn't widened
+    assert model_search.models_dir({"models_dir": "work/doge"}) == tmp_path / "work" / "doge"
+
+
+def test_fitness_can_mark_down_too_many_trades_and_is_recomputed_from_summaries():
+    from model_search import rescore, summary_fitness
+    fitness = {"drawdown_weight": 0.5, "min_trades": 4, "trade_penalty": 0.1}
+    summary = {"return": 3.0, "max_drawdown": 0.3, "trades": 20, "years": 2.0}
+
+    base = summary_fitness(summary, fitness)
+    assert summary_fitness(summary, {**fitness, "max_trades": 15}) == pytest.approx(base - 0.5)
+    assert summary_fitness({**summary, "trades": 2}, fitness) == pytest.approx(
+        summary_fitness({**summary, "trades": 4}, fitness) - 0.2)
+
+    scores = rescore({"train": dict(summary, validation=dict(summary, trades=1)), "holdout": dict(summary)}, fitness)
+    assert scores["train"]["fitness"] == pytest.approx(base) and scores["holdout"]["fitness"] == pytest.approx(base)
+    assert scores["train"]["validation"]["fitness"] < base
+
+
+def test_selection_needs_both_training_and_validation_and_ties_prefer_simpler_models():
+    from model_search import rank_key, selection_fitness
+    assert selection_fitness({"train": {"fitness": 0.8}}) == 0.8
+    assert selection_fitness({"train": {"fitness": 0.8, "validation": {"fitness": -0.2}}}) == -0.2
+
+    simple = _scored("simple", ["a"], ["b"], fitness=0.8)
+    complex_ = _scored("complex", ["a", "c", "d"], ["b"], fitness=0.8)
+    fewer_trades = _scored("calm", ["a"], ["b"], fitness=0.8, trades=3)
+    better = _scored("better", ["a", "c", "d"], ["b"], fitness=0.9)
+    ranked = sorted([complex_, simple, better, fewer_trades], key=rank_key, reverse=True)
+
+    assert [m["key"] for m in ranked] == ["better", "calm", "simple", "complex"]
+
+
+def test_a_search_built_model_with_a_regime_lock_is_recovered_as_a_reference():
+    atoms = _atoms()
+    exprs = sorted(atoms)[:3]
+    genome = {"gran": "ONE_DAY", "entry": exprs[:2], "entry_k": 2, "exit": exprs[:2], "exit_k": 0, "confirm": [],
+              "confirm_k": 0, "lock": 100, "entry_persist_h": 0, "exit_persist_h": 0, "trail": 0, "target": 0,
+              "stop": 0, "dd_limit": 0, "pos": 1.0}
+    profile = build_profile(genome, atoms, TEMPLATE, "BTC-USD")
+    assert "close > sma_100d" in profile["strategy"]["entry_signal"]["all"]
+
+    harvest = Harvest(atoms.values(), ["ONE_DAY"], "ONE_DAY")
+    recovered = harvest.add_profile("locked", profile)
+
+    assert harvest.skipped == [] and recovered["lock"] == 100
+    assert sorted(recovered["entry"]) == sorted(exprs[:2])
+
+
+def test_genomes_recorded_before_a_setting_existed_breed_with_it_off():
+    breeder = Breeder(_atoms(), TEMPLATE, SETTINGS, seed=3)
+    old_a, old_b = breeder.fresh(), breeder.fresh()
+    for genome in (old_a, old_b):
+        genome.pop("target_trail", None)  # as stored in the registry before target_trail existed
+
+    child = breeder.crossover(old_a, old_b)
+
+    assert child["target_trail"] == 0
+    features(child, _atoms(), breeder.options)  # used to fail comparing None with a number
+    repaired = breeder.repair({**child, "target_trail": None})
+    assert repaired is None or repaired[0]["target_trail"] == 0
+
+
+def test_a_template_path_from_before_currency_folders_is_found_in_its_folder(tmp_path, monkeypatch):
+    import model_search
+    monkeypatch.setattr(model_search, "ROOT", tmp_path)
+    (tmp_path / "config" / "ETH-USD").mkdir(parents=True)
+    (tmp_path / "config" / "ETH-USD" / "eth_template.json").write_text("{}", encoding="utf-8")
+
+    assert model_search.profile_path("config/eth_template.json") == tmp_path / "config" / "ETH-USD" / "eth_template.json"
+    assert model_search.profile_path("config/missing.json") == tmp_path / "config" / "missing.json"

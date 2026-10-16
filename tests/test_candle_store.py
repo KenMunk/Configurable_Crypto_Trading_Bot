@@ -362,3 +362,13 @@ def test_readers_see_the_last_commit_while_a_write_is_under_way(tmp_path):
     finally:
         writer.execute("ROLLBACK")
         writer.close()
+
+
+def test_the_downloaded_range_is_read_without_the_candles(tmp_path):
+    store = CandleStore(tmp_path, read_only=True)
+    assert store.fetched_range(PRODUCT, GRANULARITY) is None  # no database yet
+
+    _save(tmp_path, _candles(10))
+
+    assert store.fetched_range(PRODUCT, GRANULARITY) == (0, 10 * FIFTEEN_MINUTES)
+    assert store.fetched_range("ETH-USD", GRANULARITY) is None

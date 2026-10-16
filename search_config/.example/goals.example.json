@@ -1,0 +1,24 @@
+{
+  "description": "Example goals: steady growth with drawdowns kept in check. Copy to search_config/goals.json and edit.",
+  "require": "all",
+  "growth": {
+    "min_annual_growth_pct": 25,
+    "min_growth_multiple": null,
+    "min_vs_buy_and_hold_pct": null
+  },
+  "ending_value": {
+    "min_ending_value": null
+  },
+  "risk": {
+    "max_drawdown_pct": 60,
+    "max_worst_in_window_pct": null,
+    "min_trades": 4,
+    "min_win_rate_pct": null
+  },
+  "ranking": {
+    "drawdown_weight": 0.5,
+    "discard_fraction": 0.8,
+    "min_keep": 10,
+    "protect": []
+  }
+}

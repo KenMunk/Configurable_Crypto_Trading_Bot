@@ -72,6 +72,40 @@ def buy_and_hold_values(result):
     return values
 
 
+# Share of the price chart's height kept free at the bottom for the buy and sell triangles.
+TRADE_STRIP = 0.09
+
+
+def _reserve_trade_strip(ax):
+    """Lower the price axis's bottom so the data fills the top and the trade triangles sit in an empty strip
+    below it, clear of every line."""
+    low, high = ax.get_ylim()
+    if ax.get_yscale() == "log" and low > 0:
+        ax.set_ylim(low / (high / low) ** (TRADE_STRIP / (1 - TRADE_STRIP)), high)
+    else:
+        ax.set_ylim(low - (high - low) * TRADE_STRIP / (1 - TRADE_STRIP), high)
+
+
+def _trade_marks(ax, entries, exits, markersize, line_alpha, zorder, labels=False):
+    """Mark buys and sells with a vertical line through the chart and a triangle at its bottom edge.
+
+    The triangles sit in the margin under the price lines (in axes coordinates, so zooming and
+    panning keep them there) instead of on the price, where they hid the lines. Buys sit a little
+    lower than sells, so a sell and a buy on the same candle both show. Returns the artists.
+    """
+    edge = ax.get_xaxis_transform()  # x in data (time), y from 0 (bottom) to 1 (top) of the axes; see TRADE_STRIP
+    style = dict(linestyle="none", markersize=markersize, markeredgecolor=SURFACE, markeredgewidth=1.5,
+                 transform=edge, clip_on=False, zorder=zorder)
+    return [
+        ax.vlines(entries, 0, 1, transform=edge, colors=BUY_COLOR, linewidth=0.8, alpha=line_alpha, zorder=zorder - 1),
+        ax.vlines(exits, 0, 1, transform=edge, colors=SELL_COLOR, linewidth=0.8, alpha=line_alpha, zorder=zorder - 1),
+        *ax.plot(entries, np.full(len(entries), 0.025), marker="^", color=BUY_COLOR,
+                 label="Buy" if labels else "_nolegend_", **style),
+        *ax.plot(exits, np.full(len(exits), 0.065), marker="v", color=SELL_COLOR,
+                 label="Sell" if labels else "_nolegend_", **style),
+    ]
+
+
 class PriceLogLocator(Locator):
     """Ticks for a log price axis that stay readable at every zoom level.
 
@@ -317,14 +351,10 @@ class BacktestChart(_HoverChart):
         if trades:
             # Hundreds of trades at full zoom would carpet the chart; shrink to the ~8px floor.
             dense = len(trades) > 200
-            marker_style = dict(linestyle="none", markersize=6 if dense else 9, markeredgecolor=SURFACE,
-                                markeredgewidth=1 if dense else 1.5, zorder=5)
-            ax.plot(np.array([t["entry_time"] for t in trades], dtype="datetime64[s]"),
-                    [t["entry_price"] for t in trades], marker="^", color=BUY_COLOR,
-                    label="Buy", **marker_style)
-            ax.plot(np.array([t["exit_time"] for t in trades], dtype="datetime64[s]"),
-                    [t["exit_price"] for t in trades], marker="v", color=SELL_COLOR,
-                    label="Sell", **marker_style)
+            entries = np.array([t["entry_time"] for t in trades], dtype="datetime64[s]")
+            exits = np.array([t["exit_time"] for t in trades], dtype="datetime64[s]")
+            _trade_marks(ax, entries, exits, markersize=6 if dense else 9, line_alpha=0.15 if dense else 0.35,
+                         zorder=5, labels=True)
 
         self._shade_pauses()
         subtitle = f"{result['trade_count']:,} trades, {result['total_return']:+.2%} return"
@@ -336,6 +366,8 @@ class BacktestChart(_HoverChart):
             hover_color=PRICE_COLOR,
             legend_columns=3,
         )
+        if trades and (self.floor is None or not self.floor_fits):  # a floor in use is the lowest value shown
+            _reserve_trade_strip(ax)
 
     def _draw_panel(self, ax, times, meta):
         """One oscillator on its own scale, with its conventional reference levels."""
@@ -402,16 +434,15 @@ class BacktestChart(_HoverChart):
         for artist in self._focus_artists:
             artist.remove()
         entry_x, exit_x = (np.datetime64(int(trade[key]), "s") for key in ("entry_time", "exit_time"))
-        marker_style = dict(linestyle="none", markersize=11, markeredgecolor=SURFACE,
-                            markeredgewidth=2, zorder=6)
         self._focus_artists = [
             self.ax.axvspan(entry_x, exit_x, color=PRICE_COLOR, alpha=0.1, linewidth=0, zorder=0),
-            *self.ax.plot([entry_x], [trade["entry_price"]], marker="^", color=BUY_COLOR, **marker_style),
-            *self.ax.plot([exit_x], [trade["exit_price"]], marker="v", color=SELL_COLOR, **marker_style),
+            *_trade_marks(self.ax, np.array([entry_x]), np.array([exit_x]), markersize=11, line_alpha=0.8, zorder=6),
         ]
         self.ax.set_xlim(mdates.date2num(np.datetime64(int(start), "s")),
                          mdates.date2num(np.datetime64(int(end), "s")))
         self.ax.set_ylim(bottom, high * padding)
+        if bottom != self.floor:  # unless the floor set the bottom
+            _reserve_trade_strip(self.ax)
         # Fit each unbounded oscillator panel to its values in the zoomed window.
         for panel_ax, meta in zip(self.axes[1:], self.panels):
             if meta["bounds"]:
@@ -429,6 +460,9 @@ class BacktestChart(_HoverChart):
 
 class ModelValueChart(_HoverChart):
     """Portfolio value over time for one or more models, against buying and holding."""
+
+    def _panel_count(self, result):
+        return 1
 
     def show(self, result, primary=0, slots=None):
         """Plot one backtest result, or a list of them to compare models on one chart.
@@ -448,6 +482,10 @@ class ModelValueChart(_HoverChart):
         self.run_times = [np.array(run["series"]["time"], dtype="datetime64[s]") for run in runs]
         self.run_x = [mdates.date2num(run_times) for run_times in self.run_times]
         self.run_values = [np.asarray(run["series"]["equity"]) for run in runs]
+        self.run_tax_reserves = [
+            np.asarray(run["series"].get("tax_reserve", np.zeros_like(run["series"]["equity"])))
+            for run in runs
+        ]
 
         # One buy-and-hold line per product and starting value. Each starts where a model could
         # first buy: the chosen model's start for its own line, else the first model with that product and value.
@@ -484,9 +522,25 @@ class ModelValueChart(_HoverChart):
             # Every model's ending value gets a marker; a single model also gets text labels.
             ax.plot([self.run_times[position][-1]], [values[-1]], marker="o", markersize=8, color=color,
                     markeredgecolor=SURFACE, markeredgewidth=2, zorder=5, label="_nolegend_")
+            tax_label = ("Tax reserve" if single else run.get("model_name", f"Model {position + 1}"))
+            tax_label += f" ({_quote_currency(run)})"
+            self.axes[1].plot(
+                self.run_times[position], self.run_tax_reserves[position], color=color,
+                **({"linestyle": dashes} if dashes else {}),
+                linewidth=LINE_WIDTH if position == primary else 1.2, label=tax_label,
+            )
 
         primary_run = runs[primary]
         self.model_values = self.run_values[primary]
+        self.tax_reserve_values = self.run_tax_reserves[primary]
+        self.tax_reserve_ax = self.axes[1]
+        tax_currencies = {_quote_currency(run) for run in runs}
+        tax_axis_label = (f"Tax reserve ({next(iter(tax_currencies))})" if len(tax_currencies) == 1
+                          else "Tax reserve (mixed quote currencies)")
+        self.tax_reserve_ax.set_ylabel(tax_axis_label,
+                                       color=SECONDARY_INK, fontsize=9)
+        self.tax_reserve_ax.set_ylim(bottom=0)
+        self.tax_reserve_ax.legend(loc="upper left", frameon=False, fontsize=8, ncols=2)
         self.benchmark_values = self.benchmarks[(primary_run["product_id"], primary_run["starting_capital"])][1]
         capitals = {run["starting_capital"] for run in runs}
         start_value = self.model_values[0]
@@ -530,6 +584,10 @@ class ModelValueChart(_HoverChart):
             value, capital = self.run_values[position][nearest], run["starting_capital"]
             name = "Model value" if len(self.runs) == 1 else run.get("model_name", f"Model {position + 1}")
             lines.append(f"{name}  {value:,.2f} ({value / capital - 1:+.2%})")
+            tax_reserve = self.run_tax_reserves[position][nearest]
+            tax_name = "Tax reserve" if len(self.runs) == 1 else f"{name} tax reserve"
+            tax_name += f" ({_quote_currency(run)})"
+            lines.append(f"{tax_name}  {tax_reserve:,.2f}")
         for (product, capital), (position, values) in self.benchmarks.items():
             nearest = int(np.clip(np.searchsorted(self.run_x[position], moment), 0, len(values) - 1))
             name = "Buy and hold" if len(self.benchmarks) == 1 else f"Buy and hold {product}"

@@ -101,6 +101,7 @@ class CompiledModel:
     def __init__(self, profile, granularity_seconds):
         self.profile = normalize_profile(profile)
         self.granularity_seconds = granularity_seconds
+        self.gpu_indicators = []
         errors = []
 
         definitions = self.profile.get("indicators", {})
@@ -189,14 +190,17 @@ class CompiledModel:
             errors.append(f"{label} needs at least one rule in \"all\" or \"any\"")
         return compiled
 
-    def evaluate(self, candles):
+    def evaluate(self, candles, compute_device="cpu", device_id=0):
         """Return (series by name, entry signal array, exit signal array) for the candles.
 
         The exit array is None when the profile has no exit rules. `candles` may be a
         MetricCache shared with other models on the same candles.
         """
-        context = IndicatorContext(candles, self.definitions, self.granularity_seconds)
+        context = IndicatorContext(
+            candles, self.definitions, self.granularity_seconds,
+            compute_device=compute_device, device_id=device_id)
         series = {name: context.series(name) for name in self.series_names}
+        self.gpu_indicators = context.gpu_indicators
         entry = evaluate_rules(self.entry_rules, series, len(candles))
         exit_signal = (evaluate_rules(self.exit_rules, series, len(candles))
                        if self.exit_rules["all"] or self.exit_rules["any"] else None)

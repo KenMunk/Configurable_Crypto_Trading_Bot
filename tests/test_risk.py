@@ -53,7 +53,7 @@ def test_no_entry_without_room_above_the_floor():
     assert result["trade_count"] == 0
 
 
-def test_tax_payments_are_withdrawals_not_drawdowns():
+def test_monthly_tax_reserve_is_not_a_second_withdrawal_at_payment():
     year = 365 * 86_400
     prices = [100] * 6 + [101, 102, 103, 104, 105, 110] + [110] * 10
     candles = [_candle(i * STEP, p) for i, p in enumerate(prices)]
@@ -66,7 +66,8 @@ def test_tax_payments_are_withdrawals_not_drawdowns():
     result = run_backtest(candles, profile)
 
     assert result["taxes_paid"] > 0
-    assert result["series"]["equity"][-1] < result["series"]["equity"][-2]  # the payment reduced the value
+    assert max(result["series"]["tax_reserve"]) > 0
+    assert result["series"]["tax_reserve"][-1] == 0  # the reserve is cleared at the monthly payment
     assert result["max_window_drawdown"] == pytest.approx(0.0, abs=1e-9)
     assert result["max_drawdown"] == pytest.approx(0.0, abs=1e-9)
 
@@ -220,3 +221,33 @@ def test_raw_anomalies_are_kept_so_a_stop_gapped_through_fills_at_the_print():
 
     assert result["trades"][0]["exit_reason"] == "DRAWDOWN_STOP"
     assert result["trades"][0]["exit_price"] == pytest.approx(0.06)
+
+
+def test_a_profit_target_can_arm_a_trailing_stop_instead_of_selling():
+    from backtest import run_backtest
+    from tests.test_backtest import _candle, _profile
+    prices = [100, 110, 150, 200, 230, 240, 200, 190]  # entry at 110; +30% target hit at 150
+    profile = _profile(strategy={"direction": "LONG_ONLY", "entry_signal": {"all": ["close > 105"]},
+                                 "exit_signal": {"any": ["close < 50"], "profit_lock_target": 0.3}})
+    candles = [_candle(i * 900, p) for i, p in enumerate(prices)]
+
+    sold_at_target = run_backtest(candles, profile)
+    assert sold_at_target["trades"][0]["exit_reason"] == "PROFIT_LOCK"
+
+    profile["strategy"]["exit_signal"]["profit_lock_trail"] = 0.15
+    rode = run_backtest(candles, profile)
+
+    trade = rode["trades"][0]
+    assert trade["exit_reason"] == "TARGET_TRAIL"
+    # The stop sits 15% below the high of 240 (204); the next candle opens at 200, below it, so it fills there.
+    assert trade["exit_price"] == pytest.approx(200)
+    assert trade["return"] > sold_at_target["trades"][0]["return"]  # rode the run past the target
+
+
+def test_a_target_trail_needs_a_target():
+    from backtest import run_backtest
+    from tests.test_backtest import _candle, _profile
+    profile = _profile()
+    profile["strategy"]["exit_signal"]["profit_lock_trail"] = 0.2
+    with pytest.raises(ValueError, match="needs a profit_lock_target"):
+        run_backtest([_candle(i * 900, 100) for i in range(10)], profile)

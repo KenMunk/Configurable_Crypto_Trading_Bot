@@ -11,9 +11,10 @@ Used only to screen entries, never charged at the moment of a trade:
 - the tax buffer on the remaining gain
 
 The screen only runs when the profile sets both a profit_lock_target and a
-minimum_net_profit_gate. Taxes themselves are settled by the backtest once a year on
-net realized gains. The fetch_* helpers make network calls; FrictionModel itself never
-does, so a backtest without live inputs runs on the profile's rates alone.
+minimum_net_profit_gate. The backtest reserves tax from each profitable completed trade
+and pays the accumulated reserve monthly. The fetch_* helpers make network calls;
+FrictionModel itself never does, so a backtest without live inputs runs on the profile's
+rates alone.
 """
 
 import json

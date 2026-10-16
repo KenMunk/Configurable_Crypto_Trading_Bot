@@ -42,8 +42,10 @@ Each strategy is a JSON **model profile**. A profile names its indicators, write
 | **Simulator** | `python simulator.py` | A desktop app that backtests one or more model profiles over up to 10 years of Coinbase candles. It charges fees, slippage and taxes, and shows the results in sortable tables and interactive charts. | Working |
 | **Trader** | `python engine.py` | The headless runtime for an always-on machine. It loads profiles from `quant_system/config/` (one per ticker), opens its ledger and serial link, and starts a status dashboard with an on-demand Coinbase authentication check. Run directly, it exits as soon as start-up finishes; the [Trader guide](Project_Documentation/trader.md#keeping-the-engine-running) has a launcher that keeps it running. | Foundation only; does not trade yet |
 | **Model profiles** | `config/*.json` | Declarative strategy definitions in one format for both tools (the simulator reads `config/`; `python engine.py` reads `quant_system/config/`): 24 indicators, a safe rule language, and settings for friction, capital and safeguards. | Working |
-| **Parallel backtests** | `python parallel_backtest.py config/*.json` | Backtests many profiles at once on worker processes (by default one per CPU but two, keeping one CPU for the window and candle downloads and one for merging results), with one thread writing the candle database and one merging results into the performance log, so nothing collides. The simulator uses it in its default parallel mode, and its **Time spent** line compares the two modes. See [Running models in parallel](Project_Documentation/simulator.md#running-models-in-parallel). | Working |
-| **Model search** | `python model_search.py` | Breeds and backtests generations of vote-based models for one market, seeded by your existing models and their logged results, until improvement plateaus. Writes the best to `config/` and the performance log. Everything it searches over comes from a private settings file in `search_config/` ([README](search_config/README.md)). | Working |
+| **Parallel backtests** | `python parallel_backtest.py config/*.json` | Backtests many profiles at once on worker processes (by default one per CPU but two, keeping one CPU for the window and candle downloads and one for merging results), with one thread writing the candle database and one merging results into the performance log. When optional GPU dependencies and devices are available, CUDA is selected automatically and adds one worker slot per GPU; `--compute-device cpu` forces CPU-only mode. Supported moving averages run on GPU, while trading, fees and tax simulation remain CPU-based. GPU slots may not improve throughput when CPU simulation is the bottleneck. See [Running models in parallel](Project_Documentation/simulator.md#running-models-in-parallel). | Working |
+| **Model search** | `python model_search.py` | Breeds and backtests generations of vote-based models for one market, seeded by your existing models and their logged results, until improvement plateaus. Writes a varied set of the best to `config/` and the performance log, then ranks all of the currency's models against your goals and moves the bottom 80% to `config/discard/`. Several searches can run at once (`--instances N`), sharing every evaluation so none is repeated. CUDA is selected automatically when available and adds GPU-backed evaluator capacity; `--compute-device cpu` forces CPU-only evaluation. Everything it searches over comes from a private settings file in `search_config/` ([README](search_config/README.md)). | Working |
+| **Model Lab** | `python model_lab.py` | A window for running model searches yourself: queue search settings files, run several at once, and browse the top 20 models against your goals, opening any in the simulator. See the [Model Lab guide](Project_Documentation/model_lab.md). | Working |
+| **Model assessor** | `python model_assessor.py` | Checks models against the growth, ending-value and risk targets in your goals file, ranks them, and can move a currency's weakest to `config/discard/` (`--discard`) or bring them back (`--restore`). See [Goals and the assessor](search_config/README.md#goals-and-the-assessor). | Working |
 
 ---
 
@@ -58,7 +60,7 @@ The project's own research has produced over 150 models, each backtested on 10 y
 | `btc_growth_09` | Two of three trend signals, including ADX | +6,950% | +8,659% | −19.5% | 63.5% |
 | `btc_trend_vote_4in_1out` | Five-way trend vote: in on 4, out on 1 | +5,791% | +6,209% | −6.6% | 65.4% |
 
-These figures come from one run on 2026-10-15 (UTC) over the previous 10 years, on 15-minute candles for the first two models and daily candles for the other two. It charged a 0.9% fee per fill (flash-crash limit buys pay the lower maker fee), 0.25% slippage, and 31.3% tax on each year's net realized gains, with losses carried forward. Buy and hold pays none of these costs, and starts when each model could first buy. All four finish behind it, which is why they're public. The better models stay private. The simulator also records every model you test in [a running performance log](Project_Documentation/simulator.md#model-performance-log), so comparisons like this one build up as you work.
+These figures come from one run on 2026-10-15 (UTC) over the previous 10 years, on 15-minute candles for the first two models and daily candles for the other two. It charged a 0.9% fee per fill (flash-crash limit buys pay the lower maker fee), 0.25% slippage, and 31.3% tax on each year's net realized gains, with losses carried forward. They predate the current per-trade monthly tax-reserve method; rerun the models before comparing them with current simulator results. Buy and hold pays none of these costs, and starts when each model could first buy. All four finish behind it, which is why they're public. The better models stay private. The simulator also records every model you test in [a running performance log](Project_Documentation/simulator.md#model-performance-log), so comparisons like this one build up as you work.
 
 ---
 
@@ -153,6 +155,15 @@ The code is split into small modules:
 | `backtest.py` | Candle download, and the backtest itself: fills, stops, taxes, drawdown limits, flash crashes. |
 | `candle_store.py` | The candle cache: a SQLite table per product and candle size, with a column for each slow indicator kept between runs. |
 | `performance_log.py` | The model performance log: one CSV row per model with its latest results, updated when a run's results change, under a lock file so simultaneous runs never lose rows. |
+| `model_search.py` | The evolutionary model search: breeding, scoring, keeping a varied set, and running several searches at once. |
+| `model_assessor.py` | Goals: checks models against your targets, ranks a currency's models, and moves the weakest to its discard folder; `--organize` files profiles into their currency's folder. |
+| `synthetic.py` | Synthetic market scenarios (crashes, bear markets, pumps, chop, volatility shocks, resampled history) built from each market's own behaviour, for robustness tests. |
+| `stress_test.py` | Stress tests: every scenario and nightmare alone and in pairs, with and without history, and an HTML report per model. |
+| `scenario_editor.py` | The simulator's Test options window: historic or synthetic data, the scenario editor and preview, and how many top models to highlight. |
+| `model_lab.py` | Model Lab: the window that queues and runs model searches and shows the top 20 models. |
+| `model_library.py` | Where models live: one folder per currency under `config/`, their discard folders, and each currency's recorded best model. |
+| `search_registry.py` | The evaluations all model searches share (`data/model_search/registry.db`), so none is backtested twice. |
+| `file_lock.py` | The lock file that keeps simultaneous runs from writing the same file or model name at once. |
 | `parallel_backtest.py` | Runs many backtests at once: one candle-writer thread, read-only worker processes that each write their own result shard, and a gatherer that merges the shards into the performance log. |
 | `model_config.py` | Validates a profile and compiles its indicators and rules into per-candle signals. |
 | `indicators.py` | The indicator library: moving averages, oscillators, bands, volatility, trend and volume. |
@@ -215,8 +226,8 @@ The blueprint has five sections, which this summary follows:
 
 *Blueprint sections 2 and 3.*
 
-- **Long-lived software.** The engine core is built on the Python standard library, plus the optional `pyserial` and `cupy` packages (neither is in `requirements.txt`, so the serial link and GPU helper do nothing until you install them), so that it keeps working for decades without dependency churn. In practice, the simulator uses numpy, matplotlib and the Coinbase SDK, and the engine needs the Coinbase SDK only for authentication.
-- **The GPU mutual exclusion guard.** GPU simulations run on either a modern RTX card or a legacy GTX card, never both in one run, to protect the driver stack. The engine includes this guard (see the [GPU helper](Project_Documentation/trader.md#9-gpu-simulation-helper)). The simulator itself runs on the CPU.
+- **Long-lived software.** The engine core is built on the Python standard library, plus the optional `pyserial` and `cupy` packages (neither is in `requirements.txt`; install `requirements-gpu.txt` for simulator CUDA acceleration), so that it keeps working without dependency churn. In practice, the simulator uses numpy, matplotlib and the Coinbase SDK, and the engine needs the Coinbase SDK only for authentication.
+- **The GPU mutual exclusion guard.** The legacy engine GPU helper has a guard against mixing RTX- and GTX-generation cards (see the [GPU helper](Project_Documentation/trader.md#9-gpu-simulation-helper)). Parallel simulator backtests have a separate optional CUDA path for supported indicators and use visible CUDA devices when available; the trading simulation remains on CPU.
 - **The storage budget.** At 32 bytes per row, 10 years of data for five assets needs very little disk space:
 
   | Candle size | Rows | Size |
@@ -258,7 +269,7 @@ The blueprint has five sections, which this summary follows:
 | Low-wear SQLite ledger | Database created with WAL; no tables or midnight flush yet | `engine.py` |
 | LAN-only status API | Built; isolation depends on your firewall | `engine.py` |
 | Serial interlock and cutover handshake | The serial port opens; no protocol yet | `engine.py` |
-| GPU mutual exclusion guard | Built; not used by the simulator | `engine.py` |
+| Engine GPU mutual exclusion guard | Built; separate from simulator CUDA indicator path | `engine.py` |
 | Shared system configuration | Designed but not built; `.env` holds these settings today | [system_config_structure.md](Project_Documentation/system_config_structure.md) |
 
 The blueprint's code listing is an early snapshot of `engine.py`. The current engine adds `.env` settings and Coinbase authentication.
@@ -275,6 +286,14 @@ Configurable_Crypto_Trading_Bot/
 ├── candle_store.py           Candle cache and stored indicators (SQLite)
 ├── performance_log.py        Model performance log (data/model_performance.csv)
 ├── model_search.py           Evolutionary model search (settings in search_config/)
+├── model_lab.py              Model Lab: queue and run searches, see the top 20
+├── synthetic.py              Synthetic market scenarios for robustness tests
+├── stress_test.py            Stress tests and their reports
+├── scenario_editor.py        The simulator's Test options window
+├── model_assessor.py         Checks models against your goals; ranks and discards
+├── search_registry.py        Evaluations shared by every model search
+├── parallel_backtest.py      Many backtests at once on worker processes
+├── file_lock.py              Lock files for simultaneous runs
 ├── model_config.py           Profile validation and compilation
 ├── indicators.py             Indicator library
 ├── rules.py                  Signal rule language
@@ -285,10 +304,14 @@ Configurable_Crypto_Trading_Bot/
 ├── .vscode/                  Shared VS Code settings
 ├── config/
 │   ├── .example/             Public template profiles (tracked)
-│   └── *.json                Your private profiles (ignored by Git)
+│   ├── <PRODUCT>/            Your private profiles, one folder per currency, such as DOGE-USD/ (ignored by Git)
+│   │   ├── discard/          Models ranked out by the search or the assessor
+│   │   └── best_model.json   The currency's best model, chosen by the simulator
+│   └── *.json                Older private profiles, before currency folders (ignored by Git)
+├── scenarios/                Synthetic scenario sets for the simulator
 ├── search_config/
-│   ├── .example/             Public template search settings (tracked)
-│   └── *.json                Your private search settings (ignored by Git)
+│   ├── .example/             Public template search settings and goals (tracked)
+│   └── *.json                Your private search settings and goals (ignored by Git)
 ├── data/                     Candle cache (candles.db) and model performance log, created on first run (ignored by Git)
 ├── ledger/                   Ledger database for the repository-root base directory
 ├── quant_system/             Default base directory of `python engine.py`

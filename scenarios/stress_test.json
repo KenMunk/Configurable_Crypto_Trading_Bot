@@ -1,0 +1,123 @@
+{
+  "scenarios": [
+    {
+      "name": "Crash -50% in a week, half recovered in 6 months",
+      "type": "crash",
+      "placement": "append",
+      "at": "",
+      "seed": 1,
+      "chain": false,
+      "drop": 0.5,
+      "days": 7.0,
+      "recovery_days": 180.0,
+      "recovery": 0.5,
+      "volatility": 1.0
+    },
+    {
+      "name": "Bear market -70% over a year",
+      "type": "bear",
+      "placement": "append",
+      "at": "",
+      "seed": 2,
+      "chain": false,
+      "drop": 0.7,
+      "days": 365.0,
+      "volatility": 1.0
+    },
+    {
+      "name": "Pump +200% in 2 months, then -60% in a month",
+      "type": "pump",
+      "placement": "append",
+      "at": "",
+      "seed": 3,
+      "chain": false,
+      "rise": 2.0,
+      "days": 60.0,
+      "drop": 0.6,
+      "collapse_days": 30.0,
+      "volatility": 1.0
+    },
+    {
+      "name": "Calm rally +100% over 4 months, then -30%",
+      "type": "pump",
+      "placement": "append",
+      "at": "",
+      "seed": 7,
+      "chain": false,
+      "rise": 1.0,
+      "days": 120.0,
+      "drop": 0.3,
+      "collapse_days": 30.0,
+      "volatility": 0.3
+    },
+    {
+      "name": "Sideways chop, about 15% either way, for 6 months",
+      "type": "sideways",
+      "placement": "append",
+      "at": "",
+      "seed": 4,
+      "chain": false,
+      "range": 0.15,
+      "days": 180.0,
+      "volatility": 1.0
+    },
+    {
+      "name": "Volatility doubles for 3 months",
+      "type": "volatility",
+      "placement": "append",
+      "at": "",
+      "seed": 5,
+      "chain": false,
+      "days": 90.0,
+      "volatility": 2.0
+    },
+    {
+      "name": "Resampled history, 1 year, 20 paths",
+      "type": "resample",
+      "placement": "append",
+      "at": "",
+      "seed": 6,
+      "chain": false,
+      "days": 365.0,
+      "paths": 20,
+      "block_days": 7.0
+    },
+    {
+      "name": "Crash -40%",
+      "type": "crash",
+      "placement": "append",
+      "at": "",
+      "seed": 8,
+      "chain": false,
+      "drop": 0.4,
+      "days": 5.0,
+      "recovery_days": 30.0,
+      "recovery": 0.2,
+      "volatility": 1.0
+    },
+    {
+      "name": "Chop for 3 months",
+      "type": "sideways",
+      "placement": "append",
+      "at": "",
+      "seed": 9,
+      "chain": true,
+      "range": 0.1,
+      "days": 90.0,
+      "volatility": 1.0
+    },
+    {
+      "name": "Calm rally +80%",
+      "type": "pump",
+      "placement": "append",
+      "at": "",
+      "seed": 10,
+      "chain": true,
+      "rise": 0.8,
+      "days": 120.0,
+      "drop": 0.2,
+      "collapse_days": 20.0,
+      "volatility": 0.4
+    }
+  ]
+}
