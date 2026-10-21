@@ -25,15 +25,15 @@ FIELDS = [("drop", "Drop (0.5 = -50%)"), ("rise", "Rise (2.0 = +200%)"), ("days"
           ("volatility", "Volatility (1 = the market's own)"), ("paths", "Paths"), ("block_days", "Block days")]
 
 
-def load_options(path=OPTIONS_FILE):
+def load_options(path=None):
     try:
-        return {**DEFAULT_OPTIONS, **json.loads(Path(path).read_text(encoding="utf-8"))}
+        return {**DEFAULT_OPTIONS, **json.loads(Path(path or OPTIONS_FILE).read_text(encoding="utf-8"))}
     except (OSError, ValueError):
         return dict(DEFAULT_OPTIONS)
 
 
-def save_options(options, path=OPTIONS_FILE):
-    path = Path(path)
+def save_options(options, path=None):
+    path = Path(path or OPTIONS_FILE)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(options, indent=2) + "\n", encoding="utf-8")
 

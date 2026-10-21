@@ -68,6 +68,18 @@ def max_workers():
     return max(1, cpu_count() - RESERVED_CPUS)
 
 
+# Thread pools of numpy's maths libraries; one thread each keeps every model on one thread.
+SINGLE_THREAD_ENV = ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS")
+
+
+def single_threaded_children():
+    """Have the worker processes started from now on run their maths libraries on one thread each, so
+    one model is only ever worked on by one thread. Spawned processes read these when they start;
+    a value already set (by the user) is kept."""
+    for name in SINGLE_THREAD_ENV:
+        os.environ.setdefault(name, "1")
+
+
 def parse_workers(text):
     """A worker count typed by the user: "auto" (or blank) for max_workers(), else a whole number.
 
@@ -260,6 +272,7 @@ def run_parallel(client, models, workers=None, start_time=None, wait_for_fresh_s
     if gatherer is not None:
         gatherer.start()
     writer = ThreadPoolExecutor(max_workers=1, thread_name_prefix="candle-writer")
+    single_threaded_children()
     pool = ProcessPoolExecutor(
         max_workers=workers, mp_context=mp.get_context("spawn"), initializer=_start_worker,
         initargs=(cache_dir, friction_inputs, start_time, wait_for_fresh_signal, shard_dir,

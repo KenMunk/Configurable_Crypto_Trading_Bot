@@ -101,6 +101,107 @@ def test_every_model_runs_every_combination_alone_and_with_history_and_reports_a
     assert len(rows) == len(records) + 2
 
 
+def test_worker_processes_give_the_same_records_in_the_same_order():
+    profiles = [("fast", _profile(period_granularity="ONE_DAY")),
+                ("slow", _profile(period_granularity="ONE_DAY", indicators={
+                    "fast_ema": {"type": "EMA", "period": 5}, "slow_ema": {"type": "EMA", "period": 20},
+                    "emergency_ema": {"type": "EMA", "period": 1}}))]
+    frictions = {name: FrictionModel(profile) for name, profile in profiles}
+    combos = stress_test.combinations(SCENARIOS, [], pairs=2, max_paths=2)
+    markets = {("BTC-USD", "ONE_DAY"): _daily()}
+    progress = []
+
+    serial = stress_test.run_stress(profiles, frictions, markets, combos)
+    parallel = stress_test.run_stress(profiles, frictions, markets, combos, workers=2, compute_device="cpu",
+                                      progress=lambda fraction, message: progress.append(message))
+
+    key = lambda record: (record["model"], record["scenario"], record["mode"], record["return"])  # noqa: E731
+    assert [key(r) for r in parallel[0]] == [key(r) for r in serial[0]]
+    assert {name: key(r) for name, r in parallel[1].items()} == {name: key(r) for name, r in serial[1].items()}
+    assert [r["model_name"] for r in parallel[2]] == [r["model_name"] for r in serial[2]]
+    assert "on 2 workers" in progress[-1]
+    assert all(len(r["series"]["equity"]) <= stress_test.CHART_POINTS for r in parallel[2][2:])
+
+
+def test_each_model_on_each_scenario_path_is_its_own_task():
+    profiles = [("fast", _profile(period_granularity="ONE_DAY")), ("slow", _profile(period_granularity="ONE_DAY"))]
+    frictions = {name: FrictionModel(profile) for name, profile in profiles}
+    combos = stress_test.combinations(SCENARIOS, [], pairs=1, max_paths=2)
+    tasks = stress_test._tasks(profiles, frictions, combos, stress_test.MODES, False)
+
+    baselines = [args[1] for function, args, _ in tasks if function is stress_test._baseline_task]
+    runs = [(args[1], args[4], args[6]) for function, args, _ in tasks if function is stress_test._combo_task]
+    assert baselines == ["fast", "slow"]  # the real history: one task per model
+    assert len(runs) == len(set(runs)) == 2 * sum(paths for *_, paths in combos)  # per model per path
+    assert all(count == 2 for function, _, count in tasks if function is stress_test._combo_task)  # both modes
+
+
+def test_a_model_never_has_two_tasks_running_at_once():
+    queues, busy = {"a": [0, 2, 4], "b": [1, 3], "c": []}, set()
+    assert stress_test._next_tasks(queues, busy, free=5) == [0, 1]  # one task each; c has none left
+    assert stress_test._next_tasks(queues, busy, free=5) == []  # a and b are still running
+    busy.discard("a")
+    assert stress_test._next_tasks(queues, busy, free=5) == [2]  # a's next, once its last finished
+    busy.clear()
+    assert stress_test._next_tasks(queues, busy, free=1) == [4]  # never more than the free workers
+
+
+def test_never_more_workers_than_models_and_one_worker_per_model(monkeypatch):
+    profiles = [("fast", _profile(period_granularity="ONE_DAY")), ("slow", _profile(period_granularity="ONE_DAY"))]
+    frictions = {name: FrictionModel(profile) for name, profile in profiles}
+    combos = stress_test.combinations(SCENARIOS, [], pairs=2, max_paths=2)
+    seen, progress = [], []
+    stress_test.run_stress(profiles, frictions, {("BTC-USD", "ONE_DAY"): _daily()}, combos, workers=6,
+                           compute_device="cpu", worker_status=seen.append,
+                           progress=lambda fraction, message: progress.append(message))
+    assert "on 2 workers" in progress[-1]  # 2 models: 2 workers, though 6 were allowed
+    for update in seen:
+        models = [row["doing"].split(":")[0] for row in update if row["doing"]]
+        assert len(models) == len(set(models))  # no model on two workers at once
+
+
+def test_synthetic_scenarios_run_a_task_per_model_per_path_on_workers():
+    profiles = [("fast", _profile(period_granularity="ONE_DAY")), ("slow", _profile(period_granularity="ONE_DAY"))]
+    frictions = {name: FrictionModel(profile) for name, profile in profiles}
+    markets = {("BTC-USD", "ONE_DAY"): _daily()}
+    scenarios = SCENARIOS[:2] + [{"name": "Too early", "type": "crash", "placement": "at", "at": "1990-01-01",
+                                  "drop": 0.3, "days": 5}]
+
+    serial, skipped = stress_test.run_scenarios(profiles, frictions, markets, scenarios)
+    parallel, _ = stress_test.run_scenarios(profiles, frictions, markets, scenarios, workers=2, compute_device="cpu")
+
+    paths = sum(synthetic.run_paths(run) for run in synthetic.runs(SCENARIOS[:2]))
+    assert len(serial) == 2 * paths
+    assert [r["model_name"] for r in parallel] == [r["model_name"] for r in serial]
+    assert [r["total_return"] for r in parallel] == [r["total_return"] for r in serial]
+    assert serial[0]["model_name"].startswith("fast | ") and "(alone)" not in serial[0]["model_name"]
+    assert {r["base_model"] for r in serial} == {"fast", "slow"} and "scenario_path" in serial[0]
+    assert len(skipped) == 1 and skipped[0].startswith("Too early: ")
+
+
+def test_workers_report_what_they_are_running(monkeypatch):
+    profiles = [("fast", _profile(period_granularity="ONE_DAY"))]
+    frictions = {name: FrictionModel(profile) for name, profile in profiles}
+    combos = stress_test.combinations(SCENARIOS, [], pairs=1, max_paths=1)
+    markets = {("BTC-USD", "ONE_DAY"): _daily()}
+    clock = iter(range(0, 10 ** 6))  # every update passes the quarter-second throttle
+    monkeypatch.setattr(stress_test.time, "monotonic", lambda: next(clock))
+    seen = []
+    stress_test.run_stress(profiles, frictions, markets, combos, worker_status=seen.append)
+    running = [row["doing"] for update in seen for row in update if row["doing"]]
+    assert {row["worker"] for update in seen for row in update} == {1}
+    assert "fast: real history" in running and any(d.startswith("fast: building") for d in running)
+    assert any(d.startswith("fast: ") and "(alone)" in d for d in running)
+    assert any(0 < row["fraction"] < 1 for update in seen for row in update)  # partway through a run
+    assert seen[-1][0]["doing"] is None  # idle at the end
+
+    seen = []  # worker processes: the updates come through a queue, a row per worker
+    stress_test.run_stress(profiles, frictions, markets, combos, workers=2, compute_device="cpu",
+                           worker_status=seen.append)
+    assert seen and {row["worker"] for row in seen[-1]} <= {1, 2}
+    assert all(row["doing"] is None for row in seen[-1])
+
+
 def test_verdicts_name_fragile_weak_robust_and_nightmare_outcomes():
     def record(value, nightmare=False):
         return {"return": value, "buy_and_hold": 0.0, "lost_money": value < 0, "beat_buy_and_hold": value > 0,

@@ -86,18 +86,21 @@ From top to bottom:
 
 ### Models
 
-Models are kept in one folder per currency, such as `config/DOGE-USD/` (see [config/README.md](../config/README.md)). The list shows every model in them, and any older profiles still at the top of `config/`, each named after its file with its currency beside it: `doge_b_130   (DOGE-USD)`.
+Models are kept in one folder per currency, such as `config/DOGE-USD/` (see [config/README.md](../config/README.md)). The models are listed in two lists, each named after its file with its currency beside it: `doge_b_130   (DOGE-USD)`.
 
-- **Currency**, above the list, shows one currency's models or all of them. Models you selected stay selected while the filter hides them.
-- Models a ranking moved to a currency's `discard/` folder aren't listed. Tick **Include discarded models** to list them too, after the others and marked `discarded`; you can then select and test them like any other.
-- Click to select one model. Ctrl-click or Shift-click to select several, or use **Select all**, which selects every model the list shows. Every selected model is tested in the same run.
+- **Available**, on the left, lists the models you haven't chosen. **Currency** (top right) narrows it to one currency, and **Search** to models whose names contain every word you type, such as `doge b`. Its count says how many it shows, such as `Available: 239 of 447`.
+- **Selected**, on the right, lists the models the next run tests, in the order you added them, whatever the currency filter shows.
+- **Add ›** moves the models highlighted in Available to the end of Selected; so does double-clicking one, or pressing **Enter**. Ctrl-click or Shift-click to highlight several. **Add all ››** moves every model Available shows, so filter or search first to add a whole group.
+- **‹ Remove** moves the models highlighted in Selected back to Available; so does double-clicking one, or pressing **Delete**. **‹‹ Remove all** empties Selected.
+- **Move up** and **Move down** change the order of the highlighted Selected models.
+- Models a ranking moved to a currency's `discard/` folder aren't listed. Tick **Include discarded models** to list them too, after the others and marked `discarded`; you can then add and test them like any other.
 - A **★** marks each currency's best model: the one with the highest full-history return the simulator has tested for that currency (see below).
-- When the window opens, each currency's ★ model is selected. Before any has been recorded, `btc_macro_horizon` is selected if it exists; otherwise the first model is.
-- **Add file...** adds profiles from anywhere on disk to the list and selects them, along with the models already selected.
-- **Refresh** picks up files added to or removed from `config/`, and keeps your selection. Files added with **Add file...** stay in the list while they still exist.
+- When the window opens, each currency's ★ model is in Selected. Before any has been recorded, `btc_macro_horizon` is if it exists; otherwise the first model is.
+- **Add file...** adds profiles from anywhere on disk and puts them in Selected.
+- **Refresh** picks up files added to or removed from `config/`, and keeps Selected as it is. Files added with **Add file...** stay in the list while they still exist.
 - If two files share a name, the second appears as `name (2)`.
 
-**Each currency's historically best models.** A **\u25b2** marks each currency's top models by full-history growth in the performance log (5 by default; set in **Test options...**). A row logged for an earlier version of a profile doesn't count. **Select top models** selects them, or only the chosen currency's when the Currency filter is set, so testing can focus on the strongest candidates.
+**Each currency's historically best models.** A **▲** marks each currency's top models by full-history growth in the performance log (5 by default; set in **Test options...**). A row logged for an earlier version of a profile doesn't count. **Select top models** puts them in Selected (replacing what was there), or only the chosen currency's when the Currency filter is set, so testing can focus on the strongest candidates.
 
 **Each currency's best model.** When a run finishes, the simulator finds the best model of each currency it tested, by return, and:
 
@@ -117,6 +120,7 @@ Models are kept in one folder per currency, such as `config/DOGE-USD/` (see [con
 | **Load Profile** | Validates every selected profile and writes a report to the **Metrics** tab, one section per profile headed `=== name ===`. With one profile selected, the report also shows the profile's JSON. A profile in the original fixed-EMA format gets a note that it was translated into indicators and rules. |
 | **Run Simulation** | Backtests every selected profile. The button is disabled while a run is in progress. |
 | **Test Coinbase Authentication** | Makes a read-only account request with your key and shows the full result in the **Metrics** tab. |
+| **Clear data...** | Opens a dialog to clear stored data; see [Clearing stored data](#clearing-stored-data). |
 
 Next to the buttons, the **Mode** button switches between running models at once and one after another. Click it to toggle:
 
@@ -125,7 +129,15 @@ Next to the buttons, the **Mode** button switches between running models at once
 
 To see what parallel mode saves, run the same models once in each mode and compare the **Time spent** lines under the progress bars (see [Progress](#progress)).
 
-In parallel mode, **Workers** sets how many models run at once. The default, `auto`, starts one worker process per CPU but two. One spare CPU keeps the window and the candle writer (the price history downloads) responsive, and the other runs the gatherer, which consolidates the results the workers return. On a 12-CPU computer that leaves 10 workers; on one or two CPUs it is still one worker. The hint beside the box shows that number for your computer. A number above it is lowered to it. At `1`, models run one after another, as in single-threaded mode. A run of a single model always runs on its own. See [Running models in parallel](#running-models-in-parallel).
+In parallel mode, **Workers** sets how many worker processes run at once. The rule is **one model, one set of data, one thread**:
+
+- Each worker runs one model on one set of data at a time (its real history, or one path of one scenario), on one thread: worker processes run numpy's maths libraries single-threaded. A history run is a task per model; a scenario or stress run is a task per model per scenario path.
+- A model is never worked on by two workers at once: in scenario and stress runs, a model's next path starts only when its last one has finished. So a run never uses more workers than it has models; 3 models use at most 3 workers, whatever the Workers box allows.
+- The default, `auto`, allows every CPU but two. Scenario and stress runs add one worker per GPU (see [Stress tests](#stress-tests)); history runs don't, as their indicators come from the candle store, so a GPU only adds load.
+
+Small runs can be slower in parallel than single-threaded: each worker takes about 3 s to start and to load its market's candles and stored indicators, which one process does once for every model. 20 daily DOGE models took 0.3 s single-threaded and 6.5 s on 12 workers; 20 BTC 15-minute models, 29 s and 18 to 24 s. Switch **Mode** to single-threaded for quick runs of daily models.
+
+A number typed in **Workers** is used as it is (still at most one worker per model). Of the CPUs, one spare CPU keeps the window and the candle writer (the price history downloads) responsive, and the other runs the gatherer, which consolidates the results the workers return. On a 12-CPU computer that leaves at most 10 workers; on one or two CPUs it is still one worker. The hint beside the box shows that number for your computer. A number above it is lowered to it. At `1`, models run one after another, as in single-threaded mode. A run of a single model always runs on its own. See [Running models in parallel](#running-models-in-parallel).
 
 ### Progress
 
@@ -190,7 +202,7 @@ History is one path the market happened to take. Synthetic scenarios test how mo
 **Test options...**, above the buttons, opens the options window; the line beside it shows the current choice.
 
 - **Data to test on**: **Historic data only** (as before), **Historic data plus synthetic scenarios**, or **Synthetic scenarios only**.
-- **Focus**: how many of each currency's historically best models to mark \u25b2 (see [Models](#models)).
+- **Focus**: how many of each currency's historically best models to mark ▲ (see [Models](#models)).
 - **Stress test**: see [Stress tests](#stress-tests) below.
 - **Synthetic scenarios**: the scenario set to use, from `scenarios/`, listed as **modules**. Select one to edit it on the right (fields the type doesn't use are greyed out) and click **Apply changes to the scenario**.
   - **Chains.** A module with **Continues the scenario above (chained)** ticked joins the run of the module above it: the run's modules play one after another as one continuous path, each starting where the one before ended, such as a crash, then three months of chop, then a calm rally. The **Run** column shows each module's run and step (`Run 3 · step 2 of 3`), and chained modules are shown in blue. **Chain to above** and **Unchain** do the same from the buttons. A run's placement (after history, or at a date) is its first module's.
@@ -206,13 +218,21 @@ With synthetic data, each selected model also runs on every path of every scenar
 - are measured from the scenario's first candle, with indicators warmed up on real history, so Return is the model's result through the scenario and Buy & hold is the market's;
 - are never recorded in the performance log or as a currency's best model: only historic results are.
 
-The **Scenarios** tab shows one row per model and one column per data source: the historic return, then each scenario's return (for several paths, the median with the worst path), the model's **Worst scenario**, and in how many scenario runs it **Beat buy & hold**. Rows are sorted by the worst scenario, so the most robust models come first. Synthetic runs go one after another, after any parallel historic run; resampled scenarios with many paths multiply the work.
+The **Scenarios** tab shows one row per model and one column per data source: the historic return, then each scenario's return (for several paths, the median with the worst path), the model's **Worst scenario**, and in how many scenario runs it **Beat buy & hold**. Rows are sorted by the worst scenario, so the most robust models come first. Synthetic runs come after the historic run. In parallel mode each model on each scenario path is its own task on the workers (and GPUs), shown in the **Workers** table; in single-threaded mode they go one after another. Resampled scenarios with many paths multiply the work.
+
+The **Scenario charts** tab gives every data set the run tested on a chart of its own. A data set is the real history, or one path of one scenario (or of one stress combination, alone or with history), for one market. On the left, the data sets are listed by market, such as `ETH-USD ONE_DAY`, then by scenario. A scenario with several paths is one row, with its paths under it, `path #1` to `path #20`. Each row shows how many models ran on it, the best model's return (for several paths: the median, with the worst path) and buying and holding through it.
+
+- Click a row to chart it. Clicking a scenario with paths charts its first path, and **Previous** and **Next** step through every data set and every path in order.
+- The chart shows each model's value on that data set against buying and holding through it, titled with the data set's name. A dashed line marks where a scenario starts. Hovering reads every model's value at that moment, as on the Model value tab.
+- Each model keeps one color on every data set's chart. There is no tax reserve panel here, so the value chart gets the whole height; the **Model value** tab still shows it.
 
 A scenario only tests what it describes. The calm-trend DOGE models, for example, stay in cash through the default crash, bear, pump and volatility scenarios (0% while the market falls up to 70%), and only trade in a calm rally: that shows both their protection and what they need to make money.
 
 ### Stress tests
 
 A stress test pushes the selected models through a fixed set of scenario combinations, to find their limits. Choose **Stress test** in **Test options...**, select the models to test (for example with **Select top models**), and click **Run Simulation**. Each model is run on its real history alone, as its **baseline**, then on every combination of the **stress test plan**, twice: **alone**, measured from the scenario's first candle, and **with history**, over the whole real history with the scenario appended, which shows whether a scenario wipes out the model's historic gains. Resampled scenarios contribute up to the number of paths set in the Stress test line.
+
+**Speed.** In parallel mode (the **Mode** button), the stress test shares its runs out to worker processes: the **Workers** count (auto uses every CPU but two), plus one more per NVIDIA GPU when CuPy is installed (see `requirements-gpu.txt`), but at most one per model. Each model's run on its real history, and each model on each path of each combination, is its own task (the latter alone and with history, on candles the task builds itself). Each worker runs one task at a time, and a model's next task starts only when its last one has finished, so no model is ever on two workers at once (see the rule under [Buttons](#buttons)). Unlike history runs, stress tests gain a lot from the GPUs: every scenario path recomputes its indicators, and the GPUs do the moving averages, with the same results to the last digit. Three models (BTC 15-minute, SOL hourly, ETH daily) on 6 combinations, 36 runs, took 121 s single-threaded and 36 s on 3 workers (one per model) with the two GPUs. The progress line counts the runs and names the workers and GPUs. While it runs, a **Workers** table under **Time spent** shows a row per worker: what it is running, such as `eth_growth_02: Nightmare: death spiral, -95% over 2 years #3 (with history) [GPU 1]` or `eth_growth_02: building ...` while it makes a scenario's candles, and a bar for how far through that run it is (`idle` between tasks). It updates a few times a second and disappears when the test ends; a single-threaded stress test shows one worker. Only the moving-average indicators (SMA, EMA, WMA, DEMA, TEMA, HMA) run on a GPU; the trading simulation itself always runs on the CPUs, so the GPUs show short bursts rather than steady use. In single-threaded mode, everything runs one after another, as before; the report is the same either way. Each worker holds a copy of the tested markets' history, so many workers on 15-minute markets need several GB of memory.
 
 **The stress test plan** is the list of combinations, kept in `scenarios/stress_plan.json` and edited on the **Stress test plan** tab of Test options. The first time, it is the built-in baseline: every built-in scenario run and nightmare on its own, plus 20 fixed pairs (one straight after the other), 33 combinations in all. Every stress test runs the same plan until you change it, so results are comparable from run to run. On the tab:
 
@@ -242,7 +262,7 @@ Verdicts: **Fragile** when the worst run lost half or more; **Weak** when more t
 
 ### Running models in parallel
 
-In parallel mode with **Workers** at `auto` or above 1, or from the command line, models are backtested at the same time on separate worker processes. CUDA is selected automatically when a usable GPU is available; one GPU-backed worker slot per visible CUDA device is added to the CPU worker capacity. Each run gives every shared file a single writer, so runs never collide:
+In parallel mode with **Workers** above 1 (or at `auto` on a run big enough; see above), or from the command line, models are backtested at the same time on separate worker processes. From the command line, CUDA is selected automatically when a usable GPU is available, and one GPU-backed worker slot per visible CUDA device is added to the CPU worker capacity; the simulator's history runs use the CPUs only. Each run gives every shared file a single writer, so runs never collide:
 
 | Role | How many | Reads | Writes |
 |---|---|---|---|
@@ -290,11 +310,32 @@ data/candles.db
 - **The first run** for a product and candle size downloads everything, in requests of up to 350 candles with a 0.1 second pause between them.
 - **Later runs** load the cache and fetch only candles that have closed since the last run. New candles are added to the table, and candles already in it are never rewritten. The **Data gathering** bar says which happened: `candles loaded from cache`, `candles downloaded`, or a count of each.
 - **Candles are kept as they traded.** Nothing is removed or smoothed, including flash crashes and prints that look like errors.
-- **To force a fresh download**, delete `data/candles.db`. Deleting it also discards every stored metric.
+- **To force a fresh download**, clear the market with **Clear data...** (see [Clearing stored data](#clearing-stored-data)), or close the simulator and delete `data/candles.db`. Either way its stored metrics go too.
 - **A CSV cache from an earlier version** (`data/BTC-USD_FIFTEEN_MINUTE.csv` with its `.meta.json`) is imported into the database the first time it is needed, which takes a couple of seconds. After that, the CSV files are not read, and you can delete them.
 - `data/` is ignored by Git. It also holds `model_performance.csv`, the [model performance log](#model-performance-log).
 
 Ten years of 15-minute BTC-USD candles take about 19 MB, and load in about half a second. To inspect the candles and stored metrics, open `candles.db` in any SQLite browser, such as DB Browser for SQLite.
+
+### Synthetic candles
+
+Synthetic candles are kept apart from the price history, in a database of their own: `data/synthetic/synthetic.db`. `data/candles.db` only ever holds candles downloaded from Coinbase, and its indicator columns only values computed on them.
+
+- Every scenario path a synthetic or stress run builds is stored in its own table, `<product>_<candle size>__<key>_p<path>`, such as `BTC-USD_FIFTEEN_MINUTE__39244a87ce73_p0`. The key is a hash of the run's scenario modules and of the history it was built on.
+- A table holds only the candles the run made or changed: for a run appended after history, its own candles; for one written in at a date, every candle from that date on (the ones after the run are the real history, shifted to continue from where the run ended). The history before them is the real one, so it isn't copied.
+- `synthetic_runs` describes every table: the product and candle size, the run's name and path, its modules as JSON, the history it was built on (first and last candle, and how many), the candles stored and when.
+- Building is seeded, so the same run on the same history makes the same candles; a table already stored is left as it is. A run on newer history gets a new table.
+- Synthetic candles are marked as such while they are tested. The candle store refuses to save them, and they never use the stored indicator columns, which share the real candles' start times; their indicators are computed in memory.
+- Clear them with **Clear data...**, or delete `data/synthetic/` while the simulator is closed, to free the space; nothing reads them back.
+
+### Clearing stored data
+
+**Clear data...** (beside **Test Coinbase Authentication**) opens a dialog listing the price history one market per row: the product, candle size, number of candles, the dates they run from and to, and how many indicator columns are stored with them. Below the list are the totals and the database's size on disk.
+
+- **Clear selected markets** deletes the highlighted markets' candles and stored indicators (Ctrl-click or Shift-click to highlight several). **Clear all price history** deletes every market's.
+- **Clear synthetic candles** deletes every stored scenario path (see [Synthetic candles](#synthetic-candles)).
+- Each asks first, naming what it deletes; **No** keeps everything. Nothing is cleared while a simulation is running.
+- A cleared market is downloaded again from Coinbase by the next run that needs it: ten years of 15-minute candles take several minutes. A CSV cache an earlier version left for it (`data/<market>.csv` with its `.meta.json`) is deleted too, so the fresh download isn't replaced by the old file.
+- The database is compacted afterwards, giving the space back. Model profiles, the performance log and stress reports are never touched.
 
 ### Stored metrics
 
@@ -336,17 +377,17 @@ All times are in UTC.
 
 ### Comparison
 
-The Comparison tab has one row per model, sorted by return with the best first. A line above the table gives the number of models and the best one, and, with a start date, when the test started. Click a column heading to sort by it, and click again to reverse. Number columns sort largest first, and text columns A to Z. The table scrolls sideways and up and down.
+The Comparison tab has one row per model, sorted by return with the best first. A line above the table gives the number of models and the best one, and, with a start date, when the test started. The table scrolls sideways and up and down.
 
-**Filters.** Under each column heading is a filter box. Rows must pass every filter you fill in, and the line above the table counts them, such as `Showing 12 of 300 models`; **Clear filters** empties every box. Sorting keeps the filters.
+**Sorting and filtering, as in Excel.** Every heading shows a ▾; click it to open its drop-down:
 
-| Column | Type | Example |
-|---|---|---|
-| Numbers (Start, End, Trades, Fees, Taxes, Flash buys, Blocked signals) | a comparison: `>`, `>=`, `<`, `<=`, `=` or `!=`, a range `low..high` (inclusive, either end optional), or several separated by spaces, all of which must hold | `>=12`, `10..20`, `>5 <50` |
-| Percentages (Return, Buy & hold, vs Buy & hold, Max drawdown, Worst in window, Win rate) | the same, in percent as shown | `>100` for more than +100%, `<40` for a drawdown under 40% |
-| Text and dates (Model, Product, Candles, First buy, B&H start) | any part of the text, ignoring case | `doge_b`, `SIX_HOUR`, `2024` |
+- **Sort smallest to largest** / **Sort largest to smallest** (for text columns, **Sort A to Z** / **Sort Z to A**) sorts the table by the column.
+- **Number filter** (number columns only): pick **greater than**, **at least**, **less than**, **at most**, **equals** or **between** and type the number, or both numbers for between. Percent columns (Return, Buy & hold, vs Buy & hold, Max drawdown, Worst in window, Win rate) take the number in percent, as shown: greater than `100` keeps returns above +100%.
+- **The checklist** lists the column's values, smallest first or A to Z, as shown in the table, all checked. Untick values to hide their rows, or untick **(Select All)** and tick the few to keep. It offers only the values left by the other columns' filters.
+- **Search** narrows the checklist to values containing every word typed; with a search, **OK** keeps only the checked values the search shows, as in Excel.
+- **OK** applies the drop-down (**Enter** too); **Cancel** (or **Esc**) leaves the column as it was; **Clear filter from "<column>"** removes its filter.
 
-A number filter that isn't a number, such as `>abc`, matches nothing.
+A filtered column's heading shows `[Name] ▼`. Rows must pass every column's filter; the line above the table counts them, such as `Showing 12 of 300 models`, and **Clear all filters** removes every filter. Sorting keeps the filters.
 
 To chart some of the models, select their rows (Ctrl-click or Shift-click for several) and click **Chart selected models** above the table, or press **Enter**. The charts then show only those models (see [Showing model](#showing-model)), with the selected row highest in the table on show. With several models selected, the **Model value** tab opens; with one, the **Chart** tab. Rows not in the charts' view are shown in gray. Double-click a model to open its chart; a gray model is added to the view.
 

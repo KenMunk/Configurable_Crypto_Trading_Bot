@@ -459,17 +459,25 @@ class BacktestChart(_HoverChart):
 
 
 class ModelValueChart(_HoverChart):
-    """Portfolio value over time for one or more models, against buying and holding."""
+    """Portfolio value over time for one or more models, against buying and holding.
+
+    Set `tax_panel` False to leave out the tax reserve panel and give the value chart the height.
+    """
+
+    tax_panel = True
 
     def _panel_count(self, result):
-        return 1
+        return 1 if self.tax_panel else 0
 
-    def show(self, result, primary=0, slots=None):
+    def show(self, result, primary=0, slots=None, heading=None, marks=(), legend_location=None):
         """Plot one backtest result, or a list of them to compare models on one chart.
 
         With several results, `primary` picks the one the hover dot follows and that is
         drawn slightly heavier. Colors are tied to each model's position in the list, or to
         its entry in `slots`, so a model keeps its color when only some models are shown.
+        `heading` replaces the chart's title; `marks` are (unix time, label) moments drawn as
+        dashed vertical lines, such as where a scenario starts. `legend_location` overrides where the
+        legend goes (a matplotlib location such as "best").
         """
         self._shown = (result, primary, slots)
         runs = result if isinstance(result, list) else [result]
@@ -522,6 +530,8 @@ class ModelValueChart(_HoverChart):
             # Every model's ending value gets a marker; a single model also gets text labels.
             ax.plot([self.run_times[position][-1]], [values[-1]], marker="o", markersize=8, color=color,
                     markeredgecolor=SURFACE, markeredgewidth=2, zorder=5, label="_nolegend_")
+            if not self.tax_panel:
+                continue
             tax_label = ("Tax reserve" if single else run.get("model_name", f"Model {position + 1}"))
             tax_label += f" ({_quote_currency(run)})"
             self.axes[1].plot(
@@ -530,17 +540,23 @@ class ModelValueChart(_HoverChart):
                 linewidth=LINE_WIDTH if position == primary else 1.2, label=tax_label,
             )
 
+        for moment, mark_label in marks:
+            for panel in self.axes:
+                panel.axvline(np.datetime64(int(moment), "s"), color=SECONDARY_INK, linestyle=(0, (4, 3)),
+                              linewidth=1, zorder=2, label=mark_label if panel is ax else "_nolegend_")
+
         primary_run = runs[primary]
         self.model_values = self.run_values[primary]
         self.tax_reserve_values = self.run_tax_reserves[primary]
-        self.tax_reserve_ax = self.axes[1]
-        tax_currencies = {_quote_currency(run) for run in runs}
-        tax_axis_label = (f"Tax reserve ({next(iter(tax_currencies))})" if len(tax_currencies) == 1
-                          else "Tax reserve (mixed quote currencies)")
-        self.tax_reserve_ax.set_ylabel(tax_axis_label,
-                                       color=SECONDARY_INK, fontsize=9)
-        self.tax_reserve_ax.set_ylim(bottom=0)
-        self.tax_reserve_ax.legend(loc="upper left", frameon=False, fontsize=8, ncols=2)
+        self.tax_reserve_ax = self.axes[1] if self.tax_panel else None
+        if self.tax_panel:
+            tax_currencies = {_quote_currency(run) for run in runs}
+            tax_axis_label = (f"Tax reserve ({next(iter(tax_currencies))})" if len(tax_currencies) == 1
+                              else "Tax reserve (mixed quote currencies)")
+            self.tax_reserve_ax.set_ylabel(tax_axis_label,
+                                           color=SECONDARY_INK, fontsize=9)
+            self.tax_reserve_ax.set_ylim(bottom=0)
+            self.tax_reserve_ax.legend(loc="upper left", frameon=False, fontsize=8, ncols=2)
         self.benchmark_values = self.benchmarks[(primary_run["product_id"], primary_run["starting_capital"])][1]
         capitals = {run["starting_capital"] for run in runs}
         start_value = self.model_values[0]
@@ -565,14 +581,14 @@ class ModelValueChart(_HoverChart):
                         f"{best.get('model_name', 'model')} {best['total_return']:+.2%}")
 
         self._finish(
-            title=title,
+            title=heading or title,
             subtitle=subtitle,
             ylabel=f"Value ({_quote_currency(primary_run)}, log scale)",
             hover_values=self.model_values,
             hover_color=MODEL_COLORS[slots[primary] % len(MODEL_COLORS)],
             legend_columns=2,
             # Several model lines fill the top of the chart; the lower right stays clear.
-            legend_location="upper left" if single else "lower right",
+            legend_location=legend_location or ("upper left" if single else "lower right"),
         )
 
     def tooltip_text(self, index):

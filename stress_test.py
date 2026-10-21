@@ -22,6 +22,8 @@ import io
 import json
 import itertools
 import math
+import os
+import time
 import random
 from datetime import datetime, timezone
 from pathlib import Path
@@ -53,9 +55,10 @@ NIGHTMARES = [
 MODES = ("alone", "with history")
 
 
-def load_nightmares(path=NIGHTMARE_SET):
+def load_nightmares(path=None):
     """The nightmare scenario set; written with the five built-in nightmares the first time."""
-    if not Path(path).exists():
+    path = Path(path or NIGHTMARE_SET)
+    if not path.exists():
         synthetic.save_set(NIGHTMARES, path)
     return synthetic.load_set(path)
 
@@ -148,57 +151,321 @@ def _record(model, product, granularity, label, mode, path, nightmare, result):
     }
 
 
+CHART_POINTS = 5000  # the most candles of a stress result's series kept for the simulator's charts
+
+_histories = {}  # this process's real candles for each market, {(product, granularity): candles}
+_status = []  # this process's [queue] for what it is running (see _say), when the caller asked
+
+
+def _say(doing, fraction=0.0):
+    """Tell the caller what this process is running and how far through it is (None: between tasks)."""
+    if _status:
+        _status[0].put((os.getpid(), doing, fraction))
+
+
+def _watch(doing):
+    """A run_backtest progress callback that passes every 5% on to _say."""
+    _say(doing, 0.0)
+    last = [0]
+
+    def progress(fraction, message):
+        step = int(fraction * 20)
+        if step != last[0]:
+            last[0] = step
+            _say(doing, fraction)
+    return progress
+
+
+def _gpu(device):
+    return f" [GPU {device[1]}]" if device[0] == "cuda" else ""
+
+
+def _trim(result):
+    """Keep the last CHART_POINTS of each series, as copies, so the full-length arrays can be freed."""
+    series = result["series"]
+    for key, values in list(series.items()):
+        if key == "indicators":
+            series[key] = {name: list(v[-CHART_POINTS:]) for name, v in values.items()}
+        else:
+            series[key] = list(values[-CHART_POINTS:])
+    return result
+
+
+def _baseline_task(market, name, profile, friction, wait, device):
+    """The model on its market's real history: (record, result)."""
+    from backtest import run_backtest
+    from candle_store import MarketCandles
+    product, granularity, _ = market
+    history = _histories[(product, granularity)]
+    candles = history if hasattr(history, "metrics") else MarketCandles(history, synthetic.MemoryMetrics())
+    result = run_backtest(candles, profile, friction=friction, wait_for_fresh_signal=wait,
+                          compute_device=device[0], device_id=device[1],
+                          progress=_watch(f"{name}: real history{_gpu(device)}"))
+    _say(None)
+    record = _record(name, product, granularity, "Historic baseline", "history", 0, False, result)
+    result.update(model_name=name, granularity=granularity, base_model=name, data_source="Historic")
+    return record, result  # the whole history, as the simulator charts real runs
+
+
+def _combo_task(market, label, run, nightmare, path, paths, name, profile, friction, modes, wait, style,
+                synthetic_dir, device):
+    """One model on one path of one combination, in every mode: [(record, result)], or the
+    synthetic.ScenarioError's message when the scenario doesn't fit the history.
+
+    With `style` "stress", results are named "<model> | <run> (<mode>)" and trimmed to CHART_POINTS;
+    with "scenario" (the simulator's synthetic data), "<model> | <run>", whole, as before stress tests.
+    With `synthetic_dir`, the run's candles are kept in its synthetic.SyntheticStore, apart from the history.
+    """
+    from backtest import run_backtest
+    product, granularity, seconds = market
+    name_of_run = label + (f" #{path + 1}" if paths > 1 else "")
+    _say(f"{name}: building {name_of_run}{_gpu(device)}")
+    try:
+        store = synthetic.SyntheticStore(synthetic_dir) if synthetic_dir is not None else None
+        candles, start = synthetic.market_candles(list(_histories[(product, granularity)]), run, seconds, path,
+                                                  store=store, market=(product, granularity))
+    except synthetic.ScenarioError as exc:
+        _say(None)
+        return str(exc)
+    done = []
+    for mode in modes:
+        shown = f" ({mode})" if style == "stress" else ""
+        result = run_backtest(candles, profile, friction=friction,
+                              start_time=start if mode == "alone" else None, wait_for_fresh_signal=wait,
+                              compute_device=device[0], device_id=device[1],
+                              progress=_watch(f"{name}: {name_of_run}{shown}{_gpu(device)}"))
+        record = _record(name, product, granularity, name_of_run, mode, path, nightmare, result)
+        if style == "stress":
+            result.update(model_name=f"{name} | {name_of_run} ({mode})", granularity=granularity,
+                          base_model=name, data_source=f"{label} ({mode})", scenario_path=path,
+                          scenario_start=start)
+            result = _trim(result)
+        else:
+            result.update(model_name=f"{name} | {name_of_run}", granularity=granularity, base_model=name,
+                          data_source=label, scenario_path=path, scenario_start=start)
+        done.append((record, result))
+    _say(None)
+    return done
+
+
+def _start_worker(histories, status=None):
+    _histories.clear()
+    _histories.update(histories)
+    _status[:] = [status] if status is not None else []
+
+
+class _Direct:
+    """A stand-in for the status queue when the runs share the caller's thread."""
+
+    def __init__(self, handle):
+        self.put = handle
+
+
+def _tasks(models, frictions, combos, modes, wait, compute_device="cpu", gpu_devices=(), baseline=True,
+           style="stress", synthetic_dir=None):
+    """[(function, args, runs it makes)] in report order: for each market, its models' baselines (with
+    `baseline`), then for every path of every combination, a task per model.
+
+    Tasks take turns on the GPUs, when there are any.
+    """
+    from backtest import resolve_granularity
+    by_market = {}
+    for name, profile in models:
+        granularity, seconds = resolve_granularity(profile.get("period_granularity", "FIFTEEN_MINUTE"))
+        by_market.setdefault((profile["product_id"], granularity, seconds), []).append((name, profile))
+    tasks = []
+    for market, members in by_market.items():
+        for name, profile in members if baseline else ():
+            tasks.append((_baseline_task, [market, name, profile, frictions[name], wait], 1))
+        for label, run, nightmare, paths in combos:
+            for path in range(paths):
+                for name, profile in members:
+                    tasks.append((_combo_task, [market, label, run, nightmare, path, paths, name, profile,
+                                                frictions[name], modes, wait, style, synthetic_dir],
+                                  len(modes)))
+    for number, (_, args, _) in enumerate(tasks):
+        args.append((compute_device, gpu_devices[number % len(gpu_devices)]) if gpu_devices else ("cpu", 0))
+    return tasks
+
+
+def _model_of(task):
+    """The model a task runs."""
+    function, args, _ = task
+    return args[1] if function is _baseline_task else args[6]
+
+
+def _next_tasks(queues, busy, free):
+    """Up to `free` task numbers to start: the next task of each model not `busy`, taking the models in
+    turn. `queues` maps each model to its task numbers still to run, in order, and is consumed."""
+    chosen = []
+    for model, queue in queues.items():
+        if len(chosen) == free:
+            break
+        if queue and model not in busy:
+            chosen.append(queue.pop(0))
+            busy.add(model)
+    return chosen
+
+
+def _describe(task):
+    function, args, _ = task
+    if function is _baseline_task:
+        return f"{args[1]}: history"
+    return f"{args[6]}: {args[1]}" + (f" #{args[4] + 1}" if args[5] > 1 else "")
+
+
 def run_stress(models, frictions, candles_by_market, combos, modes=MODES, wait_for_fresh_signal=False,
-               progress=None, stop=None):
+               progress=None, stop=None, workers=1, compute_device="cpu", worker_status=None, synthetic_dir=None):
     """Run every model through every combination and mode. Returns (records, baselines, results).
 
     `models` are (name, profile); `candles_by_market` maps (product, granularity) to history.
     `progress(fraction, message)` reports; `stop()` returning True ends early. `results` are the
-    backtest results (charted series trimmed) for the simulator's tables and charts.
+    backtest results (series trimmed to CHART_POINTS) for the simulator's tables and charts.
+
+    Each model's run on its real history, and on each path of each combination (in every mode),
+    is one task. With `workers` above 1, the tasks are shared out to that many worker processes,
+    plus one per GPU when `compute_device` is "auto" or "cuda" and CUDA devices are visible
+    (supported indicators are then computed on the GPUs), but never more than there are models:
+    each worker runs one task at a time on one thread, and a model's tasks run one after another,
+    never on two workers at once. The records come back in the same order either way.
+
+    `worker_status(rows)`, when given, is called as the workers' activity changes (at most four
+    times a second): one row per worker, {"worker": 1.., "doing": what it is running, or None
+    between tasks, "fraction": how far through that run}.
+
+    With `synthetic_dir` (such as synthetic.SYNTHETIC_DIR), every scenario path's candles are kept
+    in that folder's synthetic.SyntheticStore, apart from the real history.
     """
-    from backtest import resolve_granularity, run_backtest
-    total = len(models) * (1 + sum(paths for *_, paths in combos) * len(modes))
-    done, records, baselines, results = 0, [], {}, []
-    by_market = {}
-    for name, profile in models:
-        granularity, _ = resolve_granularity(profile.get("period_granularity", "FIFTEEN_MINUTE"))
-        by_market.setdefault((profile["product_id"], granularity), []).append((name, profile))
-    for (product, granularity), members in by_market.items():
-        _, seconds = resolve_granularity(granularity)
-        history = candles_by_market[(product, granularity)]
-        for name, profile in members:
-            result = run_backtest(history, profile, friction=frictions[name], wait_for_fresh_signal=wait_for_fresh_signal)
-            baselines[name] = _record(name, product, granularity, "Historic baseline", "history", 0, False, result)
-            result.update(model_name=name, granularity=granularity, base_model=name, data_source="Historic")
-            results.append(result)
-            done += 1
-        for label, run, nightmare, paths in combos:
-            for path in range(paths):
-                if stop is not None and stop():
-                    return records, baselines, results
-                try:
-                    candles, start = synthetic.market_candles(list(history), run, seconds, path)
-                except synthetic.ScenarioError:
-                    done += len(members) * len(modes)
-                    continue
-                name_of_run = label + (f" #{path + 1}" if paths > 1 else "")
-                for name, profile in members:
-                    for mode in modes:
-                        result = run_backtest(candles, profile, friction=frictions[name],
-                                              start_time=start if mode == "alone" else None,
-                                              wait_for_fresh_signal=wait_for_fresh_signal)
-                        records.append(_record(name, product, granularity, name_of_run, mode, path, nightmare, result))
-                        result.update(model_name=f"{name} | {name_of_run} ({mode})", granularity=granularity,
-                                      base_model=name, data_source=f"{label} ({mode})")
-                        for key in ("time", "close", "equity"):
-                            result["series"][key] = result["series"][key][-5000:]
-                        result["series"]["indicators"] = {k: v[-5000:] for k, v in
-                                                          result["series"]["indicators"].items()}
-                        results.append(result)
-                        done += 1
-                        if progress is not None:
-                            progress(done / total, f"{done} of {total} stress runs ({name}: {name_of_run}, {mode})")
+    records, baselines, results, _ = _run(models, frictions, candles_by_market, combos, modes,
+                                          wait_for_fresh_signal, progress, stop, workers, compute_device,
+                                          worker_status, baseline=True, style="stress", synthetic_dir=synthetic_dir)
     return records, baselines, results
+
+
+def run_scenarios(models, frictions, candles_by_market, scenarios, wait_for_fresh_signal=False, progress=None,
+                  stop=None, workers=1, compute_device="cpu", worker_status=None, synthetic_dir=None):
+    """The simulator's synthetic data: every model on every path of every run of `scenarios` (a scenario set;
+    chained modules make one run, see synthetic.runs), measured from the run's first candle.
+
+    Returns (results, skipped): results named "<model> | <run>" (" #n" for a run's paths), and
+    "<run>: <reason>" for each run that doesn't fit a market's history. A task per model per path;
+    `workers` and the rest as for run_stress.
+    """
+    combos = [(synthetic.run_label(run), run, False, synthetic.run_paths(run)) for run in synthetic.runs(list(scenarios))]
+    _, _, results, skipped = _run(models, frictions, candles_by_market, combos, ("alone",), wait_for_fresh_signal,
+                                  progress, stop, workers, compute_device, worker_status, baseline=False,
+                                  style="scenario", synthetic_dir=synthetic_dir)
+    return results, skipped
+
+
+def _run(models, frictions, candles_by_market, combos, modes, wait_for_fresh_signal, progress, stop, workers,
+         compute_device, worker_status, baseline, style, synthetic_dir=None):
+    """run_stress and run_scenarios: (records, baselines, results, skipped)."""
+    gpu_devices = []
+    if workers > 1:
+        from parallel_backtest import resolve_compute_device
+        compute_device, gpu_devices = resolve_compute_device(compute_device)
+    else:
+        compute_device = "cpu"
+    tasks = _tasks(models, frictions, combos, modes, wait_for_fresh_signal, compute_device, gpu_devices,
+                   baseline, style, synthetic_dir)
+    # A worker per model at most: a model's tasks run one after another, never on two workers at once.
+    models_count = len({_model_of(task) for task in tasks})
+    workers = max(1, min(len(tasks), models_count, workers + len(gpu_devices) if workers > 1 else 1))
+    total = sum(runs for *_, runs in tasks)
+    where = (f" on {workers} workers" + (f" (GPUs {gpu_devices})" if gpu_devices else "")) if workers > 1 else ""
+    replies, done = [None] * len(tasks), 0
+    slots, rows, shown = {}, [], [0.0]  # worker pid -> row, the rows, when they were last passed on
+
+    def note(pid, doing, fraction):
+        if pid not in slots:
+            slots[pid] = len(rows)
+            rows.append({"worker": len(rows) + 1, "doing": None, "fraction": 0.0})
+        rows[slots[pid]].update(doing=doing, fraction=fraction)
+
+    def report(status, force=False):
+        if worker_status is None:
+            return
+        while status is not None:
+            try:
+                note(*status.get_nowait())
+            except Exception:  # queue.Empty, from either kind of queue
+                break
+        if force or time.monotonic() - shown[0] >= 0.25:
+            shown[0] = time.monotonic()
+            worker_status([dict(row) for row in rows])
+
+    def finished(number, reply):
+        nonlocal done
+        replies[number] = reply
+        done += tasks[number][2]
+        if progress is not None:
+            kind = "stress" if style == "stress" else "scenario"
+            progress(done / max(total, 1), f"{done} of {total} {kind} runs{where} ({_describe(tasks[number])})")
+
+    if workers == 1:
+        direct = None if worker_status is None else _Direct(lambda event: (note(*event), report(None)))
+        _start_worker(candles_by_market, direct)
+        try:
+            for number, (function, args, _) in enumerate(tasks):
+                if stop is not None and stop():
+                    break
+                finished(number, function(*args))
+        finally:
+            _start_worker({})
+    else:
+        import multiprocessing as mp
+        from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
+        from parallel_backtest import single_threaded_children
+        single_threaded_children()
+        # Plain candles: the real ones carry the market's database-backed indicator cache.
+        histories = {key: [dict(candle) for candle in candles] for key, candles in candles_by_market.items()
+                     if any(args[0][:2] == key for _, args, _ in tasks)}
+        context = mp.get_context("spawn")
+        status = context.Queue() if worker_status is not None else None
+        with ProcessPoolExecutor(max_workers=workers, mp_context=context,
+                                 initializer=_start_worker, initargs=(histories, status)) as pool:
+            # One task per worker and per model at a time: a model's next task starts when its last ends.
+            queues, busy, pending = {}, set(), {}
+            for number, task in enumerate(tasks):
+                queues.setdefault(_model_of(task), []).append(number)
+
+            def start_more():
+                for number in _next_tasks(queues, busy, workers - len(pending)):
+                    function, args, _ = tasks[number]
+                    pending[pool.submit(function, *args)] = number
+
+            start_more()
+            while pending:
+                if stop is not None and stop():
+                    for future in pending:
+                        future.cancel()
+                    break
+                ready, _ = wait(pending, timeout=0.25, return_when=FIRST_COMPLETED)
+                for future in ready:
+                    number = pending.pop(future)
+                    busy.discard(_model_of(tasks[number]))
+                    finished(number, future.result())
+                start_more()
+                report(status)
+        report(status, force=True)
+
+    records, baselines, results, skipped = [], {}, [], []
+    for (function, args, _), reply in zip(tasks, replies):
+        if reply is None:
+            continue
+        if isinstance(reply, str):  # the scenario doesn't fit this market's history
+            note = f"{args[1]}" + (f" #{args[4] + 1}" if args[5] > 1 else "") + f": {reply}"
+            if note not in skipped:
+                skipped.append(note)
+            continue
+        if function is _baseline_task:
+            baselines[args[1]] = reply[0]
+            results.append(reply[1])
+        else:
+            records.extend(record for record, _ in reply)
+            results.extend(result for _, result in reply)
+    return records, baselines, results, skipped
 
 
 # --- reports ------------------------------------------------------------------------------

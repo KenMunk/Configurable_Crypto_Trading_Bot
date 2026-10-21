@@ -32,8 +32,11 @@ same scenario and seed always give the same candles. Each scenario is measured f
 candle (`start_time`), with indicators warmed up on the real history before it.
 """
 
+import hashlib
 import json
 import math
+import sqlite3
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -358,11 +361,137 @@ class MemoryMetrics:
         return self._caches[key]
 
 
-def market_candles(candles, run, granularity_seconds, path=0):
-    """build(), with the candles carrying their own in-memory indicator cache (see MemoryMetrics)."""
-    from candle_store import MarketCandles
+def market_candles(candles, run, granularity_seconds, path=0, store=None, market=None):
+    """build(), as SyntheticCandles with their own in-memory indicator cache (see MemoryMetrics).
+
+    With a SyntheticStore `store` and `market` (product, granularity), the candles the run made
+    or changed are also kept there, in their own table (see SyntheticStore).
+    """
     built, start = build(candles, run, granularity_seconds, path)
-    return MarketCandles(built, MemoryMetrics()), start
+    if store is not None:
+        first = next(index for index, candle in enumerate(built) if candle["start"] >= start)
+        store.save(*market, run, path, candles, built[first:])
+    return SyntheticCandles(built, MemoryMetrics()), start
+
+
+def _synthetic_candles_class():
+    from candle_store import MarketCandles
+
+    class SyntheticCandles(MarketCandles):
+        """Candles with a scenario in them. They carry an in-memory indicator cache, and the real
+        market's store refuses them (see candle_store.MarketMetrics.cache and CandleStore.save)."""
+        synthetic = True
+
+    return SyntheticCandles
+
+
+SyntheticCandles = _synthetic_candles_class()
+
+SYNTHETIC_DIR = Path(__file__).parent / "data" / "synthetic"
+SYNTHETIC_DATABASE = "synthetic.db"
+CANDLE_COLUMNS = ("start", "open", "high", "low", "close", "volume")
+RUNS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS synthetic_runs (
+    table_name TEXT PRIMARY KEY,
+    product_id TEXT, granularity TEXT, run_label TEXT, path INTEGER,
+    modules TEXT,             -- the run's scenario modules, as JSON
+    history_from INTEGER,     -- the real history it was built on: first and last candle start,
+    history_through INTEGER,  -- and how many candles
+    history_candles INTEGER,
+    first_start INTEGER, candles INTEGER,  -- the candles stored: those the run made or changed
+    created TEXT
+);
+"""
+
+
+class SyntheticStore:
+    """The candles scenario runs make, kept apart from the real history: a separate database,
+    data/synthetic/synthetic.db, never the price history's data/candles.db.
+
+    Each market, run and path has its own table, named "<product>_<granularity>__<key>_p<path>",
+    where the key is a hash of the run's modules and of the history it was built on; the table
+    holds the candles the run made, or changed (for a run written in at a date, from there to
+    the end). synthetic_runs describes every table. Building is seeded, so the same run on the
+    same history makes the same candles, and a table already stored is left as it is.
+    """
+
+    def __init__(self, folder=None):
+        self.folder = Path(folder if folder is not None else SYNTHETIC_DIR)
+        self.path = self.folder / SYNTHETIC_DATABASE
+
+    def _connect(self):
+        from candle_store import BUSY_TIMEOUT_SECONDS, use_wal
+        self.folder.mkdir(parents=True, exist_ok=True)
+        connection = sqlite3.connect(self.path, timeout=BUSY_TIMEOUT_SECONDS)
+        use_wal(connection)
+        connection.executescript(RUNS_SCHEMA)
+        return connection
+
+    @staticmethod
+    def table_name(product_id, granularity, run, path, history):
+        modules = [normalize(module) for module in (run if isinstance(run, list) else [run])]
+        fingerprint = json.dumps([modules, path, len(history), history[0]["start"], history[-1]["start"],
+                                  history[-1]["close"]], sort_keys=True, default=str)
+        key = hashlib.sha1(fingerprint.encode("utf-8")).hexdigest()[:12]
+        return f"{product_id}_{granularity}__{key}_p{path}"
+
+    def save(self, product_id, granularity, run, path, history, candles):
+        """Keep `candles` (the run's own) in the run's table, unless it is stored already; returns the table."""
+        table = self.table_name(product_id, granularity, run, path, history)
+        quoted = '"' + table.replace('"', '""') + '"'
+        modules = [normalize(module) for module in (run if isinstance(run, list) else [run])]
+        connection = self._connect()
+        try:
+            with connection:
+                if connection.execute("SELECT 1 FROM synthetic_runs WHERE table_name = ?", (table,)).fetchone():
+                    return table
+                connection.execute(f"CREATE TABLE IF NOT EXISTS {quoted} (start INTEGER PRIMARY KEY, open REAL, "
+                                   "high REAL, low REAL, close REAL, volume REAL)")
+                connection.executemany(f"INSERT OR IGNORE INTO {quoted} VALUES (?, ?, ?, ?, ?, ?)",
+                                       ([candle[column] for column in CANDLE_COLUMNS] for candle in candles))
+                connection.execute(
+                    "INSERT OR IGNORE INTO synthetic_runs VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (table, product_id, granularity, run_label(modules), path, json.dumps(modules, default=str),
+                     history[0]["start"], history[-1]["start"], len(history),
+                     candles[0]["start"] if candles else None, len(candles),
+                     time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())))
+        finally:
+            connection.close()
+        return table
+
+    def runs(self):
+        """Every stored run: [{"table_name", "product_id", ..., "created"}], in the order they were stored."""
+        if not self.path.exists():
+            return []
+        connection = self._connect()
+        try:
+            cursor = connection.execute("SELECT * FROM synthetic_runs ORDER BY rowid")
+            names = [column[0] for column in cursor.description]
+            return [dict(zip(names, row)) for row in cursor.fetchall()]
+        finally:
+            connection.close()
+
+    def size(self):
+        """The bytes the synthetic store takes on disk."""
+        return sum(path.stat().st_size for path in self.folder.glob(SYNTHETIC_DATABASE + "*")) \
+            if self.folder.exists() else 0
+
+    def clear(self):
+        """Delete every stored synthetic run (the whole database). Returns how many there were."""
+        count = len(self.runs())
+        for path in self.folder.glob(SYNTHETIC_DATABASE + "*") if self.folder.exists() else ():
+            path.unlink()
+        return count
+
+    def load(self, table):
+        """A stored run's candles, oldest first."""
+        connection = self._connect()
+        try:
+            quoted = '"' + table.replace('"', '""') + '"'
+            rows = connection.execute(f"SELECT {', '.join(CANDLE_COLUMNS)} FROM {quoted} ORDER BY start").fetchall()
+        finally:
+            connection.close()
+        return [dict(zip(CANDLE_COLUMNS, row)) for row in rows]
 
 
 def paths(scenario):

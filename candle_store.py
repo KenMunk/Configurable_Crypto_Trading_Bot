@@ -165,6 +165,59 @@ class CandleStore:
                    for r in rows]
         return candles, fetched[0], fetched[1]
 
+    def markets(self):
+        """Every stored market: [{"table", "candles", "first", "last", "fetched_start", "fetched_end",
+        "metrics" (stored indicator columns)}], by table name. Empty when there is no database."""
+        if not self.path.exists():
+            return []
+        with self._connect() as connection:
+            if not connection.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'candle_tables'").fetchone():
+                return []
+            markets = []
+            for table, fetched_start, fetched_end in connection.execute(
+                    "SELECT table_name, fetched_start, fetched_end FROM candle_tables ORDER BY table_name").fetchall():
+                count, first, last = connection.execute(
+                    f"SELECT count(*), min(start), max(start) FROM {_quote(table)}").fetchone()
+                metrics = connection.execute("SELECT count(*) FROM metric_columns WHERE table_name = ?",
+                                             (table,)).fetchone()[0]
+                markets.append({"table": table, "candles": count, "first": first, "last": last,
+                                "fetched_start": fetched_start, "fetched_end": fetched_end, "metrics": metrics})
+        return markets
+
+    def clear(self, tables=None):
+        """Delete the stored candles and indicator columns of `tables` (names from markets()), or of
+        every market with None, with any CSV cache an earlier version left for them, so the next
+        run downloads them afresh. Returns the tables cleared.
+
+        The file is compacted afterwards to give the space back; if another program is reading it
+        just then, that is skipped and the space is reused by later downloads instead.
+        """
+        if self.read_only:
+            raise PermissionError(f"{self.path} is open read-only")
+        stored = [market["table"] for market in self.markets()]
+        tables = stored if tables is None else [table for table in tables if table in stored]
+        if tables:
+            with self._connect() as connection:
+                for table in tables:
+                    connection.execute(f"DROP TABLE IF EXISTS {_quote(table)}")
+                    connection.execute("DELETE FROM candle_tables WHERE table_name = ?", (table,))
+                    connection.execute("DELETE FROM metric_columns WHERE table_name = ?", (table,))
+            try:
+                vacuum = sqlite3.connect(self.path, timeout=5, isolation_level=None)
+                try:
+                    vacuum.execute("VACUUM")
+                finally:
+                    vacuum.close()
+            except sqlite3.OperationalError:
+                pass
+        for table in tables if tables else stored:
+            for suffix in (".csv", ".meta.json"):
+                legacy = self.cache_dir / f"{table}{suffix}"
+                if legacy.exists():
+                    legacy.unlink()
+        return tables
+
     def fetched_range(self, product_id, granularity):
         """[fetched_start, fetched_end) downloaded for the market, without reading its candles; None if none."""
         if not self.path.exists():
@@ -186,6 +239,8 @@ class CandleStore:
         """
         if self.read_only:
             raise PermissionError(f"{self.path} is open read-only; candles are saved by the run's writer")
+        if getattr(candles, "synthetic", False):
+            raise ValueError("Synthetic candles are never saved with the real history (see synthetic.SyntheticStore)")
         with self._connect() as connection:
             self._insert(connection, self.table_name(product_id, granularity), candles, fetched_start, fetched_end)
 
@@ -363,7 +418,13 @@ class MarketMetrics:
         self._caches = {}
 
     def cache(self, candles):
-        """The shared cache for `candles`, one per distinct candle range."""
+        """The shared cache for `candles`, one per distinct candle range.
+
+        Synthetic candles are refused: their indicator values must never be stored in, or read
+        from, the real market's columns, which share their candles' start times.
+        """
+        if getattr(candles, "synthetic", False):
+            raise ValueError("Synthetic candles can't use the real market's stored indicators")
         key = (len(candles), candles[0]["start"], candles[-1]["start"])
         if key not in self._caches:
             self._caches[key] = StoredMetricCache(candles, self.store, self.table)

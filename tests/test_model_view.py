@@ -221,6 +221,126 @@ def test_time_spent_runs_during_a_run_and_compares_the_modes(window, monkeypatch
     assert window.timing_compare_var.get().endswith("Parallel was 2.0x as fast, saving 5.2 s")
 
 
+def test_auto_gives_every_model_its_own_worker(window, monkeypatch):
+    """One model, one set of data, one worker: auto never groups models or runs a history run on one thread."""
+    started = {}
+
+    class FakeThread:
+        def __init__(self, target, args, daemon):
+            started["args"] = args
+
+        def start(self):
+            pass
+
+    monkeypatch.setattr("simulator.threading.Thread", FakeThread)
+    monkeypatch.setattr("simulator.max_workers", lambda: 10)
+    monkeypatch.setattr("parallel_backtest.max_workers", lambda: 10)
+    monkeypatch.setattr(window, "_selected_models", lambda: [(name, {"period_granularity": "ONE_DAY"})
+                                                             for name in "abcde"])
+    monkeypatch.setattr("simulator.describe_profile", lambda profile: (True, ""))
+    monkeypatch.setattr(window.auth_engine, "create_coinbase_client", lambda **kwargs: object())
+    monkeypatch.setattr(window.root, "after", lambda *args: None)
+    window.parallel_var.set(True)
+    window.workers_var.set("auto")
+    window.test_options = dict(window.test_options, mode="historic")
+
+    window._run_simulation()
+
+    assert started["args"][4] == 10  # small daily models too: each gets a worker
+    assert window.run_timing["mode"] == "parallel, 5 workers"
+
+
+def test_the_run_passes_the_chosen_data_mode_to_the_worker(window, monkeypatch):
+    """The timing label once overwrote the data mode, so a stress test ran as plain history."""
+    started = {}
+
+    class FakeThread:
+        def __init__(self, target, args, daemon):
+            started["args"] = args
+
+        def start(self):
+            pass
+
+        def is_alive(self):
+            return False
+
+    monkeypatch.setattr("simulator.threading.Thread", FakeThread)
+    monkeypatch.setattr(window, "_selected_models", lambda: [("a", {}), ("b", {})])
+    monkeypatch.setattr("simulator.describe_profile", lambda profile: (True, ""))
+    monkeypatch.setattr(window.auth_engine, "create_coinbase_client", lambda **kwargs: object())
+    monkeypatch.setattr(window.root, "after", lambda *args: None)
+    window.parallel_var.set(True)
+    window.workers_var.set("2")
+    window.test_options = dict(window.test_options, mode="stress")
+
+    window._run_simulation()
+
+    assert started["args"][5] == "stress"
+    assert window.run_timing["mode"].startswith("parallel")
+
+
+def test_the_workers_table_shows_each_worker_during_a_stress_test(window):
+    from simulator import format_worker_row
+    assert format_worker_row({"worker": 2, "doing": "a: Crash (alone)", "fraction": 0.45}) == (
+        "Worker 2", "a: Crash (alone)", "█" * 4 + "░" * 6 + " 45%")
+    assert format_worker_row({"worker": 1, "doing": None, "fraction": 0})[1].startswith("idle")
+    assert not window.workers_table.winfo_ismapped() and not window.workers_table.grid_info()
+
+    window.progress_queue.put(("workers", [{"worker": 1, "doing": "a: Crash (alone)", "fraction": 0.5},
+                                           {"worker": 2, "doing": None, "fraction": 0.0}]))
+    window._poll_progress()
+    assert window.workers_table.grid_info()
+    assert [window.workers_table.item(i, "values")[0] for i in window.workers_table.get_children()] == [
+        "Worker 1", "Worker 2"]
+
+    window.progress_queue.put(("workers", [{"worker": 1, "doing": "a: Crash (with history)", "fraction": 1.0},
+                                           {"worker": 2, "doing": None, "fraction": 0.0}]))
+    window._poll_progress()
+    assert window.workers_table.item("worker1", "values")[1] == "a: Crash (with history)"  # updated in place
+
+    window.progress_queue.put(("done", window.results, "logged"))
+    window._poll_progress()
+    assert not window.workers_table.grid_info()  # hidden when the run ends
+
+
+def test_the_scenario_charts_tab_charts_each_data_set_on_its_own(window):
+    import copy
+    results = []
+    for result in window.results:  # history, plus two paths of a scenario for each model
+        name = result["model_name"]
+        results.append(dict(result, base_model=name))
+        for path in (0, 1):
+            synthetic_run = copy.deepcopy(result)
+            synthetic_run.update(model_name=f"{name} | crash #{path + 1}", base_model=name, data_source="crash",
+                                 scenario_path=path, scenario_start=result["series"]["time"][5],
+                                 total_return=result["total_return"] - 0.1 * path)
+            results.append(synthetic_run)
+    window.progress_queue.put(("done", results, "synthetic results aren't logged"))
+    window._poll_progress()
+
+    tree = window.scenario_chart_tree
+    (market,) = tree.get_children()
+    assert tree.item(market, "text") == "BTC-USD FIFTEEN_MINUTE"
+    historic, crash = tree.get_children(market)
+    assert tree.item(historic, "text") == "Historic" and tree.item(crash, "text") == "crash (2 paths)"
+    assert str(tree.item(crash, "values")[0]) == "3" and "worst" in tree.item(crash, "values")[1]
+    assert [tree.item(item, "text") for item in tree.get_children(crash)] == ["path #1", "path #2"]
+    assert "3 data sets (2 synthetic) on 1 market" in window.scenario_chart_note.get()
+    window.root.update()
+    assert window.scenario_chart.ax.get_title(loc="left") == "Historic \u00b7 BTC-USD FIFTEEN_MINUTE"
+    assert len(window.scenario_chart.runs) == 3
+    assert len(window.scenario_chart.axes) == 1  # no tax panel: the value chart gets the height
+
+    window._step_scenario_chart(1)
+    chart = window.scenario_chart
+    assert chart.ax.get_title(loc="left") == "crash #1 \u00b7 BTC-USD FIFTEEN_MINUTE"
+    assert {run["model_name"] for run in chart.runs} == {"alpha | crash #1", "beta | crash #1", "gamma | crash #1"}
+    assert "Scenario starts" in [text.get_text() for text in chart.ax.get_legend().get_texts()]
+    window._step_scenario_chart(5)  # stops at the last
+    assert tree.item(tree.selection()[0], "text") == "path #2"
+    assert window.scenario_chart.ax.get_title(loc="left") == "crash #2 \u00b7 BTC-USD FIFTEEN_MINUTE"
+
+
 def test_a_failed_run_reports_its_time_but_is_not_compared(window, monkeypatch):
     clock = iter([4.0])
     monkeypatch.setattr("simulator.time.monotonic", lambda: next(clock))
@@ -337,8 +457,11 @@ def _run_results():
     return results
 
 
-def _names(window, starred_only=False):
-    rows = [window.model_list.get(i) for i in range(window.model_list.size())]
+def _names(window, starred_only=False, which="available"):
+    """Model names shown in the Available list, the Selected list, or both."""
+    lists = {"available": [window.model_list], "selected": [window.selected_list],
+             "both": [window.model_list, window.selected_list]}[which]
+    rows = [box.get(i) for box in lists for i in range(box.size())]
     return [row.split()[-2] if row.startswith("\u2605") else row.split()[0]
             for row in rows if not starred_only or row.startswith("\u2605")]
 
@@ -347,7 +470,7 @@ def test_the_model_list_reads_currency_folders_and_filters_by_currency(monkeypat
     window, _ = _library_window(monkeypatch, tmp_path)
     try:
         assert list(window.currency_picker["values"]) == ["All currencies", "BTC-USD", "ETH-USD"]
-        assert window.model_list.size() == 4
+        assert window.model_list.size() + window.selected_list.size() == 4  # one is selected when it opens
 
         window.currency_var.set("ETH-USD")
         window._fill_model_list()
@@ -371,7 +494,8 @@ def test_after_a_run_each_currencys_best_model_is_recorded_starred_and_selected(
                           for product in ("BTC-USD", "ETH-USD"))
         assert recorded == best
         assert sorted(Path(path).stem for path in window.selected_model_paths()) == best
-        assert sorted(_names(window, starred_only=True)) == best
+        assert sorted(_names(window, starred_only=True, which="both")) == best
+        assert sorted(_names(window, which="selected")) == best  # moved to the Selected list
         assert sorted(run["model_name"] for run in window.value_chart.runs) == best  # each currency's best
         assert "best per currency: BTC-USD" in window.result_var.get()
     finally:
@@ -411,32 +535,98 @@ def test_each_currencys_best_model_is_selected_when_the_simulator_opens(monkeypa
 
 # --- comparison filters and discarded models ------------------------------------------------
 
-def test_comparison_filters_compare_numbers_in_shown_units_and_match_text():
-    from simulator import parse_filter, row_matches
-    row = {"sort": {"return": 2.5, "trades": 14, "model": "doge_b_130", "max_drawdown": 0.3},
-           "display": {"return": "+250.00%", "trades": "14", "model": "doge_b_130", "max_drawdown": "30.0%"}}
+def test_column_values_and_filters_work_like_excel():
+    from simulator import column_values, row_passes
+    rows = [{"sort": {"model": name, "return": value, "trades": trades}, "display": {
+        "model": name, "return": f"{value:+.2%}", "trades": str(trades)}}
+        for name, value, trades in (("b", 2.5, 14), ("a", -0.1, 3), ("c", 0.4, 14))]
 
-    assert parse_filter(">10 <=40") == [(">", 10.0), ("<=", 40.0)]
-    assert row_matches(row, {"return": ">100"}) and not row_matches(row, {"return": ">300"})
-    assert row_matches(row, {"trades": "10..20", "max_drawdown": "<35%"})
-    assert row_matches(row, {"model": "B_13"}) and not row_matches(row, {"model": "eth"})
-    assert not row_matches(row, {"trades": ">abc"})  # a malformed number matches nothing
-    assert row_matches(row, {"return": "  "})  # an empty filter is ignored
+    assert column_values(rows, "model") == ["a", "b", "c"]  # text A to Z
+    assert column_values(rows, "trades") == ["3", "14"]  # distinct, numbers smallest first
+    assert column_values(rows, "return") == ["-10.00%", "+40.00%", "+250.00%"]
+
+    kept = lambda filters: [row["sort"]["model"] for row in rows if row_passes(row, filters)]  # noqa: E731
+    assert kept({"trades": {"values": {"14"}, "test": None}}) == ["b", "c"]
+    assert kept({"return": {"values": None, "test": ("greater than", 100, None)}}) == ["b"]  # percent as shown
+    assert kept({"return": {"values": None, "test": ("between", 0, 50)}}) == ["c"]
+    assert kept({"trades": {"values": {"14"}, "test": None},
+                 "return": {"values": None, "test": ("at most", 40, None)}}) == ["c"]
+    assert kept({}) == ["b", "a", "c"]
 
 
-def test_the_comparison_table_filters_rows_and_counts_them(window):
-    window.filter_vars["model"].set("a")  # alpha, beta, gamma all contain "a"
-    assert len(window.comparison_table.get_children()) == 3
+def _shown_models(window):
+    return [window.comparison_rows[item]["result"]["model_name"] for item in window.comparison_table.get_children()]
 
-    window.filter_vars["model"].set("gam")
-    assert [window.comparison_rows[item]["result"]["model_name"] for item in window.comparison_table.get_children()] == [
-        "gamma"]
-    assert window.comparison_count_var.get() == "Showing 1 of 3 models"
+
+def test_a_heading_drop_down_filters_by_checked_values_and_marks_the_column(window):
+    popup = window.filter_popup = __import__("simulator").ColumnFilterPopup(window, "model")
+    assert popup.values == ["alpha", "beta", "gamma"] and popup.checked == {"alpha", "beta", "gamma"}
+
+    popup.toggle("beta")
+    popup.apply()
+
+    assert sorted(_shown_models(window)) == ["alpha", "gamma"]
+    assert window.comparison_count_var.get() == "Showing 2 of 3 models"
+    assert window.comparison_table.heading("model", "text") == "[Model] \u25bc"
+    assert window.comparison_table.heading("trades", "text") == "Trades \u25be"
     window._sort_comparison("trades")  # sorting keeps hidden rows hidden
-    assert len(window.comparison_table.get_children()) == 1
+    assert len(window.comparison_table.get_children()) == 2
 
     window._clear_comparison_filters()
     assert len(window.comparison_table.get_children()) == 3
+    assert window.comparison_table.heading("model", "text") == "Model \u25be"
+
+
+def test_searching_the_drop_down_keeps_only_the_checked_search_results(window):
+    from simulator import ColumnFilterPopup
+    popup = ColumnFilterPopup(window, "model")
+    popup.search_var.set("gam")
+    assert popup.visible() == ["gamma"]
+
+    popup.apply()
+
+    assert _shown_models(window) == ["gamma"]
+
+
+def test_select_all_and_an_empty_choice(window):
+    from simulator import ColumnFilterPopup
+    popup = ColumnFilterPopup(window, "model")
+    popup.select_all(False)
+    popup.apply()
+    assert popup.note_var.get() == "Check at least one value" and len(_shown_models(window)) == 3
+    popup.select_all(True)
+    popup.apply()
+    assert "model" not in window.column_filters  # everything checked is no filter
+
+
+def test_a_number_filter_and_values_offered_after_other_filters(window):
+    from simulator import ColumnFilterPopup
+    trades = sorted(row["sort"]["trades"] for row in window.comparison_rows.values())
+    popup = ColumnFilterPopup(window, "trades")
+    popup.test_var.set("at least")
+    popup.first_var.set(str(trades[-1]))
+    popup.apply()
+    assert all(window.comparison_rows[item]["sort"]["trades"] >= trades[-1]
+               for item in window.comparison_table.get_children())
+
+    other = ColumnFilterPopup(window, "model")  # offers only the models the trades filter left
+    assert len(other.values) == len(window.comparison_table.get_children())
+    other.close()
+
+    broken = ColumnFilterPopup(window, "return")
+    broken.test_var.set("between")
+    broken.first_var.set("5")
+    broken.apply()
+    assert "needs a number" in broken.note_var.get()
+    broken.close()
+
+
+def test_sorting_from_the_drop_down(window):
+    from simulator import ColumnFilterPopup
+    ColumnFilterPopup(window, "model").sort(descending=False)
+    assert _shown_models(window) == ["alpha", "beta", "gamma"]
+    ColumnFilterPopup(window, "model").sort(descending=True)
+    assert _shown_models(window) == ["gamma", "beta", "alpha"]
 
 
 def test_discarded_models_are_listed_only_when_asked(monkeypatch, tmp_path):
@@ -453,5 +643,67 @@ def test_discarded_models_are_listed_only_when_asked(monkeypatch, tmp_path):
 
         rows = [window.model_list.get(i) for i in range(window.model_list.size())]
         assert any(row.split()[0] == "old" and "discarded" in row for row in rows)
+    finally:
+        window.root.destroy()
+
+
+
+# --- the two-list model picker -----------------------------------------------------------------
+
+def test_models_move_between_the_available_and_selected_lists(monkeypatch, tmp_path):
+    window, _ = _library_window(monkeypatch, tmp_path)
+    try:
+        window._remove_all_models()
+        assert _names(window, which="selected") == [] and sorted(_names(window)) == ["alpha", "beta", "delta", "gamma"]
+        assert window.available_count_var.get() == "Available: 4" and window.selected_count_var.get() == "Selected: 0"
+
+        window.model_list.select_set(_names(window).index("gamma"))
+        window._add_models()
+        window.model_list.select_set(_names(window).index("alpha"))
+        window._add_models()
+
+        assert _names(window, which="selected") == ["gamma", "alpha"]  # in the order they were added
+        assert "gamma" not in _names(window)  # moved, not highlighted
+        assert [Path(p).stem for p in window.selected_model_paths()] == ["gamma", "alpha"]
+
+        window.selected_list.select_set(1)
+        window._move_selected(-1)
+        assert _names(window, which="selected") == ["alpha", "gamma"]
+        assert window.selected_list.curselection() == (0,)  # the moved model stays highlighted
+
+        window.selected_list.select_set(0)
+        window._remove_models()
+        assert _names(window, which="selected") == ["gamma"] and "alpha" in _names(window)
+    finally:
+        window.root.destroy()
+
+
+def test_add_all_moves_only_what_the_filter_and_search_show(monkeypatch, tmp_path):
+    window, _ = _library_window(monkeypatch, tmp_path)
+    try:
+        window._remove_all_models()
+        window.currency_var.set("BTC-USD")
+        window.model_search_var.set("a")  # alpha, beta, gamma all contain "a"; delta is ETH
+        window.model_search_var.set("ta")  # beta only
+        assert _names(window) == ["beta"] and window.available_count_var.get() == "Available: 1 of 4"
+
+        window._add_all_models()
+
+        assert _names(window, which="selected") == ["beta"]
+        window.model_search_var.set("")
+        window.currency_var.set("All currencies")
+        window._fill_model_list()
+        assert sorted(_names(window)) == ["alpha", "delta", "gamma"]
+    finally:
+        window.root.destroy()
+
+
+def test_selecting_models_another_way_fills_the_selected_list(monkeypatch, tmp_path):
+    window, config = _library_window(monkeypatch, tmp_path)
+    try:
+        window.select_models([config / "ETH-USD" / "delta.json", config / "BTC-USD" / "beta.json"])
+
+        assert _names(window, which="selected") == ["delta", "beta"]
+        assert sorted(_names(window)) == ["alpha", "gamma"]
     finally:
         window.root.destroy()

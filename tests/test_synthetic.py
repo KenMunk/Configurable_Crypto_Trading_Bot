@@ -130,6 +130,26 @@ def test_the_scenario_matrix_puts_the_most_robust_model_first():
     assert a["cells"]["paths"] == (0.3, -0.2, 2) and a["worst"] == -0.4 and (a["beat"], a["tested"]) == (2, 3)
 
 
+def test_each_data_set_gets_its_own_group_history_first():
+    from simulator import HISTORIC, scenario_groups
+
+    def result(model, source, path=0, product="BTC-USD", start=None):
+        return {"model_name": model, "base_model": model.split(" |")[0], "data_source": source,
+                "scenario_path": path, "product_id": product, "granularity": "ONE_DAY", "scenario_start": start}
+
+    results = [result("a | crash", "crash", start=500), result("a", HISTORIC), result("b | crash", "crash", start=500),
+               result("a | paths #1", "paths", 0), result("a | paths #2", "paths", 1), result("b", HISTORIC),
+               result("c", HISTORIC, product="ETH-USD")]
+
+    groups = scenario_groups(results)
+
+    assert [group["label"] for group in groups] == [
+        "Historic · BTC-USD ONE_DAY", "Historic · ETH-USD ONE_DAY", "crash · BTC-USD ONE_DAY",
+        "paths #1 · BTC-USD ONE_DAY", "paths #2 · BTC-USD ONE_DAY"]
+    assert groups[0]["positions"] == [1, 5] and groups[2]["positions"] == [0, 2]  # every model on that data
+    assert groups[2]["start"] == 500 and groups[0]["start"] is None
+
+
 def test_the_historically_best_models_of_each_currency_are_found(tmp_path):
     import json
     from performance_log import profile_fingerprint
@@ -184,6 +204,14 @@ def test_a_synthetic_only_run_tests_every_model_on_every_path_and_logs_nothing(t
     assert {result["data_source"] for result in results} == {"crash", "paths"}
     assert "synthetic results aren't logged" in logged
     assert not (tmp_path / "model_performance.csv").exists()
+    # The scenario candles went to the synthetic store, a database of their own; the history's has none.
+    stored = synthetic.SyntheticStore().runs()
+    assert sorted((run["run_label"], run["path"]) for run in stored) == [("crash", 0), ("paths", 0), ("paths", 1)]
+    assert synthetic.SyntheticStore().path.parent == synthetic.SYNTHETIC_DIR != tmp_path
+    import sqlite3
+    with sqlite3.connect(tmp_path / "candles.db") as history:
+        tables = [row[0] for row in history.execute("SELECT name FROM sqlite_master WHERE type = 'table'")]
+    assert not any("__" in table for table in tables)
 
 
 def test_historic_plus_synthetic_logs_only_the_historic_results(tmp_path, monkeypatch):
@@ -310,3 +338,37 @@ def test_a_duplicate_follows_its_original_and_saving_keeps_the_chain(editor, tmp
     editor._save()
     assert editor.saved and [s["chain"] for s in load_set(tmp_path / "stress_test.json")] == [
         False, True, True, False, False]
+
+
+def test_synthetic_candles_are_kept_in_their_own_tables_apart_from_the_history(tmp_path):
+    history = _daily()
+    store = synthetic.SyntheticStore(tmp_path / "synthetic")
+    crash = {"name": "Crash", "type": "crash", "drop": 0.5, "days": 5, "recovery_days": 20, "seed": 3}
+    at_date = {"name": "Dip", "type": "bear", "placement": "at", "at": "1970-06-01", "drop": 0.3, "days": 30}
+
+    built, start = synthetic.market_candles(list(history), crash, DAY, 0, store=store, market=("BTC-USD", "ONE_DAY"))
+    synthetic.market_candles(list(history), crash, DAY, 1, store=store, market=("BTC-USD", "ONE_DAY"))
+    synthetic.market_candles(list(history), crash, DAY, 0, store=store, market=("BTC-USD", "ONE_DAY"))  # again
+    dip, dip_start = synthetic.market_candles(list(history), at_date, DAY, 0, store=store,
+                                              market=("BTC-USD", "ONE_DAY"))
+
+    runs = store.runs()
+    assert [(run["run_label"], run["path"]) for run in runs] == [("Crash", 0), ("Crash", 1), ("Dip", 0)]
+    assert all(run["table_name"].startswith("BTC-USD_ONE_DAY__") for run in runs)
+    assert runs[0]["history_candles"] == len(history) and runs[0]["history_through"] == history[-1]["start"]
+    first = store.load(runs[0]["table_name"])
+    assert first == [dict(candle) for candle in built if candle["start"] >= start]  # only the run's own candles
+    assert first[0]["start"] == history[-1]["start"] + DAY
+    changed = store.load(runs[2]["table_name"])  # written in at a date: from there to the end
+    assert changed[0]["start"] == dip_start and changed[-1]["start"] == history[-1]["start"]
+    assert built.synthetic and dip.synthetic
+
+
+def test_the_history_store_refuses_synthetic_candles(tmp_path):
+    from candle_store import CandleStore, MarketMetrics
+    store = CandleStore(tmp_path)
+    built, _ = synthetic.market_candles(list(_daily()), {"name": "c", "type": "crash", "drop": 0.3, "days": 5}, DAY)
+    with pytest.raises(ValueError, match="never saved with the real history"):
+        store.save("BTC-USD", "ONE_DAY", built, 0, 1)
+    with pytest.raises(ValueError, match="real market's stored indicators"):
+        MarketMetrics(store, store.table_name("BTC-USD", "ONE_DAY")).cache(built)

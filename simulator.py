@@ -266,6 +266,15 @@ def format_elapsed(seconds):
     return f"{tenths / 10:.1f} s"
 
 
+def format_worker_row(row):
+    """(worker, what it is running, progress) for the Workers table, from a stress_test worker row."""
+    if row["doing"] is None:
+        return f"Worker {row['worker']}", "idle, waiting for the next task", ""
+    filled = int(row["fraction"] * 10 + 1e-9)
+    return (f"Worker {row['worker']}", row["doing"],
+            "\u2588" * filled + "\u2591" * (10 - filled) + f" {row['fraction']:.0%}")
+
+
 def describe_mode(workers, model_count):
     """How a run of `model_count` models on `workers` executes (see _simulation_worker)."""
     if workers > 1 and model_count > 1:
@@ -404,57 +413,54 @@ COMPARISON_COLUMNS = [
 PERCENT_COLUMNS = {"return", "buy_and_hold", "versus", "max_drawdown", "window_drawdown", "win_rate"}
 # Columns filtered by matching their text (dates and names); the rest compare numbers.
 TEXT_COLUMNS = {"model", "data", "product", "candles", "first_buy", "bh_start"}
-_COMPARISONS = [(">=", lambda a, b: a >= b), ("<=", lambda a, b: a <= b), ("!=", lambda a, b: a != b),
-                (">", lambda a, b: a > b), ("<", lambda a, b: a < b), ("=", lambda a, b: a == b)]
+# Number filters a column's drop-down offers, as in Excel: name -> test(value, first, second).
+NUMBER_TESTS = {
+    "greater than": lambda value, a, b: value > a,
+    "at least": lambda value, a, b: value >= a,
+    "less than": lambda value, a, b: value < a,
+    "at most": lambda value, a, b: value <= a,
+    "equals": lambda value, a, b: value == a,
+    "between": lambda value, a, b: min(a, b) <= value <= max(a, b),
+}
 
 
 def _number(text):
-    return float(text.replace("%", "").replace("$", "").replace(",", "").replace("x", "").strip())
+    return float(str(text).replace("%", "").replace("$", "").replace(",", "").replace("x", "").strip())
 
 
-def parse_filter(text):
-    """A column filter's conditions: [(test, value)] where test is a comparison or "range" or "contains".
+def filter_number(row, key):
+    """A row's value in a number column, in the units shown (percent columns in percent); None if it has none."""
+    value = row["sort"][key]
+    if not isinstance(value, (int, float)) or key in TEXT_COLUMNS or math.isinf(value):
+        return None
+    return value * 100 if key in PERCENT_COLUMNS else value
 
-    Number filters: `>100`, `<=40`, `=12`, `!=0`, `10..50` (inclusive), several separated by spaces
-    (all must hold). Anything else matches as text, ignoring case. Raises ValueError for a
-    comparison whose value isn't a number.
+
+def column_values(rows, key):
+    """A column's distinct values as shown, in sort order (numbers smallest first, text A to Z)."""
+    first = {}
+    for row in rows:
+        first.setdefault(row["display"][key], row["sort"][key])
+    def order(item):
+        shown, value = item
+        return (0, value, shown) if isinstance(value, (int, float)) and not isinstance(value, bool) else (1, 0, str(shown).lower())
+    return [shown for shown, _ in sorted(first.items(), key=order)]
+
+
+def row_passes(row, filters):
+    """Whether a comparison row passes every column filter.
+
+    `filters` maps a column to {"values": the shown values to keep, or None for all, "test": None or
+    (number test name, first, second)}, as the Excel-style drop-downs set them.
     """
-    conditions = []
-    for part in str(text).split():
-        if ".." in part:
-            low, _, high = part.partition("..")
-            conditions.append(("range", (_number(low) if low else float("-inf"), _number(high) if high else float("inf"))))
-            continue
-        for symbol, _ in _COMPARISONS:
-            if part.startswith(symbol):
-                conditions.append((symbol, _number(part[len(symbol):])))
-                break
-        else:
-            conditions.append(("contains", part.lower()))
-    return conditions
-
-
-def row_matches(row, filters):
-    """Whether a comparison row (from comparison_rows) passes every column filter in `filters` ({key: text})."""
-    for key, text in filters.items():
-        if not str(text).strip():
-            continue
-        try:
-            conditions = parse_filter(text)
-        except ValueError:
+    for key, column_filter in filters.items():
+        values = column_filter.get("values")
+        if values is not None and row["display"][key] not in values:
             return False
-        value = row["sort"][key]
-        if isinstance(value, (int, float)) and key in PERCENT_COLUMNS:
-            value *= 100
-        shown = str(row["display"][key]).lower()
-        for test, target in conditions:
-            if test == "contains" or key in TEXT_COLUMNS or not isinstance(value, (int, float)):
-                if test != "contains" or target not in shown:
-                    return False
-            elif test == "range":
-                if not target[0] <= value <= target[1]:
-                    return False
-            elif not dict(_COMPARISONS)[test](value, target):
+        test = column_filter.get("test")
+        if test:
+            number = filter_number(row, key)
+            if number is None or not NUMBER_TESTS[test[0]](number, test[1], test[2]):
                 return False
     return True
 
@@ -607,6 +613,33 @@ def scenario_matrix(results):
     return [HISTORIC] + scenarios, rows
 
 
+def scenario_groups(results):
+    """The data sets a run tested on, each with the results run on it, for the Scenario charts tab.
+
+    A data set is one source (the real history, a scenario, or a stress combination and mode) on one
+    path, for one market. Returns [{"label", "source", "path", "product", "granularity",
+    "positions" (in `results`), "start" (where the scenario's candles begin, or None)}],
+    history first, then in the order the results came.
+    """
+    groups, paths = {}, {}
+    for position, result in enumerate(results):
+        source = result.get("data_source", HISTORIC)
+        path = result.get("scenario_path", 0)
+        market = (result["product_id"], result.get("granularity", ""))
+        groups.setdefault((source, path, *market), []).append(position)
+        paths.setdefault((source, *market), set()).add(path)
+    rows = []
+    for (source, path, product, granularity), positions in groups.items():
+        several = len(paths[(source, product, granularity)]) > 1
+        name = source + (f" #{path + 1}" if several else "")
+        rows.append({"label": f"{name} \u00b7 {product} {granularity}".rstrip(), "source": source, "path": path,
+                     "paths": len(paths[(source, product, granularity)]), "market": f"{product} {granularity}".rstrip(),
+                     "product": product, "granularity": granularity, "positions": positions,
+                     "start": results[positions[0]].get("scenario_start")})
+    rows.sort(key=lambda row: row["source"] != HISTORIC)  # stable: history first, then as they came
+    return rows
+
+
 def best_by_currency(results):
     """{product: position in `results`} of each currency's best result by total return."""
     best = {}
@@ -683,6 +716,141 @@ def group_by_market(models):
     return groups
 
 
+class ColumnFilterPopup:
+    """An Excel-style drop-down for one comparison column: sort, a number filter, and a checklist of values.
+
+    The checklist offers the values left by the other columns' filters. Searching narrows it;
+    with a search, OK keeps only the checked values the search shows, as Excel does.
+    """
+
+    CHECKED, UNCHECKED = "\u2611", "\u2610"
+
+    def __init__(self, window, key):
+        self.window, self.key = window, key
+        self.heading = dict((k, h) for k, h, *_ in COMPARISON_COLUMNS)[key]
+        others = {k: f for k, f in window.column_filters.items() if k != key}
+        rows = [row for row in window.comparison_rows.values() if row_passes(row, others)]
+        self.values = column_values(rows, key)
+        current = window.column_filters.get(key, {})
+        self.checked = set(current.get("values") or self.values)
+        self.numeric = key not in TEXT_COLUMNS
+
+        top = self.top = tk.Toplevel(window.root)
+        top.title(f"Filter: {self.heading}")
+        top.transient(window.root)
+        x, y = window.root.winfo_pointerx(), window.root.winfo_pointery()
+        top.geometry(f"320x480+{max(x - 40, 0)}+{y + 12}")
+        frame = ttk.Frame(top, padding=8)
+        frame.pack(fill="both", expand=True)
+        ascending, descending = ("Sort A to Z", "Sort Z to A") if not self.numeric else (
+            "Sort smallest to largest", "Sort largest to smallest")
+        ttk.Button(frame, text=ascending, command=lambda: self.sort(False)).pack(fill="x")
+        ttk.Button(frame, text=descending, command=lambda: self.sort(True)).pack(fill="x", pady=(2, 0))
+        ttk.Button(frame, text=f'Clear filter from "{self.heading}"', command=self.clear).pack(fill="x", pady=(2, 6))
+        self.test_var, self.first_var, self.second_var = tk.StringVar(value="(none)"), tk.StringVar(), tk.StringVar()
+        if self.numeric:
+            box = ttk.LabelFrame(frame, text="Number filter" + (" (in %)" if key in PERCENT_COLUMNS else ""),
+                                 padding=4)
+            box.pack(fill="x", pady=(0, 6))
+            ttk.Combobox(box, textvariable=self.test_var, state="readonly", width=12,
+                         values=["(none)", *NUMBER_TESTS]).pack(side="left")
+            ttk.Entry(box, textvariable=self.first_var, width=9).pack(side="left", padx=(4, 0))
+            ttk.Label(box, text="and").pack(side="left", padx=2)
+            ttk.Entry(box, textvariable=self.second_var, width=9).pack(side="left")
+            if current.get("test"):
+                name, first, second = current["test"]
+                self.test_var.set(name)
+                self.first_var.set(f"{first:g}")
+                self.second_var.set("" if second is None else f"{second:g}")
+        self.search_var = tk.StringVar()
+        search_row = ttk.Frame(frame)
+        search_row.pack(fill="x")
+        ttk.Label(search_row, text="Search:").pack(side="left")
+        ttk.Entry(search_row, textvariable=self.search_var).pack(side="left", fill="x", expand=True, padx=(4, 0))
+        self.search_var.trace_add("write", lambda *_: self._show())
+        list_frame = ttk.Frame(frame)
+        list_frame.pack(fill="both", expand=True, pady=(4, 0))
+        self.tree = ttk.Treeview(list_frame, show="tree", selectmode="none")
+        scroll = ttk.Scrollbar(list_frame, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=scroll.set)
+        self.tree.pack(side="left", fill="both", expand=True)
+        scroll.pack(side="left", fill="y")
+        self.tree.bind("<ButtonRelease-1>", self._clicked)
+        self.note_var = tk.StringVar()
+        ttk.Label(frame, textvariable=self.note_var, foreground="#b3261e").pack(anchor="w")
+        buttons = ttk.Frame(frame)
+        buttons.pack(fill="x", pady=(6, 0))
+        ttk.Button(buttons, text="Cancel", command=self.close).pack(side="right")
+        ttk.Button(buttons, text="OK", command=self.apply).pack(side="right", padx=(0, 4))
+        top.bind("<Escape>", lambda _event: self.close())
+        top.bind("<Return>", lambda _event: self.apply())
+        self._show()
+
+    def visible(self):
+        words = self.search_var.get().lower().split()
+        return [value for value in self.values if all(word in str(value).lower() for word in words)]
+
+    def _show(self):
+        self.tree.delete(*self.tree.get_children())
+        shown = self.visible()
+        everything = bool(shown) and all(value in self.checked for value in shown)
+        self.tree.insert("", "end", iid="__all__", text=f"{self.CHECKED if everything else self.UNCHECKED} (Select All)")
+        for index, value in enumerate(shown):
+            mark = self.CHECKED if value in self.checked else self.UNCHECKED
+            self.tree.insert("", "end", iid=f"v{index}", text=f"{mark} {value}")
+        self._shown = shown
+
+    def _clicked(self, event):
+        item = self.tree.identify_row(event.y)
+        if item == "__all__":
+            self.select_all(not all(value in self.checked for value in self._shown))
+        elif item:
+            self.toggle(self._shown[int(item[1:])])
+
+    def toggle(self, value):
+        self.checked ^= {value}
+        self._show()
+
+    def select_all(self, on):
+        """Check (or uncheck) every value the search shows."""
+        (self.checked.update if on else self.checked.difference_update)(self.visible())
+        self._show()
+
+    def sort(self, descending):
+        self.window._sort_comparison(self.key, descending)
+        self.close()
+
+    def clear(self):
+        self.window.set_column_filter(self.key)
+        self.close()
+
+    def apply(self):
+        """Apply the checked values and the number filter, then close; an empty choice is refused."""
+        keep = self.checked & set(self.visible()) if self.search_var.get().strip() else set(self.checked)
+        if not keep:
+            self.note_var.set("Check at least one value")
+            return
+        test = None
+        if self.test_var.get() != "(none)":
+            try:
+                first = _number(self.first_var.get())
+                second = _number(self.second_var.get()) if self.test_var.get() == "between" else None
+            except ValueError:
+                self.note_var.set("The number filter needs a number" + (
+                    "s in both boxes" if self.test_var.get() == "between" else ""))
+                return
+            test = (self.test_var.get(), first, second)
+        all_values = keep >= set(self.values)
+        self.window.set_column_filter(self.key, None if all_values else keep, test)
+        self.close()
+
+    def close(self):
+        if self.top.winfo_exists():
+            self.top.destroy()
+        if self.window.filter_popup is self:
+            self.window.filter_popup = None
+
+
 class SimulationWindow:
     """Pick models, run them on a worker thread, and browse the results in tabs."""
 
@@ -695,7 +863,8 @@ class SimulationWindow:
         self.model_paths = []
         self.model_products = {}  # path -> product_id
         self.selected_paths = set()  # chosen models, kept while the currency filter hides them
-        self.shown_paths = []  # the models the list shows, in its order
+        self.shown_paths = []  # the models the Available list shows, in its order
+        self.selection_order = []  # the Selected list's order (selected_paths says which are selected)
         self.best_paths = set()  # each currency's recorded best model
         self.discarded_paths = set()  # listed models from discard folders (with "Include discarded models")
         self.top_paths = set()  # each currency's historically best models (Test options: top N)
@@ -731,8 +900,8 @@ class SimulationWindow:
         self.controls.pack(fill="x")
         heading_row = ttk.Frame(self.controls)
         heading_row.pack(fill="x")
-        ttk.Label(heading_row, text="Models (select one or more; Ctrl/Shift-click for several; "
-                                    "\u2605 marks each currency's best)",
+        ttk.Label(heading_row, text="Models (move them to Selected to test them; \u2605 each currency's best, "
+                                    "\u25b2 its top models)",
                   font=("Segoe UI", 10, "bold")).pack(side="left")
         self.currency_var = tk.StringVar(value=ALL_CURRENCIES)
         self.currency_picker = ttk.Combobox(heading_row, textvariable=self.currency_var, state="readonly", width=16,
@@ -743,19 +912,59 @@ class SimulationWindow:
         self.include_discarded_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(heading_row, text="Include discarded models", variable=self.include_discarded_var,
                         command=self._refresh_models).pack(side="right", padx=(0, 16))
+        # Two lists, as in a "slush bucket": models move from Available to Selected rather than being highlighted.
         models_row = ttk.Frame(self.controls)
         models_row.pack(fill="x", pady=(6, 12))
-        self.model_list = tk.Listbox(models_row, selectmode="extended", height=6, exportselection=False,
+        models_row.columnconfigure(0, weight=1)
+        models_row.columnconfigure(2, weight=1)
+        available_frame = ttk.Frame(models_row)
+        available_frame.grid(row=0, column=0, sticky="nsew")
+        available_top = ttk.Frame(available_frame)
+        available_top.pack(fill="x")
+        self.available_count_var = tk.StringVar(value="Available")
+        ttk.Label(available_top, textvariable=self.available_count_var).pack(side="left")
+        self.model_search_var = tk.StringVar()
+        self.model_search_var.trace_add("write", lambda *_: self._fill_model_list())
+        ttk.Entry(available_top, textvariable=self.model_search_var, width=22).pack(side="right")
+        ttk.Label(available_top, text="Search:").pack(side="right", padx=(0, 4))
+        available_body = ttk.Frame(available_frame)
+        available_body.pack(fill="both", expand=True, pady=(2, 0))
+        self.model_list = tk.Listbox(available_body, selectmode="extended", height=7, exportselection=False,
                                      activestyle="none")
-        list_scroll = ttk.Scrollbar(models_row, orient="vertical", command=self.model_list.yview)
-        self.model_list.configure(yscrollcommand=list_scroll.set)
-        self.model_list.pack(side="left", fill="x", expand=True)
-        self.model_list.bind("<<ListboxSelect>>", lambda _event: self._note_selection())
-        list_scroll.pack(side="left", fill="y")
+        available_scroll = ttk.Scrollbar(available_body, orient="vertical", command=self.model_list.yview)
+        self.model_list.configure(yscrollcommand=available_scroll.set)
+        self.model_list.pack(side="left", fill="both", expand=True)
+        available_scroll.pack(side="left", fill="y")
+        self.model_list.bind("<Double-1>", lambda _event: self._add_models())
+        self.model_list.bind("<Return>", lambda _event: self._add_models())
+
+        move_buttons = ttk.Frame(models_row)
+        move_buttons.grid(row=0, column=1, padx=8, sticky="n", pady=(18, 0))
+        for text, command in (("Add \u203a", self._add_models), ("Add all \u203a\u203a", self._add_all_models),
+                              ("\u2039 Remove", self._remove_models),
+                              ("\u2039\u2039 Remove all", self._remove_all_models),
+                              ("Move up", lambda: self._move_selected(-1)),
+                              ("Move down", lambda: self._move_selected(1))):
+            ttk.Button(move_buttons, text=text, width=13, command=command).pack(fill="x", pady=(0, 3))
+
+        selected_frame = ttk.Frame(models_row)
+        selected_frame.grid(row=0, column=2, sticky="nsew")
+        self.selected_count_var = tk.StringVar(value="Selected")
+        ttk.Label(selected_frame, textvariable=self.selected_count_var).pack(anchor="w", pady=(0, 3))
+        selected_body = ttk.Frame(selected_frame)
+        selected_body.pack(fill="both", expand=True)
+        self.selected_list = tk.Listbox(selected_body, selectmode="extended", height=7, exportselection=False,
+                                        activestyle="none")
+        selected_scroll = ttk.Scrollbar(selected_body, orient="vertical", command=self.selected_list.yview)
+        self.selected_list.configure(yscrollcommand=selected_scroll.set)
+        self.selected_list.pack(side="left", fill="both", expand=True)
+        selected_scroll.pack(side="left", fill="y")
+        self.selected_list.bind("<Double-1>", lambda _event: self._remove_models())
+        self.selected_list.bind("<Delete>", lambda _event: self._remove_models())
+
         model_buttons = ttk.Frame(models_row)
-        model_buttons.pack(side="left", padx=(8, 0), anchor="n")
+        model_buttons.grid(row=0, column=3, padx=(8, 0), sticky="n", pady=(18, 0))
         ttk.Button(model_buttons, text="Add file...", command=self._browse_config).pack(fill="x")
-        ttk.Button(model_buttons, text="Select all", command=self._select_all_shown).pack(fill="x", pady=(4, 0))
         ttk.Button(model_buttons, text="Refresh", command=self._refresh_models).pack(fill="x", pady=(4, 0))
         self.select_best_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(self.controls, text="After a run, select the best model of each currency tested",
@@ -789,6 +998,7 @@ class SimulationWindow:
         ttk.Button(action_row, text="Test Coinbase Authentication", command=self._authenticate_coinbase).pack(
             side="left", padx=(8, 0)
         )
+        ttk.Button(action_row, text="Clear data...", command=self._open_clear_data).pack(side="left", padx=(8, 0))
         self.parallel_var = tk.BooleanVar(value=True)
         self.mode_text = tk.StringVar()
         self.mode_button = ttk.Checkbutton(action_row, textvariable=self.mode_text, variable=self.parallel_var,
@@ -800,7 +1010,8 @@ class SimulationWindow:
         self.workers_box = ttk.Spinbox(action_row, values=["auto", *range(1, max_workers() + 1)],
                                        textvariable=self.workers_var, width=5)
         self.workers_box.pack(side="left", padx=(6, 0))
-        ttk.Label(action_row, text=f"auto uses {max_workers()} CPU slots plus one worker per GPU",
+        ttk.Label(action_row, text=f"auto uses {max_workers()} workers, each running one model on one set of "
+                                   f"data at a time; scenario and stress runs add one per GPU",
                   foreground="#555555").pack(side="left", padx=(8, 0))
         self._update_mode()
 
@@ -832,6 +1043,17 @@ class SimulationWindow:
         self.timing_compare_var = tk.StringVar(value="Run once in each mode, on the same models, to compare them")
         ttk.Label(progress_frame, textvariable=self.timing_compare_var, foreground="#555555").grid(
             row=7, column=1, sticky="w")
+        # One row per worker process while a stress test runs (see _show_workers); hidden otherwise.
+        self.workers_label = ttk.Label(progress_frame, text="Workers", width=24)
+        self.workers_label.grid(row=8, column=0, sticky="nw", pady=(6, 0))
+        self.workers_table = ttk.Treeview(progress_frame, columns=("worker", "doing", "progress"),
+                                          show="headings", height=4, selectmode="none")
+        for column, heading, width, stretch in (("worker", "Worker", 90, False), ("doing", "Running", 500, True),
+                                                ("progress", "Progress", 150, False)):
+            self.workers_table.heading(column, text=heading, anchor="w")
+            self.workers_table.column(column, width=width, stretch=stretch, anchor="w")
+        self.workers_table.grid(row=8, column=1, sticky="ew", pady=(6, 0))
+        self._show_workers([])
         self.timings = {}  # "single" / "parallel" -> the last run in that mode, for compare_timings
         self.run_timing = None  # the run under way: started, mode, models
 
@@ -870,6 +1092,7 @@ class SimulationWindow:
                                                                model_list=True)
         self.trades_tab = self._add_trades_tab()
         self.scenarios_tab = self._add_scenarios_tab()
+        self.scenario_charts_tab = self._add_scenario_charts_tab()
 
         self.metrics_tab = ttk.Frame(self.results_tabs)
         self.results_tabs.add(self.metrics_tab, text="Metrics")
@@ -1029,52 +1252,36 @@ class SimulationWindow:
         self.chart_selected_button = ttk.Button(hint_row, text="Chart selected models",
                                                 command=self._chart_selected_rows, state="disabled")
         self.chart_selected_button.pack(side="left")
-        ttk.Label(hint_row, text="Click a column heading to sort. Ctrl/Shift-click to select several models, then "
-                                 "chart them (or press Enter). Double-click a model to open its chart. Gray rows "
-                                 "are not in the charts.", foreground="#555555").pack(side="left", padx=(8, 0))
+        ttk.Label(hint_row, text="Click a column heading to sort or filter it, as in Excel (\u25bc marks a filtered "
+                                 "column). Ctrl/Shift-click rows to select several models, then chart them (or press "
+                                 "Enter). Double-click a model to open its chart. Gray rows are not in the charts.",
+                  foreground="#555555").pack(side="left", padx=(8, 0))
         filter_row = ttk.Frame(tab)
         filter_row.pack(fill="x", pady=(0, 4))
-        ttk.Label(filter_row, text="Filter with the boxes under the headings: numbers take >100, <=40, 10..50 "
-                                   "(percent columns in %); text and dates match any part, such as DOGE or 2024.",
-                  foreground="#555555").pack(side="left")
-        ttk.Button(filter_row, text="Clear filters", command=self._clear_comparison_filters).pack(side="right")
+        ttk.Button(filter_row, text="Clear all filters", command=self._clear_comparison_filters).pack(side="right")
         self.comparison_count_var = tk.StringVar(value="")
         ttk.Label(filter_row, textvariable=self.comparison_count_var).pack(side="right", padx=(0, 8))
         table_frame = ttk.Frame(tab)
         table_frame.pack(fill="both", expand=True)
         table_frame.columnconfigure(0, weight=1)
-        table_frame.rowconfigure(1, weight=1)
+        table_frame.rowconfigure(0, weight=1)
         self.comparison_table = ttk.Treeview(
             table_frame, columns=[key for key, *_ in COMPARISON_COLUMNS], show="headings", selectmode="extended"
         )
         self.comparison_table.tag_configure("hidden", foreground="#999999")
+        # Each heading opens an Excel-style drop-down: sort, pick values, or a number filter.
+        self.column_filters = {}
         for key, heading, width, anchor in COMPARISON_COLUMNS:
-            self.comparison_table.heading(key, text=heading, command=lambda key=key: self._sort_comparison(key))
+            self.comparison_table.heading(key, command=lambda key=key: self._open_column_filter(key))
             self.comparison_table.column(key, width=width, anchor=anchor, stretch=key == "model")
-        # One filter box per column, kept under its heading as columns are resized or scrolled sideways.
-        self.filter_canvas = tk.Canvas(table_frame, height=24, highlightthickness=0, borderwidth=0)
-        self.filter_vars, self.filter_windows = {}, {}
-        for key, *_ in COMPARISON_COLUMNS:
-            variable = tk.StringVar()
-            variable.trace_add("write", lambda *_: self._arrange_comparison())
-            entry = ttk.Entry(self.filter_canvas, textvariable=variable)
-            self.filter_vars[key] = variable
-            self.filter_windows[key] = self.filter_canvas.create_window(0, 0, window=entry, anchor="nw", height=24)
-        horizontal = ttk.Scrollbar(table_frame, orient="horizontal", command=self._scroll_comparison_x)
+        self._label_headings()
+        horizontal = ttk.Scrollbar(table_frame, orient="horizontal", command=self.comparison_table.xview)
         vertical = ttk.Scrollbar(table_frame, orient="vertical", command=self.comparison_table.yview)
-
-        def x_moved(first, last):
-            horizontal.set(first, last)
-            self.filter_canvas.xview_moveto(first)
-
-        self.comparison_table.configure(xscrollcommand=x_moved, yscrollcommand=vertical.set)
-        self.filter_canvas.grid(row=0, column=0, sticky="ew")
-        self.comparison_table.grid(row=1, column=0, sticky="nsew")
-        vertical.grid(row=1, column=1, sticky="ns")
-        horizontal.grid(row=2, column=0, sticky="ew")
-        self.comparison_table.bind("<Configure>", lambda _event: self._layout_comparison_filters())
-        self.comparison_table.bind("<ButtonRelease-1>", lambda _event: self._layout_comparison_filters(), add="+")
-        self._layout_comparison_filters()
+        self.comparison_table.configure(xscrollcommand=horizontal.set, yscrollcommand=vertical.set)
+        self.comparison_table.grid(row=0, column=0, sticky="nsew")
+        vertical.grid(row=0, column=1, sticky="ns")
+        horizontal.grid(row=1, column=0, sticky="ew")
+        self.filter_popup = None
         self.comparison_table.bind("<Double-1>", self._open_compared_model)
         self.comparison_table.bind("<Return>", lambda _event: self._chart_selected_rows())
         self.comparison_table.bind("<<TreeviewSelect>>", lambda _event: self.chart_selected_button.state(
@@ -1100,10 +1307,11 @@ class SimulationWindow:
             f"{best['starting_capital']:,.0f} to {best['ending_equity']:,.0f} ({best['total_return']:+.2%})."
         )
 
-    def _sort_comparison(self, key):
-        """Sort by a column; clicking it again reverses. Text starts A-Z, numbers start largest first."""
-        sort_key, descending = self.comparison_sort
-        descending = not descending if key == sort_key else key not in ("model", "product", "candles")
+    def _sort_comparison(self, key, descending=None):
+        """Sort by a column. Without `descending`, sorting it again reverses; text starts A-Z, numbers largest first."""
+        sort_key, current = self.comparison_sort
+        if descending is None:
+            descending = not current if key == sort_key else key not in TEXT_COLUMNS
         self.comparison_sort = (key, descending)
         self._arrange_comparison()
 
@@ -1112,10 +1320,9 @@ class SimulationWindow:
         if not hasattr(self, "comparison_rows"):
             return
         key, descending = self.comparison_sort
-        filters = {column: variable.get() for column, variable in self.filter_vars.items()}
         items = sorted(self.comparison_rows, key=lambda item: self.comparison_rows[item]["sort"][key],
                        reverse=descending)
-        shown = [item for item in items if row_matches(self.comparison_rows[item], filters)]
+        shown = [item for item in items if row_passes(self.comparison_rows[item], self.column_filters)]
         for item in items:
             if item not in shown and self.comparison_table.exists(item):
                 self.comparison_table.detach(item)
@@ -1125,23 +1332,29 @@ class SimulationWindow:
         self.comparison_count_var.set("" if not total else f"Showing {len(shown)} of {total} models")
 
     def _clear_comparison_filters(self):
-        for variable in self.filter_vars.values():
-            variable.set("")
+        self.column_filters = {}
+        self._label_headings()
+        self._arrange_comparison()
 
-    def _layout_comparison_filters(self):
-        """Line the filter boxes up under their columns' current widths."""
-        x = 0
-        for key, *_ in COMPARISON_COLUMNS:
-            width = int(self.comparison_table.column(key, "width"))
-            self.filter_canvas.coords(self.filter_windows[key], x, 0)
-            self.filter_canvas.itemconfigure(self.filter_windows[key], width=max(width - 2, 10))
-            x += width
-        self.filter_canvas.configure(scrollregion=(0, 0, x, 24))
-        first, _ = self.comparison_table.xview()
-        self.filter_canvas.xview_moveto(first)
+    def _label_headings(self):
+        """Every heading shows a drop-down arrow; a filtered one shows a filled arrow and brackets."""
+        for key, heading, *_ in COMPARISON_COLUMNS:
+            filtered = key in self.column_filters
+            self.comparison_table.heading(key, text=f"[{heading}] \u25bc" if filtered else f"{heading} \u25be")
 
-    def _scroll_comparison_x(self, *args):
-        self.comparison_table.xview(*args)
+    def set_column_filter(self, key, values=None, test=None):
+        """Filter a column to `values` (shown values to keep; None for all) and/or a number `test`; neither clears it."""
+        if values is None and not test:
+            self.column_filters.pop(key, None)
+        else:
+            self.column_filters[key] = {"values": None if values is None else set(values), "test": test}
+        self._label_headings()
+        self._arrange_comparison()
+
+    def _open_column_filter(self, key):
+        if self.filter_popup is not None:
+            self.filter_popup.close()
+        self.filter_popup = ColumnFilterPopup(self, key)
 
     def _position_of(self, item):
         """The position in self.results of a comparison table row."""
@@ -1312,20 +1525,69 @@ class SimulationWindow:
             self.currency_var.set(ALL_CURRENCIES)
         self._fill_model_list()
 
+    def _model_label(self, path, names):
+        product = self.model_products.get(path)
+        marks = ("\u2605" if path in self.best_paths else " ") + ("\u25b2 " if path in self.top_paths else "  ")
+        note = ", ".join(part for part in (product, "discarded" if path in self.discarded_paths else "") if part)
+        return f"{marks}{names[path]}" + (f"   ({note})" if note else "")
+
     def _fill_model_list(self):
-        """Show the models of the chosen currency, each with its currency and a star for a currency's best."""
-        currency = self.currency_var.get()
-        self.shown_paths = [path for path in self.model_paths
-                            if currency == ALL_CURRENCIES or self.model_products.get(path) == currency]
+        """Fill both lists: Available shows the unselected models of the chosen currency that match the search;
+        Selected shows every selected model, in the order they were added."""
+        currency, search = self.currency_var.get(), self.model_search_var.get().lower().split()
         names = dict(zip(self.model_paths, model_names(self.model_paths)))
+        self.shown_paths = [path for path in self.model_paths if path not in self.selected_paths
+                            and (currency == ALL_CURRENCIES or self.model_products.get(path) == currency)
+                            and all(word in names[path].lower() for word in search)]
         self.model_list.delete(0, "end")
-        for index, path in enumerate(self.shown_paths):
-            product = self.model_products.get(path)
-            star = ("\u2605" if path in self.best_paths else " ") + ("\u25b2 " if path in self.top_paths else "  ")
-            note = ", ".join(part for part in (product, "discarded" if path in self.discarded_paths else "") if part)
-            self.model_list.insert("end", f"{star}{names[path]}" + (f"   ({note})" if note else ""))
-            if path in self.selected_paths:
-                self.model_list.select_set(index)
+        for path in self.shown_paths:
+            self.model_list.insert("end", self._model_label(path, names))
+        # Keep the order models were added in; any selected another way follow in library order.
+        self.selection_order = [path for path in self.selection_order if path in self.selected_paths] + [
+            path for path in self.model_paths if path in self.selected_paths and path not in self.selection_order]
+        self.selected_list.delete(0, "end")
+        for path in self.selection_order:
+            self.selected_list.insert("end", self._model_label(path, names))
+        listed = sum(1 for path in self.model_paths if path not in self.selected_paths)
+        self.available_count_var.set(f"Available: {len(self.shown_paths)}"
+                                     + (f" of {listed}" if len(self.shown_paths) != listed else ""))
+        self.selected_count_var.set(f"Selected: {len(self.selection_order)}")
+
+    def _add_models(self):
+        """Move the highlighted Available models to the end of the Selected list."""
+        chosen = [self.shown_paths[index] for index in self.model_list.curselection()]
+        self.selected_paths |= set(chosen)
+        self.selection_order += [path for path in chosen if path not in self.selection_order]
+        self._fill_model_list()
+
+    def _add_all_models(self):
+        """Move every model the Available list shows (after the currency filter and search) to Selected."""
+        self.model_list.select_set(0, "end")
+        self._add_models()
+
+    def _remove_models(self):
+        """Move the highlighted Selected models back to Available."""
+        chosen = {self.selection_order[index] for index in self.selected_list.curselection()}
+        self.selected_paths -= chosen
+        self._fill_model_list()
+
+    def _remove_all_models(self):
+        self.selected_paths = set()
+        self._fill_model_list()
+
+    def _move_selected(self, step):
+        """Move the highlighted Selected models up or down the list."""
+        indices = sorted(self.selected_list.curselection(), reverse=step > 0)
+        order = list(self.selection_order)
+        for index in indices:
+            target = index + step
+            if 0 <= target < len(order) and target not in indices:
+                order[index], order[target] = order[target], order[index]
+        moved = [order.index(self.selection_order[index]) for index in indices]
+        self.selection_order = order
+        self._fill_model_list()
+        for index in moved:
+            self.selected_list.select_set(index)
 
     def _select_top_models(self):
         """Select each currency's historically best models (only the chosen currency's, when filtered)."""
@@ -1348,18 +1610,10 @@ class SimulationWindow:
 
         TestOptionsDialog(self.root, self.test_options, saved, markets=[m for m in markets if m.split()[-1]])
 
-    def _note_selection(self):
-        """Keep the selection of models the currency filter hides; take the listed ones from the list."""
-        shown = set(self.shown_paths)
-        self.selected_paths = {path for path in self.selected_paths if path not in shown} | {
-            self.shown_paths[index] for index in self.model_list.curselection()}
-
-    def _select_all_shown(self):
-        self.model_list.select_set(0, "end")
-        self._note_selection()
-
     def selected_model_paths(self):
-        return [path for path in self.model_paths if path in self.selected_paths]
+        """The Selected list's models, in its order."""
+        ordered = [path for path in self.selection_order if path in self.selected_paths]
+        return ordered + [path for path in self.model_paths if path in self.selected_paths and path not in ordered]
 
     def select_models(self, paths):
         """Select the given profile files, adding any that aren't listed yet."""
@@ -1369,6 +1623,7 @@ class SimulationWindow:
                 self.model_paths.append(path)
                 self.model_products[path] = (read_profile(path) or {}).get("product_id", "")
         self.selected_paths = set(paths)
+        self.selection_order = list(dict.fromkeys(paths))
         self._fill_model_list()
 
     def _selected_models(self):
@@ -1426,6 +1681,141 @@ class SimulationWindow:
         vertical.grid(row=0, column=1, sticky="ns")
         horizontal.grid(row=1, column=0, sticky="ew")
         return tab
+
+    def _add_scenario_charts_tab(self):
+        """A value chart per data set: the run's data sets, by market, beside the chart of the one picked."""
+        tab = ttk.Frame(self.results_tabs, padding=(0, 6, 0, 0))
+        self.results_tabs.add(tab, text="Scenario charts")
+        panel = ttk.Frame(tab, padding=(0, 0, 8, 0))
+        panel.pack(side="left", fill="y")
+        ttk.Label(panel, text="Data sets", font=("Segoe UI", 9, "bold")).pack(anchor="w")
+        tree_frame = ttk.Frame(panel)
+        tree_frame.pack(fill="both", expand=True, pady=(4, 0))
+        tree_frame.rowconfigure(0, weight=1)
+        self.scenario_chart_tree = ttk.Treeview(tree_frame, columns=("models", "best", "held"), selectmode="browse",
+                                                height=20)
+        for column, heading, width, anchor in (("#0", "Data set", 300, "w"), ("models", "Models", 55, "e"),
+                                               ("best", "Best model", 120, "e"), ("held", "Buy & hold", 80, "e")):
+            self.scenario_chart_tree.heading(column, text=heading, anchor=anchor)
+            self.scenario_chart_tree.column(column, width=width, anchor=anchor, stretch=column == "#0")
+        scroll = ttk.Scrollbar(tree_frame, orient="vertical", command=self.scenario_chart_tree.yview)
+        sideways = ttk.Scrollbar(tree_frame, orient="horizontal", command=self.scenario_chart_tree.xview)
+        self.scenario_chart_tree.configure(yscrollcommand=scroll.set, xscrollcommand=sideways.set)
+        self.scenario_chart_tree.grid(row=0, column=0, sticky="nsew")
+        scroll.grid(row=0, column=1, sticky="ns")
+        sideways.grid(row=1, column=0, sticky="ew")
+        self.scenario_chart_tree.bind("<<TreeviewSelect>>", lambda event: self._show_scenario_chart())
+        buttons = ttk.Frame(panel)
+        buttons.pack(fill="x", pady=(4, 0))
+        ttk.Button(buttons, text="\u2039 Previous", command=lambda: self._step_scenario_chart(-1)).pack(side="left")
+        ttk.Button(buttons, text="Next \u203a", command=lambda: self._step_scenario_chart(1)).pack(
+            side="left", padx=(4, 0))
+        self.scenario_chart_note = tk.StringVar(value="Run a simulation to chart each data set it tested on")
+        ttk.Label(panel, textvariable=self.scenario_chart_note, foreground="#555555", wraplength=520,
+                  justify="left").pack(anchor="w", pady=(4, 0))
+
+        figure = Figure(figsize=(9, 5), dpi=100)
+        canvas = FigureCanvasTkAgg(figure, master=tab)
+        toolbar = NavigationToolbar2Tk(canvas, tab, pack_toolbar=False)
+        self.scenario_chart = ModelValueChart(figure, canvas)
+        self.scenario_chart.tax_panel = False  # the value gets the height; the Model value tab has the tax
+        toolbar.pack(side="bottom", fill="x")
+        canvas.get_tk_widget().pack(fill="both", expand=True)
+        self.scenario_chart_groups, self.scenario_chart_items = [], {}
+        return tab
+
+    def _fill_scenario_charts(self, results):
+        """List the run's data sets (see scenario_groups) by market, then data source, then path, and chart
+        the first. A source with several paths is one row, with its paths under it."""
+        self.scenario_chart_groups = groups = scenario_groups(results)
+        models = list(dict.fromkeys(result.get("base_model", result["model_name"]) for result in results))
+        self.scenario_chart_slots = {model: slot for slot, model in enumerate(models)}  # one color per model
+        tree = self.scenario_chart_tree
+        tree.delete(*tree.get_children())
+        self.scenario_chart_items = {}  # tree item -> group index (a source with paths: its first path)
+        self.scenario_chart_order = []  # the items of every data set, in order, for Previous and Next
+
+        def figures(indices):
+            bests = sorted(max(results[p]["total_return"] for p in groups[i]["positions"]) for i in indices)
+            held = sorted(results[groups[i]["positions"][0]]["buy_and_hold_return"] for i in indices)
+            if len(indices) == 1:
+                return f"{bests[0]:+.0%}", f"{held[0]:+.0%}"
+            return (f"{bests[len(bests) // 2]:+.0%} (worst {bests[0]:+.0%})", f"{held[len(held) // 2]:+.0%}")
+
+        markets = list(dict.fromkeys(group["market"] for group in groups))
+        for number, market in enumerate(markets):
+            market_item = tree.insert("", "end", text=market, open=True)
+            sources = list(dict.fromkeys(group["source"] for group in groups if group["market"] == market))
+            for source in sources:
+                indices = [i for i, group in enumerate(groups) if group["market"] == market
+                           and group["source"] == source]
+                models_count = len(groups[indices[0]]["positions"])
+                best, held = figures(indices)
+                name = source if len(indices) == 1 else f"{source} ({len(indices)} paths)"
+                item = tree.insert(market_item, "end", text=name, values=(models_count, best, held))
+                self.scenario_chart_items[item] = indices[0]
+                if len(indices) == 1:
+                    self.scenario_chart_order.append(item)
+                    continue
+                for index in indices:
+                    best, held = figures([index])
+                    path_item = tree.insert(item, "end", text=f"path #{groups[index]['path'] + 1}",
+                                            values=(models_count, best, held))
+                    self.scenario_chart_items[path_item] = index
+                    self.scenario_chart_order.append(path_item)
+        synthetic_sets = sum(group["source"] != HISTORIC for group in groups)
+        self.scenario_chart_note.set(
+            f"{len(groups)} data sets ({synthetic_sets} synthetic) on {len(markets)} "
+            f"market{'s' if len(markets) != 1 else ''}. The chart shows every model's value on the data set picked, "
+            "against buying and holding through it; a dashed line marks where a scenario starts. Best model: its "
+            "return (for several paths, the median, with the worst path). Click a scenario with paths to see its "
+            "first; Previous and Next step through every data set.")
+        if self.scenario_chart_order:
+            self._pick_scenario_chart(self.scenario_chart_order[0])
+
+    def _pick_scenario_chart(self, item):
+        tree = self.scenario_chart_tree
+        parent = tree.parent(item)
+        while parent:
+            tree.item(parent, open=True)
+            parent = tree.parent(parent)
+        tree.selection_set(item)
+        tree.see(item)
+
+    def _step_scenario_chart(self, step):
+        if not self.scenario_chart_order:
+            return
+        selection = self.scenario_chart_tree.selection()
+        current = selection[0] if selection else self.scenario_chart_order[0]
+        if current not in self.scenario_chart_order:  # a source with paths, or a market: start from its first
+            index = self.scenario_chart_items.get(current)
+            current = next((item for item in self.scenario_chart_order
+                            if self.scenario_chart_items[item] == index), self.scenario_chart_order[0])
+        position = self.scenario_chart_order.index(current)
+        position = min(max(position + step, 0), len(self.scenario_chart_order) - 1)
+        self._pick_scenario_chart(self.scenario_chart_order[position])
+        self.root.update_idletasks()
+        self._show_scenario_chart()
+
+    def _show_scenario_chart(self):
+        """Chart every model run on the picked data set (for a market row, its first)."""
+        selection = self.scenario_chart_tree.selection()
+        if not selection or not self.scenario_chart_groups:
+            return
+        item = selection[0]
+        if item not in self.scenario_chart_items:  # a market row
+            children = self.scenario_chart_tree.get_children(item)
+            if not children:
+                return
+            item = children[0]
+        group = self.scenario_chart_groups[self.scenario_chart_items[item]]
+        runs = [self.results[position] for position in group["positions"]]
+        best = max(range(len(runs)), key=lambda index: runs[index]["total_return"])
+        marks = [(group["start"], "Scenario starts")] if group["start"] is not None else []
+        self.scenario_chart.show(
+            runs, primary=best,
+            slots=[self.scenario_chart_slots.get(run.get("base_model", run["model_name"]), 0) for run in runs],
+            heading=group["label"], marks=marks, legend_location="best")  # data sets differ in shape
 
     def _show_scenarios(self, results):
         """Fill the Scenarios tab: one row per model, one column per data source, most robust first."""
@@ -1516,6 +1906,12 @@ class SimulationWindow:
             self.chart.focus_trade(self.trade_rows[selection[0]]["trade"])
             self.results_tabs.select(self.chart_tab)
 
+    def _open_clear_data(self):
+        """The Clear data dialog (data_manager.py): clear stored price history or synthetic candles."""
+        from data_manager import ClearDataDialog
+        self.clear_data_dialog = ClearDataDialog(
+            self.root, busy=lambda: self.simulation_thread is not None and self.simulation_thread.is_alive())
+
     def _authenticate_coinbase(self):
         self.auth_status_var.set("Coinbase authentication: testing")
         approve_path_update = lambda: messagebox.askyesno(
@@ -1583,8 +1979,10 @@ class SimulationWindow:
         try:
             models = self._selected_models()
             start_time = parse_start_date(self.start_date_var.get())
-            workers = parse_workers(self.workers_var.get()) if self.parallel_var.get() else 1
             mode = self.test_options.get("mode", "historic")
+            # One model on one set of data per worker at a time: history runs a task per model, scenario
+            # and stress runs a task per model per path. Auto: every CPU but two (scenario runs add the GPUs).
+            workers = parse_workers(self.workers_var.get()) if self.parallel_var.get() else 1
             scenarios = synthetic.load_set(self.test_options["scenario_set"]) if mode in (
                 "historic+synthetic", "synthetic") else []
             if mode in ("historic+synthetic", "synthetic") and not scenarios:
@@ -1608,15 +2006,17 @@ class SimulationWindow:
                 messagebox.showerror("Simulation Run Error", str(exc))
             return
 
+        self._show_workers([])
         for phase in self.progress_bars:
             self.progress_bars[phase]["value"] = 0
             self.progress_vars[phase].set("waiting")
         self.metrics_text.delete("1.0", tk.END)
         self.run_button.state(["disabled"])
         self.result_var.set("Simulation status: testing the Coinbase API")
-        mode = describe_mode(workers, len(models))
-        self.run_timing = {"started": time.monotonic(), "mode": mode, "models": [name for name, _ in models],
-                           "kind": "parallel" if mode.startswith("parallel") else "single"}
+        # Not `mode`: that is the data mode the worker needs. Scenario runs make a task per model per path.
+        run_kind = describe_mode(workers, len(models) if mode == "historic" else max(len(models), 2))
+        self.run_timing = {"started": time.monotonic(), "mode": run_kind, "models": [name for name, _ in models],
+                           "kind": "parallel" if run_kind.startswith("parallel") else "single"}
         self._show_time()
 
         self.simulation_thread = threading.Thread(
@@ -1631,10 +2031,11 @@ class SimulationWindow:
                            mode="historic", scenarios=()):
         """Test the API, then gather data, simulate each (name, profile) in turn and log the results.
 
-        With `start_time`, every model starts testing there (see run_backtest). With more
-        than one of `workers` and of models, the models run at once (see _parallel_run). With `mode`
-        "historic+synthetic" or "synthetic", each model is also (or only) run on every scenario path
-        (see _synthetic_runs); synthetic results are never logged or recorded as a currency's best.
+        With `start_time`, every model starts testing there (see run_backtest). With more than one
+        of `workers` and of models, each model runs on its history in its own worker process (see
+        _parallel_results). With `mode` "historic+synthetic" or "synthetic", each model is also (or
+        only) run on every scenario path, a task per model per path on `workers` processes (see
+        _synthetic_runs); synthetic results are never logged or recorded as a currency's best.
         Runs off the Tk thread, so it only posts events for _poll_progress to apply.
         """
         post = self.progress_queue.put
@@ -1652,7 +2053,7 @@ class SimulationWindow:
             post(("friction", auth, frictions[models[0][0]].describe()))
             results, logged, candles_by_market = [], "", {}
             if mode == "stress":
-                self._stress_test(client, models, frictions, scenarios, wait_for_fresh_signal)
+                self._stress_test(client, models, frictions, wait_for_fresh_signal, workers)
                 return
             if mode != "synthetic" and workers > 1 and len(models) > 1:
                 outcome = self._parallel_results(client, models, inputs, start_time, wait_for_fresh_signal, workers)
@@ -1666,7 +2067,7 @@ class SimulationWindow:
                 if not candles_by_market:
                     candles_by_market = self._gather_markets(client, models)
                 results = results + self._synthetic_runs(models, frictions, candles_by_market, scenarios,
-                                                         wait_for_fresh_signal)
+                                                         wait_for_fresh_signal, workers)
                 logged = (logged + "; " if logged else "") + "synthetic results aren't logged"
             post(("done", results, logged))
         except Exception as exc:  # Reported in the window; the worker must not die silently.
@@ -1716,47 +2117,27 @@ class SimulationWindow:
             logged = f"{path.name} not updated ({exc})"
         return results, logged, candles_by_market
 
-    def _synthetic_runs(self, models, frictions, candles_by_market, scenarios, wait_for_fresh_signal):
+    def _synthetic_runs(self, models, frictions, candles_by_market, scenarios, wait_for_fresh_signal, workers=1):
         """Run every model on every path of every scenario, built from its market's history.
 
-        Models on one market share each scenario path's candles (and their indicator values). A
-        result is named "<model> | <scenario>" (with " #n" for a scenario's paths) and measured
-        from the scenario's first candle.
+        Each model on each path is one task, shared out to `workers` processes (and the GPUs) in
+        parallel mode (see stress_test.run_scenarios). A result is named "<model> | <scenario>"
+        (with " #n" for a scenario's paths) and measured from the scenario's first candle.
         """
+        import stress_test
         post = self.progress_queue.put
-        # Chained modules make one run (see synthetic.runs); multi-path runs repeat with each path.
-        runs = [(run, path) for run in synthetic.runs(list(scenarios)) for path in range(synthetic.run_paths(run))]
-        total, done, results = len(runs) * len(models), 0, []
-        by_market = {}
-        for name, profile in models:
-            granularity, _ = resolve_granularity(profile.get("period_granularity", "FIFTEEN_MINUTE"))
-            by_market.setdefault((profile["product_id"], granularity), []).append((name, profile))
-        for (product_id, granularity), members in by_market.items():
-            _, seconds = resolve_granularity(granularity)
-            history = list(candles_by_market[(product_id, granularity)])
-            for run, path in runs:
-                name_of_run = synthetic.run_label(run)
-                label = name_of_run + (f" #{path + 1}" if synthetic.run_paths(run) > 1 else "")
-                post(("status", f"Simulation status: scenario {label} on {product_id} {granularity}"))
-                try:
-                    candles, start = synthetic.market_candles(history, run, seconds, path)
-                except synthetic.ScenarioError as exc:
-                    post(("status", f"Simulation status: skipped {label}: {exc}"))
-                    done += len(members)
-                    continue
-                for name, profile in members:
-                    result = run_backtest(candles, profile, friction=frictions[name], start_time=start,
-                                          wait_for_fresh_signal=wait_for_fresh_signal)
-                    result.update(model_name=f"{name} | {label}", granularity=granularity, base_model=name,
-                                  data_source=name_of_run, scenario_path=path)
-                    results.append(result)
-                    done += 1
-                    post(("progress", "simulation", done / max(total, 1),
-                          f"{done} of {total} scenario runs ({name} on {label})"))
+        results, skipped = stress_test.run_scenarios(
+            models, frictions, candles_by_market, scenarios, wait_for_fresh_signal=wait_for_fresh_signal,
+            workers=workers, compute_device="auto", worker_status=lambda rows: post(("workers", rows)),
+            synthetic_dir=synthetic.SYNTHETIC_DIR,
+            progress=lambda fraction, message: post(("progress", "simulation", fraction, message)))
+        for note in skipped:
+            post(("status", f"Simulation status: skipped {note}"))
         return results
 
-    def _stress_test(self, client, models, frictions, scenarios, wait_for_fresh_signal):
-        """Run the stress test (stress_test.py), write its reports, and post the results and the report."""
+    def _stress_test(self, client, models, frictions, wait_for_fresh_signal, workers):
+        """Run the stress test (stress_test.py) on `workers` processes (and the GPUs, in parallel mode),
+        write its reports, and post the results and the report."""
         import stress_test
         post = self.progress_queue.put
         candles_by_market = self._gather_markets(client, models)
@@ -1765,7 +2146,8 @@ class SimulationWindow:
         post(("status", f"Simulation status: stress testing {len(models)} models on {len(combos)} combinations"))
         records, baselines, results = stress_test.run_stress(
             models, frictions, candles_by_market, combos, wait_for_fresh_signal=wait_for_fresh_signal,
-            progress=lambda fraction, message: post(("progress", "simulation", fraction, message)))
+            workers=workers, compute_device="auto", worker_status=lambda rows: post(("workers", rows)),
+            synthetic_dir=synthetic.SYNTHETIC_DIR, progress=lambda fraction, message: post(("progress", "simulation", fraction, message)))
         for result in results:
             result["stress_test"] = True
         settings = (f"stress plan of {len(combos)} combinations, up to {self.test_options.get('stress_paths', 3)} "
@@ -1777,9 +2159,9 @@ class SimulationWindow:
     def _parallel_results(self, client, models, friction_inputs, start_time, wait_for_fresh_signal, workers):
         """Run the models on worker processes; (results, logged), or None after posting the error."""
         post = self.progress_queue.put
-        post(("status", f"Simulation status: running {len(models)} models on "
-                        f"{min(workers, len(models))} CPU-capacity workers; GPU slots added when available"))
-        run = run_parallel(client, models, workers=workers, start_time=start_time,
+        post(("status", f"Simulation status: running {len(models)} models on {min(workers, len(models))} workers"))
+        # CPU only: history runs read their indicators from the candle store, so GPU workers only add load.
+        run = run_parallel(client, models, workers=workers, start_time=start_time, compute_device="cpu",
                            wait_for_fresh_signal=wait_for_fresh_signal, friction_inputs=friction_inputs,
                            performance_path=self.performance_log_path,
                            progress=lambda phase, fraction, message: post(("progress", phase, fraction, message)))
@@ -1789,26 +2171,6 @@ class SimulationWindow:
             post(("error", RuntimeError(f"Every model failed - {failed}")))
             return None
         return results, run["logged"] + (f"; FAILED {failed}" if failed else "")
-
-    def _parallel_run(self, client, models, friction_inputs, start_time, wait_for_fresh_signal, workers):
-        """Run the models on worker processes (see parallel_backtest.py) and post the results.
-
-        Each model reports when it finishes rather than as it goes. A model that fails is
-        left out of the results and named in the status line.
-        """
-        post = self.progress_queue.put
-        post(("status", f"Simulation status: running {len(models)} models on "
-                        f"{min(workers, len(models))} CPU-capacity workers; GPU slots added when available"))
-        run = run_parallel(client, models, workers=workers, start_time=start_time,
-                           wait_for_fresh_signal=wait_for_fresh_signal, friction_inputs=friction_inputs,
-                           performance_path=self.performance_log_path,
-                           progress=lambda phase, fraction, message: post(("progress", phase, fraction, message)))
-        results = [result for result in run["results"] if result is not None]
-        failed = "; ".join(f"{name}: {error}" for name, error in run["errors"].items())
-        if not results:
-            post(("error", RuntimeError(f"Every model failed - {failed}")))
-            return
-        post(("done", results, run["logged"] + (f"; FAILED {failed}" if failed else "")))
 
     def _poll_progress(self):
         """Apply the worker's queued events to the window; checks again every 100 ms until the run ends."""
@@ -1841,6 +2203,8 @@ class SimulationWindow:
                 )
             elif kind == "status":
                 self.result_var.set(event[1])
+            elif kind == "workers":
+                self._show_workers(event[1])
             elif kind == "report":
                 import webbrowser
                 self.last_report = event[1]
@@ -1850,6 +2214,7 @@ class SimulationWindow:
                 best = max(range(len(self.results)), key=lambda i: self.results[i]["total_return"])
                 self._show_comparison(self.results)
                 self._show_scenarios(self.results)
+                self._fill_scenario_charts(self.results)
                 self.color_slots = {}
                 historic = [result for result in self.results if is_historic(result)]
                 per_currency = {product: self.results.index(historic[position])
@@ -1878,9 +2243,27 @@ class SimulationWindow:
 
         self._show_time(finished=finished, succeeded=succeeded)
         if finished:
+            self._show_workers([])
             self.run_button.state(["!disabled"])
         else:
             self.root.after(100, self._poll_progress)
+
+    def _show_workers(self, rows):
+        """Show what each stress test worker is running (rows from stress_test.run_stress), or hide the table."""
+        if not rows:
+            self.workers_table.delete(*self.workers_table.get_children())
+            self.workers_label.grid_remove()
+            self.workers_table.grid_remove()
+            return
+        self.workers_label.grid()
+        self.workers_table.grid()
+        self.workers_table.configure(height=min(len(rows), 16))
+        for row in rows:
+            item, values = f"worker{row['worker']}", format_worker_row(row)
+            if self.workers_table.exists(item):
+                self.workers_table.item(item, values=values)
+            else:
+                self.workers_table.insert("", "end", iid=item, values=values)
 
     def _show_time(self, finished=False, succeeded=False):
         """Update the Time spent line: running time during a run, then the total once it ends.

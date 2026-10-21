@@ -100,6 +100,16 @@ def test_a_run_never_uses_more_workers_than_every_cpu_but_two(cached_markets, mo
     assert "0 of 4 models done on 2 workers" in phases
 
 
+def test_worker_processes_run_their_maths_libraries_on_one_thread(monkeypatch):
+    for name in parallel_backtest.SINGLE_THREAD_ENV:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("MKL_NUM_THREADS", "4")  # set by the user: kept
+    parallel_backtest.single_threaded_children()
+    import os
+    assert os.environ["OMP_NUM_THREADS"] == os.environ["OPENBLAS_NUM_THREADS"] == "1"
+    assert os.environ["MKL_NUM_THREADS"] == "4"
+
+
 def test_gpu_slots_add_to_cpu_worker_capacity(monkeypatch):
     monkeypatch.setattr(parallel_backtest, "cpu_count", lambda: 6)
 
