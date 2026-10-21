@@ -468,7 +468,7 @@ Each regime can set:
 
 Settings a regime leaves out come from the base profile. Indicators, friction, flash-crash buys, the drawdown limit and `max_orders_per_day` are shared by every regime. The friction screen uses the base profile's `profit_lock_target`.
 
-Detection only uses candles up to the current close, so it lags. Stops, trailing stops and flash-crash buys still act inside every candle, so give the fast protection to each regime's stops, and keep `confirm` for the slower question of which regime the market is in. Each result reports the regime switches and the share of candles spent in each regime under `regimes`.
+Detection only uses candles up to the current close, so it lags. Stops, trailing stops and flash-crash buys still act inside every candle, so give the fast protection to each regime's stops, and keep `confirm` for the slower question of which regime the market is in. Each result reports the regime switches and the share of candles spent in each regime under `regimes`, and its `series.regime` gives the active regime on every candle. **Load Profile** lists each regime's detector, rules and stops; the simulator's charts mark where the regimes switched and which one was in use (see [Regime marks](simulator.md#regime-marks)).
 
 ---
 

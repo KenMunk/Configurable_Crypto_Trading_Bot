@@ -1,3 +1,4 @@
+import numpy as np
 import pytest
 
 from backtest import run_backtest
@@ -121,3 +122,93 @@ def test_no_regime_enters_before_every_detector_has_warmed_up():
     assert result["trades"] == [] and result["open_position"]
     assert result["ready_to_trade"] == 5 * 900
     assert result["buy_and_hold_start"] == 5 * 900
+
+
+# --- reports and charts ---------------------------------------------------------------------------------------
+
+def test_a_result_carries_each_candles_regime_and_a_summary_of_every_regime():
+    result = run_backtest(_candles([100, 100, 85, 85, 96, 100]), _dip_profile("keep"))
+
+    assert result["series"]["regime"] == [0, 0, 1, 1, 0, 0]
+    regimes = result["regimes"]
+    assert regimes["names"] == ["base", "dip"]
+    assert (regimes["confirm_candles"], regimes["min_hold_candles"], regimes["on_switch"]) == (1, 1, "keep")
+    dip = regimes["summary"][1]
+    assert (dip["when"], dip["entry_all"], dip["exit_any"]) == ("close < 90", ["close < 90"], ["close > 1000"])
+    assert regimes["summary"][0]["when"] is None
+
+
+def test_a_result_without_regimes_has_no_regime_series():
+    profile = _profile(None)
+    del profile["regimes"]
+
+    result = run_backtest(_candles([100, 101, 102]), profile)
+
+    assert "regime" not in result["series"] and result["regimes"] is None
+
+
+def _render(chart_class, result):
+    import matplotlib
+    matplotlib.use("Agg")
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
+    from matplotlib.figure import Figure
+    figure = Figure(figsize=(8, 4), dpi=100)
+    canvas = FigureCanvasAgg(figure)
+    chart = chart_class(figure, canvas)
+    chart.show(result)
+    canvas.draw()
+    return chart
+
+
+@pytest.mark.parametrize("chart_name", ["BacktestChart", "ModelValueChart"])
+def test_charts_mark_each_regime_and_every_switch(chart_name):
+    import chart as charts
+    result = run_backtest(_candles([100, 100, 85, 85, 96, 100]), _dip_profile("keep"))
+
+    chart = _render(getattr(charts, chart_name), result)
+
+    # A strip along the top in each regime's color: base, dip, base.
+    strips = [patch for patch in chart.ax.patches if patch.get_y() == charts.REGIME_STRIP[0]]
+    assert [patch.get_facecolor()[:3] for patch in strips] == [
+        matplotlib_rgb(charts.regime_color(n)) for n in (0, 1, 0)]
+    legend = [text.get_text() for text in chart.ax.get_legend().get_texts()]
+    assert "Regime: base" in legend and "Regime: dip" in legend
+    # A dashed line on every panel where the regime switches: into dip, and back to base.
+    switch_times = sorted({line.get_xdata()[0] for ax in chart.axes for line in ax.get_lines()
+                           if line.get_linestyle() == "--" and line.get_alpha() == 0.8})
+    assert switch_times == [np.datetime64(2 * 900, "s"), np.datetime64(4 * 900, "s")]
+    assert "Regime  dip" in chart.tooltip_text(2) and "Regime  base" in chart.tooltip_text(5)
+
+
+def test_no_regime_is_marked_while_the_detectors_warm_up():
+    import chart as charts
+    profile = _dip_profile("keep")
+    profile["indicators"]["slow_ema"] = {"type": "EMA", "period": 4}
+    profile["regimes"]["list"].append({"name": "slow", "when": "close > slow_ema * 2"})
+
+    result = run_backtest(_candles([85, 85, 85, 85, 85, 85]), profile)
+
+    assert result["regimes"]["switches"][0]["time"] == 3 * 900  # dip only once the slow detector is ready
+    assert charts.regime_runs(result) == [(1, 3, 5)]
+    assert charts.regime_at(result, 1) == "warming up"
+
+
+def test_simulator_text_describes_the_regimes_and_where_the_run_switched():
+    from simulator import describe_profile, format_backtest_result
+    profile = _dip_profile("close", {"use_hard_stop": True, "hard_stop_percentage": 0.05})
+
+    valid, report = describe_profile(profile)
+    text = format_backtest_result(run_backtest(_candles([100, 100, 85, 85, 96, 100]), profile))
+
+    assert valid
+    for lines in (report, text):
+        assert "Regimes (1 plus base)" in lines and "an open position is sold" in lines
+        assert "- dip (when close < 90): hard stop 5%, position 100% of cash" in lines
+        assert "    buy: all of: close < 90" in lines
+    assert "Time in each regime: base 67%, dip 33%" in text
+    assert "Regime switches: 2" in text and "base -> dip" in text and "dip -> base" in text
+
+
+def matplotlib_rgb(color):
+    from matplotlib.colors import to_rgb
+    return to_rgb(color)

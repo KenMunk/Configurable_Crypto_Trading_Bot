@@ -415,8 +415,9 @@ The Chart tab draws the chosen model on a log price scale:
 - a separate panel under the price for each oscillator (RSI, MACD, ADX and so on), with its conventional reference levels
 - a thin green line through the chart at each buy and a red one at each sell, with a ▲ (buy) or ▼ (sell) in a strip kept clear along the bottom edge, so the marks never cover the price or indicator lines (with a price floor set, the strip isn't reserved)
 - gray shading where trading was paused by the drawdown limit
+- for a model with [regimes](model_configuration.md#49-regimes-experimental), which regime it was trading in (see [Regime marks](#regime-marks))
 
-The subtitle gives the model's trade count and return. Hover anywhere to see a crosshair and a tooltip listing the close and every indicator's value at that candle; an indicator still in its warm-up shows `warming up`. Use the toolbar to zoom, pan, go back, or save the chart as an image. All panels share one time axis, so zooming one zooms them all.
+The subtitle gives the model's trade count and return. Hover anywhere to see a crosshair and a tooltip listing the close and every indicator's value at that candle (and the active regime, for a model with regimes); an indicator still in its warm-up shows `warming up`. Use the toolbar to zoom, pan, go back, or save the chart as an image. All panels share one time axis, so zooming one zooms them all.
 
 **Lowest price shown** sets a floor for the price axis. Type a price and press **Enter** or **Apply**; **Clear** fits the axis to the data again. Lines below the floor are cut off, which is useful when one stray price squashes the chart: BTC-USD has a bad $0.06 print on 2017-04-15 that drags the 100-day Donchian channel down for 100 days, and a floor of `500` removes it from view. The floor:
 
@@ -429,6 +430,16 @@ The subtitle gives the model's trade count and return. Hover anywhere to see a c
 If the floor is above every price on the chart, the note beside it says so and the chart shows all its values. If the text isn't a number above zero, the note says why and the floor is left as it was.
 
 For how indicators are drawn and how to hide some, see [Charts and tooltips](indicator_reference.md#10-charts-and-tooltips).
+
+#### Regime marks
+
+A model with [regimes](model_configuration.md#49-regimes-experimental) switches its rules with the market's situation. The Chart tab, and the Model value tab when it shows one model, mark which regime was in use:
+
+- a colored **strip along the top** of the chart, one color per regime and gray for the base regime, with the regime's name wherever its stretch is wide enough to fit it. The legend names every regime's color.
+- a faint wash of the regime's color over every panel while it is active (none for the base regime)
+- a dashed line in the new regime's color at each **switch**
+
+Nothing is marked while the model's indicators warm up: the regime can't be told until every detector is ready, and the tooltip shows `warming up` there. Hover anywhere else to read the active regime. The Metrics tab lists each regime's detector, rules and stops, the time spent in each, and the latest switches.
 
 ### Model value
 
@@ -447,7 +458,7 @@ The chart has these reference lines:
 - a horizontal line at the starting capital, one for each different starting capital
 - a gray **buy and hold** line for each product and starting capital. It stays at the starting capital until the model could first buy, then follows the price from that candle's close. An open circle marks where it starts, and the legend gives the date. With several models, it uses the start of the model chosen in **Showing model** (or, for another product or starting capital, of the first model with that product and starting capital), and the legend names that model.
 
-With one model, the chart labels the start and end values, the subtitle gives the model's return and the buy-and-hold return with its start date, and gray shading marks drawdown pauses. With several models, the legend shows each model's ending value and return, the subtitle names the best model, and the model chosen in **Showing model** is drawn slightly heavier. Hover to read every model's value, tax reserve and buy-and-hold value at one moment, each with its return where applicable.
+With one model, the chart labels the start and end values, the subtitle gives the model's return and the buy-and-hold return with its start date, gray shading marks drawdown pauses, and a model with regimes gets the same [regime marks](#regime-marks) as the Chart tab. With several models, the legend shows each model's ending value and return, the subtitle names the best model, and the model chosen in **Showing model** is drawn slightly heavier. Hover to read every model's value, tax reserve and buy-and-hold value at one moment, each with its return where applicable.
 
 **Lowest value shown** works like the Chart tab's floor, in value units. For example, set it to the starting capital to hide the part of the chart below it. Each tab keeps its own floor.
 

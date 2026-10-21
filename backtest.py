@@ -766,6 +766,8 @@ def run_backtest(candles, profile, starting_capital=None, progress=None, frictio
             "close": indicator_series["close"],
             "equity": equity_series,
             "tax_reserve": tax_reserve_series,
+            # The active regime on each candle, as an index into result["regimes"]["names"] (profiles with regimes).
+            **({"regime": active_regime} if active_regime is not None else {}),
             "indicators": {name: indicator_series[name] for meta in model.indicator_meta()
                            for name in meta["outputs"]},
         },
@@ -773,5 +775,7 @@ def run_backtest(candles, profile, starting_capital=None, progress=None, frictio
         "regimes": None if regimes is None else {
             "names": regimes.names, "switches": regime_switches,
             "share": {name: active_regime.count(number) / total for number, name in enumerate(regimes.names)},
+            "confirm_candles": regimes.confirm, "min_hold_candles": regimes.min_hold, "on_switch": regimes.on_switch,
+            "summary": regimes.summary(),
         },
     }

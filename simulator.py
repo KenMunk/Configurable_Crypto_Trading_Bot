@@ -74,6 +74,50 @@ def format_model(indicators, rules):
     return lines
 
 
+def _duration(candles, granularity_seconds):
+    seconds = candles * granularity_seconds
+    if seconds >= 86_400:
+        return f"{seconds / 86_400:g} days"
+    return f"{seconds / 3600:g} hours"
+
+
+def format_regimes(regimes, granularity_seconds):
+    """Report lines for a profile's regimes (a result's "regimes" or Regimes.summary-style dict): how they are
+    detected and what each one trades."""
+    lines = ["", f"Regimes ({len(regimes['summary']) - 1} plus base): a new regime takes over after it has held for "
+                 f"{_duration(regimes['confirm_candles'], granularity_seconds)}, then stays at least "
+                 f"{_duration(regimes['min_hold_candles'], granularity_seconds)}; on a switch an open position is "
+                 f"{'kept' if regimes['on_switch'] == 'keep' else 'sold'}."]
+    for regime in regimes["summary"]:
+        settings = regime["settings"]
+        stops = []
+        if settings["use_hard_stop"] and settings["hard_stop_trigger"] and settings["hard_stop_percentage"]:
+            stops.append(f"hard stop {settings['hard_stop_percentage']:.0%}")
+        if settings["trailing_stop"]:
+            stops.append(f"trailing stop {settings['trailing_stop']:.0%}")
+        if settings["profit_lock_target"]:
+            stops.append(f"profit target {settings['profit_lock_target']:.0%}")
+        stops.append(f"position {settings['target_position_fraction']:.0%} of cash")
+        when = f"when {regime['when']}" if regime["when"] else "when no other regime is active"
+        lines.append(f"- {regime['name']} ({when}): {', '.join(stops)}")
+        for label, all_key, any_key in (("buy", "entry_all", "entry_any"), ("sell", "exit_all", "exit_any")):
+            rules = [f"all of: {rule}" for rule in regime[all_key]] + [f"any of: {rule}" for rule in regime[any_key]]
+            lines.append(f"    {label}: " + ("; ".join(rules) if rules else "no rules"))
+    return lines
+
+
+def format_regime_activity(result, recent=10):
+    """Report lines for the time a run spent in each regime and its latest switches."""
+    regimes = result.get("regimes")
+    if not regimes:
+        return []
+    share = ", ".join(f"{name} {fraction:.0%}" for name, fraction in regimes["share"].items())
+    switches = regimes["switches"]
+    lines = ["", f"Time in each regime: {share}", f"Regime switches: {len(switches):,}"]
+    lines += [f"- {_format_time(switch['time'])}: {switch['from']} -> {switch['to']}" for switch in switches[-recent:]]
+    return lines
+
+
 def describe_profile(profile):
     """Validate a profile; return (is_valid, report text).
 
@@ -103,9 +147,14 @@ def describe_profile(profile):
             f"{flash_reserve * allocation:,.2f} at {drop:.0%} below" for drop, allocation in flash_levels)
     else:
         flash = ", ".join(f"{allocation:.0%} of cash at {drop:.0%} below" for drop, allocation in flash_levels)
+    regimes = []
+    if model.regimes is not None:
+        regimes = format_regimes({"summary": model.regimes.summary(), "confirm_candles": model.regimes.confirm,
+                                  "min_hold_candles": model.regimes.min_hold, "on_switch": model.regimes.on_switch},
+                                 granularity_seconds)
     lines = (["Profile is valid.", "", f"Starting value: {starting_capital:,.2f} ({source})",
               f"Flash-crash buys: {flash}"]
-             + format_model(model.indicator_meta(), model.rule_text()) + notes)
+             + format_model(model.indicator_meta(), model.rule_text()) + regimes + notes)
     return True, "\n".join(lines)
 
 
@@ -201,6 +250,11 @@ def format_backtest_result(result, recent_trades=10):
         f"Position open at end: {'yes' if result['open_position'] else 'no'}",
     ]
     lines += format_model(result["indicators"], result["rules"])
+    if result.get("regimes"):
+        times = result["series"]["time"]
+        step = times[1] - times[0] if len(times) > 1 else 86_400
+        lines += format_regimes(result["regimes"], step)
+        lines += format_regime_activity(result, recent_trades)
     lines += format_friction(result)
     events = result.get("flash_crash_events", [])
     if events:

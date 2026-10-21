@@ -35,6 +35,13 @@ MODEL_VALUE_COLOR = "#2a78d6"
 MODEL_COLORS = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#4a3aa7", "#e34948"]
 BENCHMARK_COLOR = SECONDARY_INK  # buy and hold is context, so it recedes
 PAUSE_SHADE = "#ebeae5"  # neutral gray wash for drawdown-limit pauses
+# Market regimes (profiles with "regimes"): each takes a categorical hue in list order, shown as a faint wash over
+# the chart and a solid strip along its top edge; the base regime gets no wash and a gray strip.
+REGIME_COLORS = ["#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#4a3aa7"]
+REGIME_BASE_COLOR = BASELINE
+REGIME_WASH_ALPHA = 0.08
+REGIME_STRIP = (0.965, 1.0)  # the strip's bottom and top, as fractions of the chart's height
+REGIME_NAME_MIN_WIDTH = 0.04  # a stretch narrower than this share of the chart is too narrow to name in the strip
 BUY_COLOR = "#008300"
 SELL_COLOR = "#e34948"
 LINE_WIDTH = 1.5  # points; about 2px at 100 dpi
@@ -60,6 +67,45 @@ def _quote_currency(result):
 
 def _day(timestamp):
     return f"{datetime.fromtimestamp(int(timestamp), timezone.utc):%Y-%m-%d}"
+
+
+def regime_color(number):
+    """The color of the regime at `number` in result["regimes"]["names"] (0 is the base regime)."""
+    return REGIME_BASE_COLOR if number == 0 else REGIME_COLORS[(number - 1) % len(REGIME_COLORS)]
+
+
+def _ink_on(color):
+    """Dark ink on a light background color, light ink on a dark one."""
+    red, green, blue = (int(color[i:i + 2], 16) / 255 for i in (1, 3, 5))
+    return PRIMARY_INK if 0.299 * red + 0.587 * green + 0.114 * blue > 0.6 else SURFACE
+
+
+def regime_runs(result):
+    """[(regime number, first index, last index)] for each stretch of candles in one regime, from the first candle
+    the model is ready to trade (regimes can't be told apart while the detectors warm up), or [] without regimes."""
+    active = result["series"].get("regime")
+    if not active or not result.get("regimes"):
+        return []
+    ready = result.get("ready_to_trade")
+    start = int(np.searchsorted(np.asarray(result["series"]["time"]), ready)) if ready is not None else len(active)
+    runs = []
+    for index in range(start + 1, len(active) + 1):
+        if index == len(active) or active[index] != active[start]:
+            runs.append((active[start], start, index - 1))
+            start = index
+    return runs
+
+
+def regime_at(result, index):
+    """The name of the regime active at candle `index` ("warming up" before the model is ready to trade), or None
+    without regimes."""
+    active = result["series"].get("regime")
+    if not active or not result.get("regimes"):
+        return None
+    ready = result.get("ready_to_trade")
+    if ready is None or result["series"]["time"][min(index, len(active) - 1)] < ready:
+        return "warming up"
+    return result["regimes"]["names"][active[min(index, len(active) - 1)]]
 
 
 def buy_and_hold_values(result):
@@ -206,6 +252,36 @@ class _HoverChart:
                            color=PAUSE_SHADE, linewidth=0, zorder=0,
                            label="Paused (drawdown limit)" if number == 0 and ax is self.ax else "_nolegend_")
 
+    def _shade_regimes(self):
+        """Mark which regime is active: a strip along the main chart's top in each regime's color, named where a
+        stretch is wide enough; a faint wash of that color over every panel (none for base); and a dashed line
+        at each switch. Nothing is marked while the detectors warm up."""
+        runs = regime_runs(self.result)
+        if not runs:
+            return
+        names = self.result["regimes"]["names"]
+        times = np.array(self.result["series"]["time"], dtype="datetime64[s]")
+        span = max(float((times[-1] - times[0]).astype(np.int64)), 1.0)
+        labelled = set()
+        for position, (number, first, last) in enumerate(runs):
+            start = times[first]
+            end = times[last + 1] if last + 1 < len(times) else times[last]
+            color = regime_color(number)
+            label = f"Regime: {names[number]}" if number not in labelled else "_nolegend_"
+            labelled.add(number)
+            if number:
+                for ax in self.axes:
+                    ax.axvspan(start, end, color=color, alpha=REGIME_WASH_ALPHA, linewidth=0, zorder=0)
+            self.ax.axvspan(start, end, ymin=REGIME_STRIP[0], ymax=REGIME_STRIP[1], color=color, linewidth=0,
+                            zorder=6, label=label)
+            if float((end - start).astype(np.int64)) / span >= REGIME_NAME_MIN_WIDTH:
+                self.ax.text(start + (end - start) / 2, sum(REGIME_STRIP) / 2, names[number],
+                             transform=self.ax.get_xaxis_transform(), ha="center", va="center", fontsize=7.5,
+                             color=_ink_on(color), zorder=7, clip_on=True)
+            if position:
+                for ax in self.axes:
+                    ax.axvline(start, color=color, linestyle=(0, (3, 3)), linewidth=1, alpha=0.8, zorder=1)
+
     def _finish(self, title, subtitle, ylabel, hover_values, hover_color, legend_columns, legend_location="upper left"):
         """Axes, titles, legend and floor shared by both charts, then the hidden hover artists."""
         ax = self.ax
@@ -225,7 +301,9 @@ class _HoverChart:
         ax.set_ylabel(ylabel, color=SECONDARY_INK, fontsize=9)
         ax.set_title(title, loc="left", color=PRIMARY_INK, fontsize=11)
         ax.set_title(subtitle, loc="right", color=SECONDARY_INK, fontsize=9)
-        legend = ax.legend(loc=legend_location, frameon=False, fontsize=9, ncols=legend_columns)
+        top = REGIME_STRIP[0] - 0.01 if regime_runs(self.result) else 1.0  # keep clear of the regime strip
+        legend = ax.legend(loc=legend_location, frameon=False, fontsize=9, ncols=legend_columns,
+                           bbox_to_anchor=(0, 0, 1, top))
         for text in legend.get_texts():
             text.set_color(SECONDARY_INK)
 
@@ -245,8 +323,9 @@ class _HoverChart:
                                     animated=True, visible=False)
         # Pinned to a top corner of the main chart rather than following the cursor, so a
         # long list of indicator values never runs off the edge.
+        self.tooltip_top = top - 0.02
         self.tooltip = ax.annotate(
-            "", xy=(0.99, 0.97), xycoords="axes fraction", ha="right", va="top",
+            "", xy=(0.99, self.tooltip_top), xycoords="axes fraction", ha="right", va="top",
             fontsize=9, color=PRIMARY_INK, animated=True, visible=False, zorder=10,
             bbox=dict(boxstyle="round,pad=0.6", facecolor=SURFACE, edgecolor=BORDER),
         )
@@ -286,7 +365,7 @@ class _HoverChart:
         self.tooltip.set_text(self.tooltip_text(index))
         # Sit in the corner away from the cursor so the tooltip never hides the hovered point.
         cursor_on_right = event.x > self.ax.bbox.x0 + self.ax.bbox.width / 2
-        self.tooltip.xy = (0.01, 0.97) if cursor_on_right else (0.99, 0.97)
+        self.tooltip.xy = (0.01, self.tooltip_top) if cursor_on_right else (0.99, self.tooltip_top)
         self.tooltip.set_horizontalalignment("left" if cursor_on_right else "right")
         for artist in self._hover_artists:
             artist.set_visible(True)
@@ -357,6 +436,7 @@ class BacktestChart(_HoverChart):
                          zorder=5, labels=True)
 
         self._shade_pauses()
+        self._shade_regimes()
         subtitle = f"{result['trade_count']:,} trades, {result['total_return']:+.2%} return"
         self._finish(
             title=f"{result['product_id']} close price, indicators and trades",
@@ -397,6 +477,9 @@ class BacktestChart(_HoverChart):
         """Every indicator's value at the candle, oscillators included."""
         lines = [_format_timestamp(self.result["series"]["time"][index]),
                  f"Close  {self.closes[index]:,.2f}"]
+        regime = regime_at(self.result, index)
+        if regime is not None:
+            lines.append(f"Regime  {regime}")
         for meta in self.result["indicators"]:
             if len(meta["outputs"]) == 1:
                 lines.append(f"{meta['label']}  {_format_value(self.indicators[meta['outputs'][0]][index])}")
@@ -567,6 +650,7 @@ class ModelValueChart(_HoverChart):
                         textcoords="offset points", ha="left", va="center", fontsize=9, color=PRIMARY_INK, zorder=5)
         if single:
             self._shade_pauses()
+            self._shade_regimes()
             ax.annotate(f"End {self.model_values[-1]:,.0f}", xy=(times[-1], self.model_values[-1]), xytext=(6, 0),
                         textcoords="offset points", ha="left", va="center", fontsize=9, color=PRIMARY_INK, zorder=5)
             title = f"{primary_run['product_id']} model value over time"
@@ -600,6 +684,9 @@ class ModelValueChart(_HoverChart):
             value, capital = self.run_values[position][nearest], run["starting_capital"]
             name = "Model value" if len(self.runs) == 1 else run.get("model_name", f"Model {position + 1}")
             lines.append(f"{name}  {value:,.2f} ({value / capital - 1:+.2%})")
+            regime = regime_at(run, nearest)
+            if regime is not None:
+                lines.append(f"{'Regime' if len(self.runs) == 1 else f'{name} regime'}  {regime}")
             tax_reserve = self.run_tax_reserves[position][nearest]
             tax_name = "Tax reserve" if len(self.runs) == 1 else f"{name} tax reserve"
             tax_name += f" ({_quote_currency(run)})"

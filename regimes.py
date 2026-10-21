@@ -73,10 +73,23 @@ class Regimes:
         self.min_hold = min_hold      # candles an active regime holds at least
         self.on_switch = on_switch
 
+    def summary(self):
+        """Each regime's detector, rules and settings as written, for reports: [{name, when, entry_all, ...}]."""
+        text = lambda block, key: [rule.text for rule in block[key]]  # noqa: E731
+        return [{"name": name, "when": text(self.when[number - 1], "all")[0] if number and self.when[number - 1]["all"]
+                 else None,
+                 "entry_all": text(self.entries[number], "all"), "entry_any": text(self.entries[number], "any"),
+                 "exit_all": text(self.exits[number], "all"), "exit_any": text(self.exits[number], "any"),
+                 "settings": self.settings[number]}
+                for number, name in enumerate(self.names)]
+
     def active(self, series, length):
         """The active regime's index (into names) on each candle, after the detection lag."""
         candidate = np.zeros(length, dtype=np.int64)
+        # Until every detector has warmed up the situation can't be judged, so no regime is a candidate.
         undecided = np.ones(length, dtype=bool)
+        for block in self.when:
+            undecided &= rules_ready(block, series, length)
         for number, block in enumerate(self.when, start=1):
             matched = evaluate_rules(block, series, length) & rules_ready(block, series, length) & undecided
             candidate[matched] = number
