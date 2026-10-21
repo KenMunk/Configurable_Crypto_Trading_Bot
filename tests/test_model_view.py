@@ -171,7 +171,7 @@ def test_format_elapsed():
 
 
 def test_describe_mode():
-    assert describe_mode(10, 8) == "parallel, 8 workers"  # never more workers than models
+    assert describe_mode(10, 8) == "parallel, 8 workers"  # history runs: never more workers than models
     assert describe_mode(10, 1) == "single-threaded (one model)"
     assert describe_mode(1, 8) == "single-threaded"
 

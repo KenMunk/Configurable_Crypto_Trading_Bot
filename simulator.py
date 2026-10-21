@@ -2059,7 +2059,8 @@ class SimulationWindow:
             start_time = parse_start_date(self.start_date_var.get())
             mode = self.test_options.get("mode", "historic")
             # One model on one set of data per worker at a time: history runs a task per model, scenario
-            # and stress runs a task per model per path. Auto: every CPU but two (scenario runs add the GPUs).
+            # and stress runs a task per model per path, spread over every worker. Auto: every CPU but two
+            # (scenario runs add the GPUs).
             workers = parse_workers(self.workers_var.get()) if self.parallel_var.get() else 1
             scenarios = synthetic.load_set(self.test_options["scenario_set"]) if mode in (
                 "historic+synthetic", "synthetic") else []
@@ -2091,8 +2092,9 @@ class SimulationWindow:
         self.metrics_text.delete("1.0", tk.END)
         self.run_button.state(["disabled"])
         self.result_var.set("Simulation status: testing the Coinbase API")
-        # Not `mode`: that is the data mode the worker needs. Scenario runs make a task per model per path.
-        run_kind = describe_mode(workers, len(models) if mode == "historic" else max(len(models), 2))
+        # Not `mode`: that is the data mode the worker needs. Scenario and stress runs make a task per model per path,
+        # shared across every worker; history runs a task per model.
+        run_kind = describe_mode(workers, len(models) if mode == "historic" else workers)
         self.run_timing = {"started": time.monotonic(), "mode": run_kind, "models": [name for name, _ in models],
                            "kind": "parallel" if run_kind.startswith("parallel") else "single"}
         self._show_time()

@@ -16,6 +16,7 @@ Nothing here is logged to the performance log or recorded as a currency's best m
 """
 
 import base64
+import collections
 import csv
 import html
 import io
@@ -294,16 +295,21 @@ def _model_of(task):
     return args[1] if function is _baseline_task else args[6]
 
 
-def _next_tasks(queues, busy, free):
-    """Up to `free` task numbers to start: the next task of each model not `busy`, taking the models in
-    turn. `queues` maps each model to its task numbers still to run, in order, and is consumed."""
+def _next_tasks(queues, running, free):
+    """Up to `free` task numbers to start, each the next task of the model with the fewest tasks `running`
+    (a Counter of tasks running per model, updated here), taking tied models in turn.
+
+    While several models have tasks left this spreads the work one model per worker; once fewer models
+    than workers are left, idle workers take more of the same model's tasks rather than waiting.
+    `queues` maps each model to its task numbers still to run, in order, and is consumed."""
     chosen = []
-    for model, queue in queues.items():
-        if len(chosen) == free:
+    while len(chosen) < free:
+        waiting = [model for model, queue in queues.items() if queue]
+        if not waiting:
             break
-        if queue and model not in busy:
-            chosen.append(queue.pop(0))
-            busy.add(model)
+        model = min(waiting, key=lambda name: running[name])  # min keeps the first of a tie: models in turn
+        chosen.append(queues[model].pop(0))
+        running[model] += 1
     return chosen
 
 
@@ -325,9 +331,11 @@ def run_stress(models, frictions, candles_by_market, combos, modes=MODES, wait_f
     Each model's run on its real history, and on each path of each combination (in every mode),
     is one task. With `workers` above 1, the tasks are shared out to that many worker processes,
     plus one per GPU when `compute_device` is "auto" or "cuda" and CUDA devices are visible
-    (supported indicators are then computed on the GPUs), but never more than there are models:
-    each worker runs one task at a time on one thread, and a model's tasks run one after another,
-    never on two workers at once. The records come back in the same order either way.
+    (supported indicators are then computed on the GPUs), but never more than there are tasks. Each
+    worker runs one task at a time on one thread. Free workers take the next task of the model with the
+    fewest running, so the models are spread across the workers, and when fewer models than workers have
+    tasks left, a model's tasks run on several workers at once instead of leaving workers idle. The
+    records come back in the same order either way.
 
     `worker_status(rows)`, when given, is called as the workers' activity changes (at most four
     times a second): one row per worker, {"worker": 1.., "doing": what it is running, or None
@@ -369,9 +377,8 @@ def _run(models, frictions, candles_by_market, combos, modes, wait_for_fresh_sig
         compute_device = "cpu"
     tasks = _tasks(models, frictions, combos, modes, wait_for_fresh_signal, compute_device, gpu_devices,
                    baseline, style, synthetic_dir)
-    # A worker per model at most: a model's tasks run one after another, never on two workers at once.
-    models_count = len({_model_of(task) for task in tasks})
-    workers = max(1, min(len(tasks), models_count, workers + len(gpu_devices) if workers > 1 else 1))
+    # Tasks are independent (each builds its own scenario candles), so a model's tasks can share the workers.
+    workers = max(1, min(len(tasks), workers + len(gpu_devices) if workers > 1 else 1))
     total = sum(runs for *_, runs in tasks)
     where = (f" on {workers} workers" + (f" (GPUs {gpu_devices})" if gpu_devices else "")) if workers > 1 else ""
     replies, done = [None] * len(tasks), 0
@@ -425,13 +432,13 @@ def _run(models, frictions, candles_by_market, combos, modes, wait_for_fresh_sig
         status = context.Queue() if worker_status is not None else None
         with ProcessPoolExecutor(max_workers=workers, mp_context=context,
                                  initializer=_start_worker, initargs=(histories, status)) as pool:
-            # One task per worker and per model at a time: a model's next task starts when its last ends.
-            queues, busy, pending = {}, set(), {}
+            # One task per worker at a time, the least-busy model's next first (see _next_tasks).
+            queues, running, pending = {}, collections.Counter(), {}
             for number, task in enumerate(tasks):
                 queues.setdefault(_model_of(task), []).append(number)
 
             def start_more():
-                for number in _next_tasks(queues, busy, workers - len(pending)):
+                for number in _next_tasks(queues, running, workers - len(pending)):
                     function, args, _ = tasks[number]
                     pending[pool.submit(function, *args)] = number
 
@@ -444,7 +451,7 @@ def _run(models, frictions, candles_by_market, combos, modes, wait_for_fresh_sig
                 ready, _ = wait(pending, timeout=0.25, return_when=FIRST_COMPLETED)
                 for future in ready:
                     number = pending.pop(future)
-                    busy.discard(_model_of(tasks[number]))
+                    running[_model_of(tasks[number])] -= 1
                     finished(number, future.result())
                 start_more()
                 report(status)

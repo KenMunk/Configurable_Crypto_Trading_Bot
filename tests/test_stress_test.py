@@ -136,28 +136,35 @@ def test_each_model_on_each_scenario_path_is_its_own_task():
     assert all(count == 2 for function, _, count in tasks if function is stress_test._combo_task)  # both modes
 
 
-def test_a_model_never_has_two_tasks_running_at_once():
-    queues, busy = {"a": [0, 2, 4], "b": [1, 3], "c": []}, set()
-    assert stress_test._next_tasks(queues, busy, free=5) == [0, 1]  # one task each; c has none left
-    assert stress_test._next_tasks(queues, busy, free=5) == []  # a and b are still running
-    busy.discard("a")
-    assert stress_test._next_tasks(queues, busy, free=5) == [2]  # a's next, once its last finished
-    busy.clear()
-    assert stress_test._next_tasks(queues, busy, free=1) == [4]  # never more than the free workers
+def test_free_workers_take_the_least_busy_models_task_and_share_a_model_when_others_run_out():
+    import collections
+    queues, running = {"a": [0, 2, 4, 5], "b": [1, 3], "c": []}, collections.Counter()
+    assert stress_test._next_tasks(queues, running, free=2) == [0, 1]  # one model per worker while both have work
+    running["a"] -= 1  # a's task finished
+    assert stress_test._next_tasks(queues, running, free=1) == [2]  # a has fewer running than b
+    running["b"] -= 1
+    assert stress_test._next_tasks(queues, running, free=1) == [3]  # now b has fewer running
+    assert stress_test._next_tasks(queues, running, free=5) == [4, 5]  # only a is left: it takes the idle workers
+    assert stress_test._next_tasks(queues, running, free=5) == []  # nothing left to start
 
 
-def test_never_more_workers_than_models_and_one_worker_per_model(monkeypatch):
-    profiles = [("fast", _profile(period_granularity="ONE_DAY")), ("slow", _profile(period_granularity="ONE_DAY"))]
+def test_one_model_runs_on_every_worker_with_the_same_results(monkeypatch):
+    profiles = [("fast", _profile(period_granularity="ONE_DAY"))]
     frictions = {name: FrictionModel(profile) for name, profile in profiles}
     combos = stress_test.combinations(SCENARIOS, [], pairs=2, max_paths=2)
+    markets = {("BTC-USD", "ONE_DAY"): _daily()}
+    clock = iter(range(0, 10 ** 6))  # every update passes the quarter-second throttle
+    monkeypatch.setattr(stress_test.time, "monotonic", lambda: next(clock))
     seen, progress = [], []
-    stress_test.run_stress(profiles, frictions, {("BTC-USD", "ONE_DAY"): _daily()}, combos, workers=6,
-                           compute_device="cpu", worker_status=seen.append,
-                           progress=lambda fraction, message: progress.append(message))
-    assert "on 2 workers" in progress[-1]  # 2 models: 2 workers, though 6 were allowed
-    for update in seen:
-        models = [row["doing"].split(":")[0] for row in update if row["doing"]]
-        assert len(models) == len(set(models))  # no model on two workers at once
+
+    parallel = stress_test.run_stress(profiles, frictions, markets, combos, workers=3, compute_device="cpu",
+                                      worker_status=seen.append,
+                                      progress=lambda fraction, message: progress.append(message))
+    serial = stress_test.run_stress(profiles, frictions, markets, combos)
+
+    assert "on 3 workers" in progress[-1]  # one model, but its tasks share all three workers
+    key = lambda record: (record["scenario"], record["mode"], record["path"], record["return"])  # noqa: E731
+    assert [key(r) for r in parallel[0]] == [key(r) for r in serial[0]]  # same results, same order
 
 
 def test_synthetic_scenarios_run_a_task_per_model_per_path_on_workers():
