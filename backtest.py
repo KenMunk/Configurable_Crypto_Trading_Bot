@@ -377,6 +377,13 @@ def run_backtest(candles, profile, starting_capital=None, progress=None, frictio
         metrics.cache(candles) if metrics is not None else candles,
         compute_device=compute_device, device_id=device_id)
     entry_ready = model.entry_ready(indicator_series)
+    regimes = model.regimes
+    active_regime = None
+    if regimes is not None:
+        # Each candle trades on its active regime's signals (detected with lag; see regimes.py).
+        active_regime, entry_signals, regime_exits, entry_ready = regimes.signals(
+            indicator_series, len(entry_signals))
+        exit_signals = regime_exits if any(block["all"] or block["any"] for block in regimes.exits) else None
     first = 0
     if start_time is not None:
         first = bisect.bisect_left([candle["start"] for candle in candles], start_time)
@@ -395,6 +402,8 @@ def run_backtest(candles, profile, starting_capital=None, progress=None, frictio
     entry_ready = entry_ready[first:]
     exit_signals = exit_signals[first:].tolist() if exit_signals is not None else None
     indicator_series = {name: values[first:] for name, values in indicator_series.items()}
+    if active_regime is not None:
+        active_regime = active_regime[first:].tolist()
     waiting_for_fresh_signal = wait_for_fresh_signal
 
     fee_rate = friction.fill_fee_rate
@@ -575,9 +584,23 @@ def run_backtest(candles, profile, starting_capital=None, progress=None, frictio
     equity_series = []
     tax_reserve_series = []
 
+    regime_switches = []
     for index, candle in enumerate(candles):
         entry_signal = entry_signals[index]
         episode = episode_at[index]
+        if active_regime is not None:
+            # The active regime's own stops, target and position size.
+            regime = regimes.settings[active_regime[index]]
+            use_hard_stop = regime["use_hard_stop"] and regime["hard_stop_trigger"]
+            hard_stop_pct = regime["hard_stop_percentage"]
+            profit_lock = regime["profit_lock_target"]
+            target_trail = regime["profit_lock_trail"]
+            trailing_stop = regime["trailing_stop"]
+            position_fraction = regime["target_position_fraction"]
+            round_trip_cost = 2 * (fee_rate + slippage) * position_fraction
+            if index and active_regime[index] != active_regime[index - 1]:
+                regime_switches.append({"time": candle["start"], "from": regimes.names[active_regime[index - 1]],
+                                        "to": regimes.names[active_regime[index]]})
 
         day = candle["start"] // 86_400
         if day != current_day:
@@ -627,6 +650,9 @@ def run_backtest(candles, profile, starting_capital=None, progress=None, frictio
                     sell(candle, max(target_price, candle["open"]), "PROFIT_LOCK")
         if entry is not None and not holding_through_crash and exit_signals is not None and exit_signals[index]:
             sell(candle, candle["close"], "EXIT_SIGNAL")
+        if (entry is not None and not holding_through_crash and regime_switches and regimes.on_switch == "close"
+                and regime_switches[-1]["time"] == candle["start"]):
+            sell(candle, candle["close"], "REGIME_SWITCH")
         if entry is not None:
             entry["highest"] = max(entry["highest"], candle["high"])
         if recovered_now:
@@ -744,4 +770,8 @@ def run_backtest(candles, profile, starting_capital=None, progress=None, frictio
                            for name in meta["outputs"]},
         },
         "unmodeled_settings": UNMODELED_SETTINGS,
+        "regimes": None if regimes is None else {
+            "names": regimes.names, "switches": regime_switches,
+            "share": {name: active_regime.count(number) / total for number, name in enumerate(regimes.names)},
+        },
     }

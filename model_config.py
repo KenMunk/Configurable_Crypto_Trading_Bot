@@ -26,6 +26,7 @@ from indicators import (
     price_scale_outputs,
     resolve_parameters,
 )
+from regimes import compile_regimes
 from rules import FUNCTIONS, Rule, RuleError, evaluate_rules, rules_ready
 
 LEGACY_INDICATOR_KEYS = ("fast_window_periods", "slow_window_periods", "emergency_ema_periods")
@@ -136,6 +137,8 @@ class CompiledModel:
                                          errors, allow_empty=False)
         self.exit_rules = self._compile(strategy.get("exit_signal", {}), known, "strategy.exit_signal",
                                         errors, allow_empty=True)
+        # Optional market regimes: per-situation rules and risk settings (see regimes.py).
+        self.regimes = compile_regimes(self.profile, self._compile, known, granularity_seconds, errors)
         if errors:
             raise ProfileError(errors)
 

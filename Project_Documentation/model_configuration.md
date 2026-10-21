@@ -192,6 +192,7 @@ Each block answers one question:
 | `execution` | How are orders placed? | `max_orders_per_day` |
 | `safeguards` | What limits the risk? | Hard stop, profit gate, drawdown limit and drawdown window |
 | `tax_allocation` | When are tax reserves set aside? | Nothing yet |
+| `regimes` (optional, experimental) | Which rules and risks fit the market's current situation? | All of it ([4.9](#49-regimes-experimental)) |
 
 Every simulation report ends with a **Not modeled yet** line. It lists the same six settings for every model, whether or not the profile sets them: the fields marked **Not modeled yet** in the [field reference](#4-field-reference).
 
@@ -430,6 +431,44 @@ Pauses are shaded gray on the charts and listed in the Metrics tab.
 | `schedule.month` | The month used by a yearly schedule, such as `12` for December. |
 | `schedule.time_utc` | The trigger time, in UTC. |
 | `description` | A human-readable description of the policy. |
+
+### 4.9 `regimes` (experimental)
+
+`regimes` lets one profile change its rules and risk settings with the market's situation. Each regime has a `when` rule that detects the situation, and settings that apply while it is active. The rest of the profile is the **base** regime, used whenever no `when` matches. The simulator and stress tests support regimes; the trader engine doesn't trade on them yet.
+
+```json
+"regimes": {
+  "confirm": "7d",
+  "min_hold": "30d",
+  "on_switch": "keep",
+  "list": [
+    {"name": "trend", "when": "close > lock * 1.25",
+     "exit_signal": {"any": ["votes <= 0"]}, "safeguards": {"use_hard_stop": false}},
+    {"name": "chop", "when": "adx.adx < 20",
+     "entry_signal": {"all": ["rsi < 30"]}, "exit_signal": {"any": ["rsi > 55"]},
+     "safeguards": {"use_hard_stop": true, "hard_stop_percentage": 0.08},
+     "capital_allocation": {"target_position_fraction": 0.5}}
+  ]
+}
+```
+
+| Field | Values | Default | Meaning |
+|---|---|---|---|
+| `list` | Regimes, checked in order | Required | The first regime whose `when` holds is the **candidate** on each candle. |
+| `confirm` | Duration or candle count | `1` | The **detection lag**: a candidate must stay the same for this long before it becomes the active regime. |
+| `min_hold` | Duration or candle count | `1` | Once a regime is active, it stays active at least this long, so the model doesn't flip back and forth. |
+| `on_switch` | `keep` or `close` | `keep` | What happens to an open position when the regime changes. `keep` holds it under the new regime's exits; `close` sells it at that candle's close (exit reason `REGIME_SWITCH`). |
+
+Each regime can set:
+
+- `name` (required to be unique) and `when` (required), plus an optional `description`.
+- `entry_signal` and `exit_signal`, written like the strategy's. A regime that leaves either out uses the base strategy's. Inside `exit_signal`, `trailing_stop`, `profit_lock_target`, `profit_lock_trail` and `hard_stop_trigger` apply to that regime.
+- `safeguards.use_hard_stop` and `safeguards.hard_stop_percentage`.
+- `capital_allocation.target_position_fraction`.
+
+Settings a regime leaves out come from the base profile. Indicators, friction, flash-crash buys, the drawdown limit and `max_orders_per_day` are shared by every regime. The friction screen uses the base profile's `profit_lock_target`.
+
+Detection only uses candles up to the current close, so it lags. Stops, trailing stops and flash-crash buys still act inside every candle, so give the fast protection to each regime's stops, and keep `confirm` for the slower question of which regime the market is in. Each result reports the regime switches and the share of candles spent in each regime under `regimes`.
 
 ---
 
