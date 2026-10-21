@@ -88,7 +88,7 @@ From top to bottom:
 
 Models are kept in one folder per currency, such as `config/DOGE-USD/` (see [config/README.md](../config/README.md)). The models are listed in two lists, each named after its file with its currency beside it: `doge_b_130   (DOGE-USD)`.
 
-- **Available**, on the left, lists the models you haven't chosen. **Currency** (top right) narrows it to one currency, and **Search** to models whose names contain every word you type, such as `doge b`. Its count says how many it shows, such as `Available: 239 of 447`.
+- **Available**, on the left, lists the models you haven't chosen. **Currency** (top right) narrows it to one currency; **Type** beside it to models with [market regimes](model_configuration.md#49-regimes-experimental) (**Regime models**) or without them (**Models without regimes**), which the list tags `regimes`; and **Search** to models whose names contain every word you type, such as `doge b`. Its count says how many it shows, such as `Available: 239 of 447`.
 - **Selected**, on the right, lists the models the next run tests, in the order you added them, whatever the currency filter shows.
 - **Add ›** moves the models highlighted in Available to the end of Selected; so does double-clicking one, or pressing **Enter**. Ctrl-click or Shift-click to highlight several. **Add all ››** moves every model Available shows, so filter or search first to add a whole group.
 - **‹ Remove** moves the models highlighted in Selected back to Available; so does double-clicking one, or pressing **Delete**. **‹‹ Remove all** empties Selected.
@@ -100,7 +100,7 @@ Models are kept in one folder per currency, such as `config/DOGE-USD/` (see [con
 - **Refresh** picks up files added to or removed from `config/`, and keeps Selected as it is. Files added with **Add file...** stay in the list while they still exist.
 - If two files share a name, the second appears as `name (2)`.
 
-**Each currency's historically best models.** A **▲** marks each currency's top models by full-history growth in the performance log (5 by default; set in **Test options...**). A row logged for an earlier version of a profile doesn't count. **Select top models** puts them in Selected (replacing what was there), or only the chosen currency's when the Currency filter is set, so testing can focus on the strongest candidates.
+**Each currency's historically best models.** A **▲** marks each currency's top models by full-history growth in the performance log (5 by default; set in **Test options...**). A row logged for an earlier version of a profile doesn't count. **Select top models** puts them in Selected (replacing what was there), or only those passing the Currency and Type filters when they are set, so testing can focus on the strongest candidates.
 
 **Each currency's best model.** When a run finishes, the simulator finds the best model of each currency it tested, by return, and:
 

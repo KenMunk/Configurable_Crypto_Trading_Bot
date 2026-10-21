@@ -707,3 +707,55 @@ def test_selecting_models_another_way_fills_the_selected_list(monkeypatch, tmp_p
         assert sorted(_names(window)) == ["alpha", "gamma"]
     finally:
         window.root.destroy()
+
+
+def test_model_matches_combines_the_currency_and_type_filters():
+    from simulator import ALL_CURRENCIES, ALL_MODELS, REGIME_MODELS, STANDARD_MODELS, model_matches
+
+    assert model_matches("BTC-USD", True, ALL_CURRENCIES, ALL_MODELS)
+    assert model_matches("BTC-USD", True, "BTC-USD", REGIME_MODELS)
+    assert not model_matches("BTC-USD", False, "BTC-USD", REGIME_MODELS)
+    assert model_matches("BTC-USD", False, ALL_CURRENCIES, STANDARD_MODELS)
+    assert not model_matches("BTC-USD", True, ALL_CURRENCIES, STANDARD_MODELS)
+    assert not model_matches("ETH-USD", True, "BTC-USD", REGIME_MODELS)
+
+
+def test_the_model_list_filters_regime_models_by_type_and_currency(monkeypatch, tmp_path):
+    import simulator
+    config = tmp_path / "library"
+    regimes = {"list": [{"name": "dip", "when": "close < 90"}]}
+    for name, product, folder, regime in (("alpha", "BTC-USD", "", False), ("switcher", "BTC-USD", "regimes", True),
+                                          ("delta", "ETH-USD", "", False), ("eth_switcher", "ETH-USD", "regimes", True)):
+        target = config / product / folder
+        target.mkdir(parents=True, exist_ok=True)
+        profile = {**_profile(), "product_id": product, **({"regimes": regimes} if regime else {})}
+        (target / f"{name}.json").write_text(json.dumps(profile), encoding="utf-8")
+    monkeypatch.setattr(simulator, "CONFIG_DIRECTORY", config)
+    monkeypatch.setattr(simulator, "load_environment_config", lambda: {})
+    root = tk.Tk()
+    root.geometry("+-3000+-3000")
+    window = simulator.SimulationWindow(root)
+    try:
+        assert list(window.model_type_picker["values"]) == simulator.MODEL_TYPES
+        window.selected_paths = set()
+
+        def shown(currency, model_type):
+            window.currency_var.set(currency)
+            window.model_type_var.set(model_type)
+            window._fill_model_list()
+            return sorted(_names(window))
+
+        assert shown("All currencies", simulator.REGIME_MODELS) == ["eth_switcher", "switcher"]
+        assert shown("All currencies", simulator.STANDARD_MODELS) == ["alpha", "delta"]
+        assert shown("BTC-USD", simulator.REGIME_MODELS) == ["switcher"]
+        assert shown("ETH-USD", simulator.ALL_MODELS) == ["delta", "eth_switcher"]
+        # Regime models are tagged in the list.
+        assert "(ETH-USD, regimes)" in window.model_list.get(1)
+        # Add all moves only what the filters show.
+        window.currency_var.set("All currencies")
+        window.model_type_var.set(simulator.REGIME_MODELS)
+        window._fill_model_list()
+        window._add_all_models()
+        assert sorted(_names(window, which="selected")) == ["eth_switcher", "switcher"]
+    finally:
+        window.root.destroy()

@@ -13,7 +13,7 @@ config/
 └── .example/             public templates
 ```
 
-The simulator lists the models in every currency folder, plus any profiles still at the top of this folder, in its **Models** list, with a **Currency** filter. The model search writes new models into its currency's folder. To move older profiles at the top of this folder (and in `config/discard/`) into their currency's folders, run:
+The simulator lists the models in every currency folder, plus any profiles still at the top of this folder, in its **Models** list, with a **Currency** filter and a **Type** filter for models with or without regimes. The model search writes new models into its currency's folder. To move older profiles at the top of this folder (and in `config/discard/`) into their currency's folders, run:
 
 ```bash
 python model_assessor.py --organize

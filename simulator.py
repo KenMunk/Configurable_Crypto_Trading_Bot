@@ -438,6 +438,16 @@ def trade_summary(trades):
 
 CONFIG_DIRECTORY = Path(__file__).parent / "config"
 ALL_CURRENCIES = "All currencies"
+# The Models list's Type filter: every model, only models with market regimes (see regimes.py), or only those without.
+ALL_MODELS, REGIME_MODELS, STANDARD_MODELS = "All models", "Regime models", "Models without regimes"
+MODEL_TYPES = [ALL_MODELS, REGIME_MODELS, STANDARD_MODELS]
+
+
+def model_matches(product, has_regimes, currency=ALL_CURRENCIES, model_type=ALL_MODELS):
+    """Whether a model of `product` (with or without regimes) passes the Models list's Currency and Type filters."""
+    if currency != ALL_CURRENCIES and product != currency:
+        return False
+    return model_type == ALL_MODELS or has_regimes == (model_type == REGIME_MODELS)
 
 # (key, heading, width in pixels, anchor) for each Comparison table column.
 COMPARISON_COLUMNS = [
@@ -916,7 +926,8 @@ class SimulationWindow:
 
         self.model_paths = []
         self.model_products = {}  # path -> product_id
-        self.selected_paths = set()  # chosen models, kept while the currency filter hides them
+        self.regime_paths = set()  # listed models with market regimes (the Type filter)
+        self.selected_paths = set()  # chosen models, kept while the Currency or Type filter hides them
         self.shown_paths = []  # the models the Available list shows, in its order
         self.selection_order = []  # the Selected list's order (selected_paths says which are selected)
         self.best_paths = set()  # each currency's recorded best model
@@ -963,6 +974,12 @@ class SimulationWindow:
         self.currency_picker.pack(side="right")
         self.currency_picker.bind("<<ComboboxSelected>>", lambda _event: self._fill_model_list())
         ttk.Label(heading_row, text="Currency:").pack(side="right", padx=(0, 6))
+        self.model_type_var = tk.StringVar(value=ALL_MODELS)
+        self.model_type_picker = ttk.Combobox(heading_row, textvariable=self.model_type_var, state="readonly",
+                                              width=22, values=MODEL_TYPES)
+        self.model_type_picker.pack(side="right", padx=(0, 16))
+        self.model_type_picker.bind("<<ComboboxSelected>>", lambda _event: self._fill_model_list())
+        ttk.Label(heading_row, text="Type:").pack(side="right", padx=(0, 6))
         self.include_discarded_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(heading_row, text="Include discarded models", variable=self.include_discarded_var,
                         command=self._refresh_models).pack(side="right", padx=(0, 16))
@@ -1562,7 +1579,9 @@ class SimulationWindow:
         added = [path for path in self.model_paths if path not in found and Path(path).exists()
                  and "discard" not in Path(path).parts]
         self.model_paths = found + added
-        self.model_products = {path: (read_profile(path) or {}).get("product_id", "") for path in self.model_paths}
+        profiles = {path: read_profile(path) or {} for path in self.model_paths}
+        self.model_products = {path: profile.get("product_id", "") for path, profile in profiles.items()}
+        self.regime_paths = {path for path, profile in profiles.items() if profile.get("regimes")}
         self.best_paths = {str(Path(record["path"]).resolve()) for record in read_best(CONFIG_DIRECTORY).values()}
         from model_assessor import log_rows
         listed = [path for path in self.model_paths if path not in self.discarded_paths]
@@ -1582,16 +1601,22 @@ class SimulationWindow:
     def _model_label(self, path, names):
         product = self.model_products.get(path)
         marks = ("\u2605" if path in self.best_paths else " ") + ("\u25b2 " if path in self.top_paths else "  ")
-        note = ", ".join(part for part in (product, "discarded" if path in self.discarded_paths else "") if part)
+        note = ", ".join(part for part in (product, "regimes" if path in self.regime_paths else "",
+                                           "discarded" if path in self.discarded_paths else "") if part)
         return f"{marks}{names[path]}" + (f"   ({note})" if note else "")
 
+    def _passes_model_filters(self, path):
+        """Whether a model passes the Currency and Type filters."""
+        return model_matches(self.model_products.get(path), path in self.regime_paths, self.currency_var.get(),
+                             self.model_type_var.get())
+
     def _fill_model_list(self):
-        """Fill both lists: Available shows the unselected models of the chosen currency that match the search;
-        Selected shows every selected model, in the order they were added."""
-        currency, search = self.currency_var.get(), self.model_search_var.get().lower().split()
+        """Fill both lists: Available shows the unselected models of the chosen currency and type that match the
+        search; Selected shows every selected model, in the order they were added."""
+        search = self.model_search_var.get().lower().split()
         names = dict(zip(self.model_paths, model_names(self.model_paths)))
         self.shown_paths = [path for path in self.model_paths if path not in self.selected_paths
-                            and (currency == ALL_CURRENCIES or self.model_products.get(path) == currency)
+                            and self._passes_model_filters(path)
                             and all(word in names[path].lower() for word in search)]
         self.model_list.delete(0, "end")
         for path in self.shown_paths:
@@ -1615,7 +1640,7 @@ class SimulationWindow:
         self._fill_model_list()
 
     def _add_all_models(self):
-        """Move every model the Available list shows (after the currency filter and search) to Selected."""
+        """Move every model the Available list shows (after the Currency and Type filters and search) to Selected."""
         self.model_list.select_set(0, "end")
         self._add_models()
 
@@ -1644,9 +1669,8 @@ class SimulationWindow:
             self.selected_list.select_set(index)
 
     def _select_top_models(self):
-        """Select each currency's historically best models (only the chosen currency's, when filtered)."""
-        currency = self.currency_var.get()
-        chosen = {path for path in self.top_paths if currency == ALL_CURRENCIES or self.model_products.get(path) == currency}
+        """Select each currency's historically best models (only those passing the Currency and Type filters)."""
+        chosen = {path for path in self.top_paths if self._passes_model_filters(path)}
         if chosen:
             self.selected_paths = chosen
             self._fill_model_list()
