@@ -69,3 +69,13 @@ def test_the_best_result_of_each_currency():
                {"product_id": "DOGE-USD", "total_return": 9}, {"product_id": "BTC-USD", "total_return": 1}]
 
     assert best_by_currency(results) == {"DOGE-USD": 2, "BTC-USD": 1}
+
+
+def test_models_with_regimes_are_listed_from_each_currencys_regimes_folder(tmp_path):
+    # Branches without regime support list only the top of a currency folder, so they never show these.
+    _write(tmp_path / "BTC-USD", "plain", _profile("BTC-USD"))
+    _write(tmp_path / "BTC-USD" / "regimes", "switching", _profile("BTC-USD"))
+
+    assert [path.relative_to(tmp_path).as_posix() for path in profile_paths(tmp_path)] == [
+        "BTC-USD/plain.json", "BTC-USD/regimes/switching.json"]
+    assert [folder.name for folder in currency_folders(tmp_path)] == ["BTC-USD"]

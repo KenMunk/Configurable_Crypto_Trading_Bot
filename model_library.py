@@ -3,6 +3,7 @@
     config/
         DOGE-USD/                 the DOGE-USD models, one profile per model
             discard/              models a ranking set aside, with discard_log.csv
+            regimes/              models with market regimes (experimental; see regimes.py)
             best_model.json       the simulator's pick: the best DOGE-USD model it has tested
         BTC-USD/ ...
         *.json                    profiles from before currency folders: still read, and moved
@@ -25,6 +26,9 @@ from file_lock import file_lock
 CONFIG_DIR = Path(__file__).parent / "config"
 DISCARD = "discard"
 DISCARD_LOG = "discard_log.csv"
+# Models with "regimes" (experimental) live in each currency's regimes/ folder. Branches without regime support
+# list only the top of a currency folder, so they never show these models and silently trade their base rules.
+REGIME_FOLDER = "regimes"
 BEST_FILE = "best_model.json"
 # Held while model files are added to, moved within or named in a model library, by any process.
 LOCK_NAME = ".models.lock"
@@ -56,11 +60,12 @@ def currency_folders(config_dir=CONFIG_DIR):
 
 
 def profile_paths(config_dir=CONFIG_DIR):
-    """Every model profile in the library: config/*.json, then each currency folder's *.json."""
+    """Every model profile in the library: config/*.json, then each currency folder's *.json and its regimes/*.json."""
     config_dir = Path(config_dir)
     paths = sorted(config_dir.glob("*.json")) if config_dir.is_dir() else []
     for folder in currency_folders(config_dir):
         paths += [path for path in sorted(folder.glob("*.json")) if path.name != BEST_FILE]
+        paths += sorted((folder / REGIME_FOLDER).glob("*.json"))
     return paths
 
 

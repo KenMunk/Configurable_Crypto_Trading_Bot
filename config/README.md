@@ -6,6 +6,7 @@ This folder holds the **model profiles**: JSON files that each describe one comp
 config/
 ├── DOGE-USD/             the DOGE-USD models
 │   ├── discard/          models a ranking set aside, with discard_log.csv
+│   ├── regimes/          models with market regimes (experimental)
 │   └── best_model.json   the best DOGE-USD model the simulator has tested
 ├── BTC-USD/ ...
 ├── *.json                profiles from before currency folders (still read)
@@ -27,6 +28,7 @@ A profile without a `product_id`, or whose name is already taken in its currency
 | `*.json` | **Ignored** | Your private model profiles. Git never sees them. |
 | [.example/](.example/) | Tracked | Public template profiles to copy from. |
 | `<PRODUCT>/` | **Ignored** | One folder per currency, such as `DOGE-USD/`, holding its models. |
+| `<PRODUCT>/regimes/` | **Ignored** | Models with [market regimes](../Project_Documentation/model_configuration.md#49-regimes-experimental) (experimental). The simulator lists them with the rest. Keep them here, not at the top of the currency folder: a branch without regime support doesn't list this folder, so it can't silently trade such a model on its base rules alone. |
 | `<PRODUCT>/discard/` | **Ignored** | Models the [ranking](../search_config/README.md#ranking-and-the-discard-folder) set aside, with `discard_log.csv` recording why. The simulator doesn't list them. Bring one back with `python model_assessor.py --restore <name>`. |
 | `<PRODUCT>/best_model.json` | **Ignored** | The currency's best model, recorded by the simulator after a full-history run, and starred and pre-selected in its Models list. |
 | `.models.lock` | **Ignored** | Exists only while a search or the assessor is naming, writing or moving models. |

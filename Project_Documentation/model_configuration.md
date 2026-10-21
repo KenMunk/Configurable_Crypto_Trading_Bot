@@ -436,6 +436,8 @@ Pauses are shaded gray on the charts and listed in the Metrics tab.
 
 `regimes` lets one profile change its rules and risk settings with the market's situation. Each regime has a `when` rule that detects the situation, and settings that apply while it is active. The rest of the profile is the **base** regime, used whenever no `when` matches. The simulator and stress tests support regimes; the trader engine doesn't trade on them yet.
 
+Save a profile with regimes in its currency's `regimes/` folder, such as `config/BTC-USD/regimes/`. The simulator lists that folder with the rest; code without regime support (the `main` branch, for now) doesn't, so it can't pick the model up and quietly trade only its base rules.
+
 ```json
 "regimes": {
   "confirm": "7d",
