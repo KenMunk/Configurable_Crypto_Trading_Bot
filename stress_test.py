@@ -345,8 +345,8 @@ def run_stress(models, frictions, candles_by_market, combos, modes=MODES, wait_f
     With `synthetic_dir` (such as synthetic.SYNTHETIC_DIR), every scenario path's candles are kept
     in that folder's synthetic.SyntheticStore, apart from the real history.
 
-    With a memory_guard.MemoryGuard, the results keep less chart data as memory fills, and the run
-    stops starting new tasks at the guard's budget (memory_guard.stopped then says so).
+    With a memory_guard.MemoryGuard, the run slows down as memory fills: fewer tasks run at once, down
+    to one at the guard's budget, and the results keep less chart data. Every task still runs.
     """
     records, baselines, results, _ = _run(models, frictions, candles_by_market, combos, modes,
                                           wait_for_fresh_signal, progress, stop, workers, compute_device,
@@ -415,19 +415,16 @@ def _run(models, frictions, candles_by_market, combos, modes, wait_for_fresh_sig
             worker_status([dict(row) for row in rows])
 
     def finished(number, reply):
-        """Keep a task's reply; False when the memory guard says the run must stop."""
         nonlocal done
         replies[number] = reply
-        within = True
         if memory_guard is not None:
-            # The earlier results are only walked the first time the guard thins (thinning twice changes nothing).
-            within = memory_guard.admit(_results_of(reply), (result for earlier in replies if earlier is not None
-                                                               for result in _results_of(earlier)))
+            # The earlier results are only walked when the guard thins further (thinning twice changes nothing).
+            memory_guard.admit(_results_of(reply), (result for earlier in replies if earlier is not None
+                                                    for result in _results_of(earlier)))
         done += tasks[number][2]
         if progress is not None:
             kind = "stress" if style == "stress" else "scenario"
             progress(done / max(total, 1), f"{done} of {total} {kind} runs{where} ({_describe(tasks[number])})")
-        return within
 
     if workers == 1:
         direct = None if worker_status is None else _Direct(lambda event: (note(*event), report(None)))
@@ -436,8 +433,7 @@ def _run(models, frictions, candles_by_market, combos, modes, wait_for_fresh_sig
             for number, (function, args, _) in enumerate(tasks):
                 if stop is not None and stop():
                     break
-                if not finished(number, function(*args)):
-                    break
+                finished(number, function(*args))
         finally:
             _start_worker({})
     else:
@@ -458,14 +454,16 @@ def _run(models, frictions, candles_by_market, combos, modes, wait_for_fresh_sig
                 queues.setdefault(_model_of(task), []).append(number)
 
             def start_more():
-                for number in _next_tasks(queues, running, workers - len(pending)):
+                # As memory fills, the guard lets fewer tasks run at once (see memory_guard.py).
+                free = (memory_guard.slots(workers, len(pending)) if memory_guard is not None
+                        else workers - len(pending))
+                for number in _next_tasks(queues, running, free):
                     function, args, _ = tasks[number]
                     pending[pool.submit(function, *args)] = number
 
             start_more()
-            within = True
             while pending:
-                if not within or (stop is not None and stop()):
+                if stop is not None and stop():
                     for future in pending:
                         future.cancel()
                     break
@@ -473,9 +471,8 @@ def _run(models, frictions, candles_by_market, combos, modes, wait_for_fresh_sig
                 for future in ready:
                     number = pending.pop(future)
                     running[_model_of(tasks[number])] -= 1
-                    within = finished(number, future.result()) and within
-                if within:
-                    start_more()
+                    finished(number, future.result())
+                start_more()
                 report(status)
         report(status, force=True)
 

@@ -246,8 +246,8 @@ def run_parallel(client, models, workers=None, start_time=None, wait_for_fresh_s
     every run_backtest. `progress(phase, fraction, message)`, with phase "data" or
     "simulation", may be called from any of the run's threads. Without `keep_heavy`, the
     results leave out HEAVY_KEYS. With `performance_path` None, nothing is logged. With a
-    memory_guard.MemoryGuard, the results keep less chart data as memory fills, and the models not
-    yet started are cancelled at the guard's budget (memory_guard.stopped then says so).
+    memory_guard.MemoryGuard, the run slows down as memory fills: the results' chart data goes to disk
+    and fewer models run at once, down to one at the guard's budget. Every model still runs.
 
     Returns {"results": [result or None, in model order], "errors": {name: message},
     "logged": a status line for the performance log}.
@@ -289,6 +289,16 @@ def run_parallel(client, models, workers=None, start_time=None, wait_for_fresh_s
                                     *market["window"], report)] = (product_id, granularity)
 
         pending, done_count = set(downloads), 0
+        waiting, running = [], set()  # models whose candles are ready, waiting for a slot; models running
+
+        def start_models():
+            """Start waiting models while there are slots: every worker, or fewer as memory fills."""
+            free = (memory_guard.slots(workers, len(running)) if memory_guard is not None
+                    else workers - len(running))
+            for _ in range(min(free, len(waiting))):
+                future = pool.submit(_backtest_task, *waiting.pop(0))
+                running.add(future)
+                pending.add(future)
         worker_description = f"{workers} workers"
         if gpu_workers:
             worker_description += f" ({workers - gpu_workers} CPU-capacity + {gpu_workers} GPU-added)"
@@ -298,18 +308,15 @@ def run_parallel(client, models, workers=None, start_time=None, wait_for_fresh_s
         while pending:
             finished, pending = wait(pending, return_when=FIRST_COMPLETED)
             for future in finished:
-                if future.cancelled():  # cancelled at the memory limit
-                    continue
                 if future in downloads:
                     future.result()  # a failed download stops the run
-                    if memory_guard is not None and memory_guard.stopped:
-                        continue  # a download that was under way at the memory limit: start no more models
                     key = downloads[future]
                     market = (*key, *markets[key]["window"])
                     for index in markets[key]["models"]:
                         name, profile = models[index]
-                        pending.add(pool.submit(_backtest_task, index, name, profile, market, keep_heavy))
+                        waiting.append((index, name, profile, market, keep_heavy))
                     continue
+                running.discard(future)
                 reply = future.result()
                 metrics = []
                 for table, columns, extend in reply["metrics"]:
@@ -326,14 +333,13 @@ def run_parallel(client, models, workers=None, start_time=None, wait_for_fresh_s
                     results[reply["index"]] = reply["result"]
                     if gatherer is not None:
                         gatherer.shards.put(reply["shard"])
-                    if memory_guard is not None and not memory_guard.admit(
-                            [reply["result"]], (result for result in results if result is not None)):
-                        for other in pending:  # the models not started yet; running ones finish
-                            other.cancel()
+                    if memory_guard is not None:
+                        memory_guard.admit([reply["result"]], (result for result in results if result is not None))
                 done_count += 1
                 progress("simulation", done_count / len(models),
                          f"{done_count} of {len(models)} models done ({reply['name']}"
                          + (" failed)" if "error" in reply else ")"))
+            start_models()
     finally:
         pool.shutdown(cancel_futures=True)
         writer.shutdown()  # the metric writes still queued finish first

@@ -24,7 +24,8 @@ from backtest import (
 )
 from friction import FrictionModel, fetch_friction_inputs
 from model_library import discard_folders, profile_paths, read_best, read_profile, update_best
-from memory_guard import DEFAULT_PERCENT as DEFAULT_MEMORY_PERCENT, MemoryGuard, available_memory, format_bytes
+from memory_guard import (DEFAULT_PERCENT as DEFAULT_MEMORY_PERCENT, MemoryGuard, available_memory, clean_spills,
+                          format_bytes)
 from parallel_backtest import max_workers, parse_workers, run_parallel
 from scenario_editor import describe_mode as describe_data_mode, load_options
 import synthetic
@@ -955,6 +956,7 @@ class SimulationWindow:
         # The memory free at launch: each run may use the Memory limit's share of it (see memory_guard.py).
         self.launch_free_memory = available_memory()
         self.memory_guard = None  # each run makes its own (see _run_guard)
+        clean_spills()  # chart data earlier sessions kept on disk; their results are gone
         self.results = []
         self.in_view = []  # positions in self.results of the models the charts show
         self.color_slots = {}  # position -> color slot, stable while the model stays in view
@@ -2173,7 +2175,7 @@ class SimulationWindow:
             elif mode != "synthetic":
                 results, logged, candles_by_market = self._serial_results(
                     client, models, frictions, start_time, wait_for_fresh_signal)
-            if mode != "historic" and not self._run_guard().stopped:
+            if mode != "historic":
                 if not candles_by_market:
                     candles_by_market = self._gather_markets(client, models)
                 results = results + self._synthetic_runs(models, frictions, candles_by_market, scenarios,
@@ -2225,8 +2227,7 @@ class SimulationWindow:
             result["model_name"] = name
             result["granularity"] = granularity
             results.append(result)
-            if not self._run_guard().admit([result], results):
-                break  # at the memory limit: log and show the models run so far
+            self._run_guard().admit([result], results)  # chart data to disk as memory fills
         path = self.performance_log_path
         try:
             logged = describe_update(update_performance_log(
@@ -2331,6 +2332,8 @@ class SimulationWindow:
                 webbrowser.open(Path(event[1]).as_uri())
             elif kind == "done":
                 self.results, logged = event[1], event[2]
+                # The earlier run's chart data on disk belongs to results no longer shown.
+                clean_spills(keep=[self.memory_guard.spill_folder] if self.memory_guard is not None else [])
                 best = max(range(len(self.results)), key=lambda i: self.results[i]["total_return"])
                 self._show_comparison(self.results)
                 self._show_scenarios(self.results)

@@ -1,27 +1,46 @@
-"""Keep a simulation run's memory use under a budget, so a big run can't exhaust the computer's memory.
+"""Keep a simulation run's memory use under a budget, so a big run can't exhaust the computer's memory
+but still finishes with every result and every chart point.
 
 Every run keeps each result's chart data (price, model value and indicator series), and a stress test
 of many models makes hundreds of thousands of results: enough to fill the memory and stop the computer
 responding. A MemoryGuard gives the run a budget, by default 80% of the memory that was free when the
 simulator launched, and measures the run against it as the fall in free memory since then (so the
-worker processes count too). As the run approaches the budget, the guard steps in twice:
+worker processes count too). As the run uses more of its budget, the guard steps in:
 
-    at THIN_AT of the budget   the results keep THIN_POINTS evenly spaced points of chart data each,
-                               the ones already collected included; returns, trades and reports are
-                               unchanged, as only the charts read the series
-    at the budget              the run stops starting new work, keeps what it has, and says why
+    share of the budget   chart series                          tasks running at once
+    under 60%             kept in memory                        every worker
+    60% and over          written to disk (data/chart_spill/)   every worker
+    80% and over          on disk                               half the workers
+    90% and over          on disk                               a quarter of them
+    at the budget         on disk                               one
+
+A spilled result keeps a SpilledSeries in place of its series: it reads the file when a chart or table
+first needs it, and the SPILL_CACHE most recently read stay in memory. Nothing is thinned and no task
+is cancelled: the run goes on, more slowly, and every chart keeps every point.
 
 Free memory is read from the operating system (no extra package is needed): GlobalMemoryStatusEx on
 Windows, /proc/meminfo on Linux, sysconf elsewhere. Where it can't be read, the guard does nothing.
 """
 
+import collections
+import collections.abc
 import ctypes
+import gc
 import os
+import pickle
+import shutil
 import sys
+import time
+from pathlib import Path
+
+import numpy as np
 
 DEFAULT_PERCENT = 80
-THIN_AT = 0.75
-THIN_POINTS = 2000
+SPILL_AT = 0.6  # share of the budget from which chart series are written to disk
+# (share of the budget, share of the workers that may run at once), highest first.
+THROTTLE = [(1.0, 0.0), (0.9, 0.25), (0.8, 0.5)]
+SPILL_ROOT = Path(__file__).parent / "data" / "chart_spill"
+SPILL_CACHE = 16  # spilled series kept in memory once read: enough for a chart comparing several models
 
 
 def available_memory():
@@ -52,38 +71,121 @@ def format_bytes(count):
     return f"{count / 2 ** 30:.1f} GB"
 
 
-def thin_series(result, points=None):
-    """Keep `points` (default THIN_POINTS) evenly spaced candles, the last always, of the result's chart
-    series, in place."""
-    points = points or THIN_POINTS
-    series = result.get("series")
-    if not series or len(series.get("time", ())) <= points:
-        return result
-    length = len(series["time"])
-    keep = sorted({round(i * (length - 1) / (points - 1)) for i in range(points)})
-    pick = lambda values: [values[i] for i in keep]  # noqa: E731  (lists and numpy arrays alike)
-    for key, values in list(series.items()):
-        if key == "indicators":
-            series[key] = {name: pick(line) for name, line in values.items()}
-        elif len(values) == length:
-            series[key] = pick(values)
-    result["series_thinned"] = True
-    return result
+# --- chart series on disk --------------------------------------------------------------------------------
 
+_loaded = collections.OrderedDict()  # path -> series, the SPILL_CACHE most recently read
+
+
+def _pack(values):
+    """(array, was a list) for one series: a compact array on disk, the list given back as a list."""
+    return np.asarray(values), isinstance(values, list)
+
+
+def _unpack(packed):
+    array, was_list = packed
+    return array.tolist() if was_list else array
+
+
+class SpilledSeries(collections.abc.Mapping):
+    """A result's chart series, kept in a file: reads like the dict it replaced, loading it when first used."""
+
+    def __init__(self, path):
+        self.path = str(path)
+
+    def _series(self):
+        if self.path in _loaded:
+            _loaded.move_to_end(self.path)
+            return _loaded[self.path]
+        with open(self.path, "rb") as handle:
+            packed = pickle.load(handle)
+        series = {key: ({name: _unpack(line) for name, line in value.items()} if key == "indicators"
+                        else _unpack(value)) for key, value in packed.items()}
+        _loaded[self.path] = series
+        while len(_loaded) > SPILL_CACHE:
+            _loaded.popitem(last=False)
+        return series
+
+    def __getitem__(self, key):
+        return self._series()[key]
+
+    def __iter__(self):
+        return iter(self._series())
+
+    def __len__(self):
+        return len(self._series())
+
+
+def spill_series(result, folder, number):
+    """Write the result's chart series to `folder` and put a SpilledSeries in its place. Returns True if it did."""
+    series = result.get("series")
+    if not isinstance(series, dict) or not series:
+        return False  # none, or already on disk
+    folder.mkdir(parents=True, exist_ok=True)
+    path = folder / f"{number:07d}.pkl"
+    packed = {key: ({name: _pack(line) for name, line in value.items()} if key == "indicators" else _pack(value))
+              for key, value in series.items()}
+    with open(path, "wb") as handle:
+        pickle.dump(packed, handle, protocol=pickle.HIGHEST_PROTOCOL)
+    result["series"] = SpilledSeries(path)
+    return True
+
+
+def _process_alive(pid):
+    """Whether process `pid` is running (os.kill(pid, 0) would send CTRL_C_EVENT on Windows, so not that)."""
+    if pid == os.getpid():
+        return True
+    if sys.platform == "win32":
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+        if not handle:
+            return False
+        code = ctypes.c_ulong()
+        alive = bool(kernel32.GetExitCodeProcess(handle, ctypes.byref(code))) and code.value == 259  # STILL_ACTIVE
+        kernel32.CloseHandle(handle)
+        return alive
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def clean_spills(keep=(), root=None):
+    """Delete the spill folders of earlier runs, except those in `keep` (whose results are still shown) and
+    those of other simulator windows still open (each folder is named after its process)."""
+    root = Path(root or SPILL_ROOT)
+    keep = {Path(folder).resolve() for folder in keep if folder is not None}
+    for folder in root.glob("*") if root.is_dir() else ():
+        parts = folder.name.split("_")
+        owner = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else None
+        if owner is not None and owner != os.getpid() and _process_alive(owner):
+            continue  # another simulator window's results
+        if folder.is_dir() and folder.resolve() not in keep:
+            for path in folder.glob("*"):
+                _loaded.pop(str(path), None)
+            shutil.rmtree(folder, ignore_errors=True)
+
+
+# --- the guard -------------------------------------------------------------------------------------------
 
 class MemoryGuard:
     """A run's memory budget: `percent` of `baseline`, the bytes free when the simulator launched
-    (measured now when not given). `measure` reads the bytes free now (see available_memory)."""
+    (measured now when not given). `measure` reads the bytes free now (see available_memory). Spilled
+    chart series go to a new folder under `spill_root`."""
 
-    def __init__(self, percent=DEFAULT_PERCENT, baseline=None, measure=available_memory):
+    def __init__(self, percent=DEFAULT_PERCENT, baseline=None, measure=available_memory, spill_root=None):
         if not 0 < percent <= 100:
             raise ValueError(f"The memory limit must be a percentage above 0 and at most 100, not {percent!r}")
         self.measure = measure
         self.percent = percent
         self.baseline = baseline if baseline is not None else measure()
         self.budget = None if not self.baseline else self.baseline * percent / 100
-        self.thinned = False  # results keep only THIN_POINTS of chart data from here on
-        self.stopped = None  # why the run stopped early, if it did
+        self.spill_folder = Path(spill_root or SPILL_ROOT) / f"{time.strftime('%Y%m%d_%H%M%S')}_{os.getpid()}_{id(self)}"
+        self.spilling = False  # chart series go to disk from here on
+        self.spilled = 0
+        self.fewest_workers = None  # the fewest tasks the guard let run at once, when it slowed the run
         self.peak = 0
 
     def used(self):
@@ -95,35 +197,46 @@ class MemoryGuard:
         self.peak = max(self.peak, used)
         return used
 
-    def check(self):
-        """"ok", "thin" (past THIN_AT of the budget) or "stop" (at the budget), from memory in use now."""
-        if not self.budget:
-            return "ok"
-        share = self.used() / self.budget
-        return "stop" if share >= 1 else "thin" if share >= THIN_AT else "ok"
+    def share(self):
+        """The share of the budget in use now (0 without a budget)."""
+        return self.used() / self.budget if self.budget else 0.0
+
+    def _spill(self, result):
+        if spill_series(result, self.spill_folder, self.spilled):
+            self.spilled += 1
 
     def admit(self, new_results, collected=()):
-        """Check the memory after results came in: thin `new_results` (and, the first time, the results
-        `collected` before them) once past THIN_AT, and return False when the run must stop."""
-        state = self.check()
-        if state != "ok" and not self.thinned:
-            self.thinned = True
+        """Once memory passes SPILL_AT of the budget, write `new_results`' chart series to disk, and the
+        first time, those of the results `collected` earlier too, letting the memory they held go."""
+        if not self.spilling and self.share() >= SPILL_AT:
+            self.spilling = True
             for result in collected:
-                thin_series(result)
-        if self.thinned:
+                self._spill(result)
+            gc.collect()
+        if self.spilling:
             for result in new_results:
-                thin_series(result)
-        if state == "stop" and self.stopped is None:
-            self.stopped = (f"stopped at the memory limit: {format_bytes(self.used())} in use of the "
-                            f"{format_bytes(self.budget)} allowed ({self.percent:g}% of the "
-                            f"{format_bytes(self.baseline)} free at launch)")
-        return state != "stop"
+                self._spill(result)
+
+    def slots(self, workers, running=0):
+        """How many more tasks may start now, with `running` already running on up to `workers`: fewer
+        as memory fills, down to one at a time at the budget (so a new task waits for the running ones to
+        finish and free their memory). Never 0 when nothing is running, so a run always moves on."""
+        share = self.share()
+        step = next((fraction for at, fraction in THROTTLE if share >= at), None)
+        if step is None:
+            return max(0, workers - running)
+        allowed = max(1, int(workers * step))
+        self.fewest_workers = allowed if self.fewest_workers is None else min(self.fewest_workers, allowed)
+        return max(0, allowed - running)
 
     def describe(self):
         """A note for the run's status line, or "" when the guard didn't step in."""
         notes = []
-        if self.thinned:
-            notes.append(f"charts kept {THIN_POINTS:,} points per result to stay under the memory limit")
-        if self.stopped:
-            notes.append(self.stopped)
-        return "; ".join(notes)
+        if self.spilled:
+            notes.append(f"chart data of {self.spilled:,} results kept on disk")
+        if self.fewest_workers is not None:
+            notes.append(f"slowed to {self.fewest_workers} task{'s' if self.fewest_workers != 1 else ''} at a time")
+        if not notes:
+            return ""
+        return (" and ".join(notes) + f" to stay under the memory limit (peak {format_bytes(self.peak)} of "
+                f"{format_bytes(self.budget)}, {self.percent:g}% of the {format_bytes(self.baseline)} free at launch)")
