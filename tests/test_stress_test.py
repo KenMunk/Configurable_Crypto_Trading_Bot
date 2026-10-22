@@ -98,8 +98,10 @@ def test_every_model_runs_every_combination_alone_and_with_history_and_reports_a
     model_page = (tmp_path / "report" / "fast.html").read_text(encoding="utf-8")
     assert "Scenarios alone" in model_page and "Scenarios with history" in model_page
     assert model_page.count("data:image/png;base64,") == 3  # worst runs, and a chart for each mode
-    assert "report.pdf" in page
-    pdf = (tmp_path / "report" / "report.pdf").read_bytes()
+    pdf_path = stress_test.report_pdf(index)
+    assert re.fullmatch(r"report_\d{8}_\d{6}\.pdf", pdf_path.name)  # named with the time it was written
+    assert f"href='{pdf_path.name}'" in page
+    pdf = pdf_path.read_bytes()
     pages = len(re.findall(rb"/Type /Page[^s]", pdf))
     per_mode = {(record["model"], record["mode"]): 0 for record in records}
     for record in records:

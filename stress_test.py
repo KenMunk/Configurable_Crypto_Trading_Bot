@@ -10,7 +10,7 @@ Run from the simulator (Test options... > "Stress test"). For each tested model:
 each of 2-3 measured two ways: "alone" from the scenario's first candle, and "with history" over
 the full real history with the scenario appended. A scenario with several paths contributes up
 to `max_paths` of them. Reports go to data/stress_reports/<time>/: index.html ranks the models
-by their worst result, <model>.html details each one, report.pdf holds all of it in one file, and
+by their worst result, <model>.html details each one, report_<time>.pdf holds all of it in one file, and
 results.csv holds every run.
 
 Nothing here is logged to the performance log or recorded as a currency's best model.
@@ -858,9 +858,11 @@ def write_pdf_report(path, rows, by_model, profiles=None, settings=""):
 
 
 def write_reports(records, baselines, profiles=None, settings="", folder=None):
-    """Write index.html, a report per model, report.pdf (the whole report in one file) and results.csv;
-    returns the index path."""
-    folder = Path(folder or REPORT_DIR / datetime.now().strftime("%Y%m%d_%H%M%S"))
+    """Write index.html, a report per model, report_<time>.pdf (the whole report in one file, named with
+    the same time as the report's folder) and results.csv; returns the index path (see report_pdf)."""
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    folder = Path(folder or REPORT_DIR / stamp)
+    pdf_name = f"report_{stamp}.pdf"
     folder.mkdir(parents=True, exist_ok=True)
     profiles = profiles or {}
     by_model = {}
@@ -889,7 +891,7 @@ def write_reports(records, baselines, profiles=None, settings="", folder=None):
 <style>{STYLE}</style></head><body><h1>Stress test summary</h1>
 <p class='note'>{datetime.now(timezone.utc):%Y-%m-%d %H:%M} UTC &middot; {html.escape(settings)}. Models are ranked
 by their worst result: the most robust first. Every run's numbers are in <a href='results.csv'>results.csv</a>;
-the whole report is also in <a href='report.pdf'>report.pdf</a>.</p>
+the whole report is also in <a href='{pdf_name}'>{pdf_name}</a>.</p>
 <table><tr><th class='l'>Model</th><th class='l'>Currency</th><th>Historic</th><th>Runs</th><th>Lost money</th>
 <th>Beat buy &amp; hold</th><th>Median</th><th>Worst</th><th>Worst drawdown</th><th>Nightmares lost</th>
 <th class='l'>Verdict</th></tr>{body}</table></body></html>""", encoding="utf-8")
@@ -900,5 +902,10 @@ the whole report is also in <a href='report.pdf'>report.pdf</a>.</p>
         writer = csv.DictWriter(handle, fieldnames=columns, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(list(baselines.values()) + records)
-    write_pdf_report(folder / "report.pdf", rows, by_model, profiles, settings)
+    write_pdf_report(folder / pdf_name, rows, by_model, profiles, settings)
     return index
+
+
+def report_pdf(index):
+    """The PDF beside a report's index.html (the latest, if the folder holds several), or None."""
+    return max(Path(index).parent.glob("report_*.pdf"), default=None)
