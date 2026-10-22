@@ -236,7 +236,7 @@ class _Gatherer(threading.Thread):
 
 def run_parallel(client, models, workers=None, start_time=None, wait_for_fresh_signal=False,
                  friction_inputs=None, cache_dir=DEFAULT_CACHE_DIR, performance_path=PERFORMANCE_LOG,
-                 shard_root=None, progress=None, keep_heavy=True, now=None, compute_device="auto"):
+                 shard_root=None, progress=None, keep_heavy=True, now=None, compute_device="auto", memory_guard=None):
     """Backtest each (name, profile) in `models` on `workers` processes; see the module docstring.
 
     `workers` defaults to max_workers() and never exceeds it, nor the number of models.
@@ -245,7 +245,9 @@ def run_parallel(client, models, workers=None, start_time=None, wait_for_fresh_s
     each profile's fallback rates). `start_time` and `wait_for_fresh_signal` are passed to
     every run_backtest. `progress(phase, fraction, message)`, with phase "data" or
     "simulation", may be called from any of the run's threads. Without `keep_heavy`, the
-    results leave out HEAVY_KEYS. With `performance_path` None, nothing is logged.
+    results leave out HEAVY_KEYS. With `performance_path` None, nothing is logged. With a
+    memory_guard.MemoryGuard, the results keep less chart data as memory fills, and the models not
+    yet started are cancelled at the guard's budget (memory_guard.stopped then says so).
 
     Returns {"results": [result or None, in model order], "errors": {name: message},
     "logged": a status line for the performance log}.
@@ -296,8 +298,12 @@ def run_parallel(client, models, workers=None, start_time=None, wait_for_fresh_s
         while pending:
             finished, pending = wait(pending, return_when=FIRST_COMPLETED)
             for future in finished:
+                if future.cancelled():  # cancelled at the memory limit
+                    continue
                 if future in downloads:
                     future.result()  # a failed download stops the run
+                    if memory_guard is not None and memory_guard.stopped:
+                        continue  # a download that was under way at the memory limit: start no more models
                     key = downloads[future]
                     market = (*key, *markets[key]["window"])
                     for index in markets[key]["models"]:
@@ -320,6 +326,10 @@ def run_parallel(client, models, workers=None, start_time=None, wait_for_fresh_s
                     results[reply["index"]] = reply["result"]
                     if gatherer is not None:
                         gatherer.shards.put(reply["shard"])
+                    if memory_guard is not None and not memory_guard.admit(
+                            [reply["result"]], (result for result in results if result is not None)):
+                        for other in pending:  # the models not started yet; running ones finish
+                            other.cancel()
                 done_count += 1
                 progress("simulation", done_count / len(models),
                          f"{done_count} of {len(models)} models done ({reply['name']}"

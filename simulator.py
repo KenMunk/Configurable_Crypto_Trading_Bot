@@ -24,6 +24,7 @@ from backtest import (
 )
 from friction import FrictionModel, fetch_friction_inputs
 from model_library import discard_folders, profile_paths, read_best, read_profile, update_best
+from memory_guard import DEFAULT_PERCENT as DEFAULT_MEMORY_PERCENT, MemoryGuard, available_memory, format_bytes
 from parallel_backtest import max_workers, parse_workers, run_parallel
 from scenario_editor import describe_mode as describe_data_mode, load_options
 import synthetic
@@ -329,6 +330,21 @@ def format_worker_row(row):
     filled = int(row["fraction"] * 10 + 1e-9)
     return (f"Worker {row['worker']}", row["doing"],
             "\u2588" * filled + "\u2591" * (10 - filled) + f" {row['fraction']:.0%}")
+
+
+def parse_memory_percent(text):
+    """The Memory limit box's percentage; raises ValueError for anything but a number above 0 and at most 100."""
+    try:
+        percent = float(str(text).strip().rstrip("%"))
+    except ValueError:
+        percent = None
+    if percent is None or not 0 < percent <= 100:
+        raise ValueError(f"The memory limit must be a percentage above 0 and at most 100, not {text!r}")
+    return percent
+
+
+def join_notes(*notes):
+    return "; ".join(note for note in notes if note)
 
 
 def describe_mode(workers, model_count):
@@ -936,6 +952,9 @@ class SimulationWindow:
         self.discarded_paths = set()  # listed models from discard folders (with "Include discarded models")
         self.top_paths = set()  # each currency's historically best models (Test options: top N)
         self.test_options = load_options()
+        # The memory free at launch: each run may use the Memory limit's share of it (see memory_guard.py).
+        self.launch_free_memory = available_memory()
+        self.memory_guard = None  # each run makes its own (see _run_guard)
         self.results = []
         self.in_view = []  # positions in self.results of the models the charts show
         self.color_slots = {}  # position -> color slot, stable while the model stays in view
@@ -1083,9 +1102,16 @@ class SimulationWindow:
         self.workers_box = ttk.Spinbox(action_row, values=["auto", *range(1, max_workers() + 1)],
                                        textvariable=self.workers_var, width=5)
         self.workers_box.pack(side="left", padx=(6, 0))
+        ttk.Label(action_row, text="Memory limit:").pack(side="left", padx=(16, 0))
+        self.memory_var = tk.StringVar(value=f"{DEFAULT_MEMORY_PERCENT:g}")
+        ttk.Spinbox(action_row, from_=10, to=100, increment=5, textvariable=self.memory_var, width=5).pack(
+            side="left", padx=(6, 0))
+        free = (f"% of the {format_bytes(self.launch_free_memory)} free at launch"
+                if self.launch_free_memory else "% (free memory can't be read here, so there is no limit)")
+        ttk.Label(action_row, text=free, foreground="#555555").pack(side="left", padx=(4, 0))
         ttk.Label(action_row, text=f"auto uses {max_workers()} workers, each running one model on one set of "
                                    f"data at a time; scenario and stress runs add one per GPU",
-                  foreground="#555555").pack(side="left", padx=(8, 0))
+                  foreground="#555555").pack(side="left", padx=(16, 0))
         self._update_mode()
 
         ttk.Label(self.controls, text="Progress", font=("Segoe UI", 10, "bold")).pack(anchor="w")
@@ -2064,6 +2090,8 @@ class SimulationWindow:
             # and stress runs a task per model per path, spread over every worker. Auto: every CPU but two
             # (scenario runs add the GPUs).
             workers = parse_workers(self.workers_var.get()) if self.parallel_var.get() else 1
+            # A new budget each run, measured against the memory free at launch.
+            self.memory_guard = MemoryGuard(parse_memory_percent(self.memory_var.get()), baseline=self.launch_free_memory)
             scenarios = synthetic.load_set(self.test_options["scenario_set"]) if mode in (
                 "historic+synthetic", "synthetic") else []
             if mode in ("historic+synthetic", "synthetic") and not scenarios:
@@ -2145,15 +2173,21 @@ class SimulationWindow:
             elif mode != "synthetic":
                 results, logged, candles_by_market = self._serial_results(
                     client, models, frictions, start_time, wait_for_fresh_signal)
-            if mode != "historic":
+            if mode != "historic" and not self._run_guard().stopped:
                 if not candles_by_market:
                     candles_by_market = self._gather_markets(client, models)
                 results = results + self._synthetic_runs(models, frictions, candles_by_market, scenarios,
                                                          wait_for_fresh_signal, workers)
                 logged = (logged + "; " if logged else "") + "synthetic results aren't logged"
-            post(("done", results, logged))
+            post(("done", results, join_notes(logged, self._run_guard().describe())))
         except Exception as exc:  # Reported in the window; the worker must not die silently.
             post(("error", exc))
+
+    def _run_guard(self):
+        """This run's memory guard (see memory_guard.py): the one Run Simulation made, or a default one."""
+        if getattr(self, "memory_guard", None) is None:
+            self.memory_guard = MemoryGuard(DEFAULT_MEMORY_PERCENT, baseline=getattr(self, "launch_free_memory", None))
+        return self.memory_guard
 
     def _gather_markets(self, client, models):
         """{(product, granularity): candles} for the models' markets, downloading what the cache lacks."""
@@ -2191,6 +2225,8 @@ class SimulationWindow:
             result["model_name"] = name
             result["granularity"] = granularity
             results.append(result)
+            if not self._run_guard().admit([result], results):
+                break  # at the memory limit: log and show the models run so far
         path = self.performance_log_path
         try:
             logged = describe_update(update_performance_log(
@@ -2211,7 +2247,7 @@ class SimulationWindow:
         results, skipped = stress_test.run_scenarios(
             models, frictions, candles_by_market, scenarios, wait_for_fresh_signal=wait_for_fresh_signal,
             workers=workers, compute_device="auto", worker_status=lambda rows: post(("workers", rows)),
-            synthetic_dir=synthetic.SYNTHETIC_DIR,
+            synthetic_dir=synthetic.SYNTHETIC_DIR, memory_guard=self._run_guard(),
             progress=lambda fraction, message: post(("progress", "simulation", fraction, message)))
         for note in skipped:
             post(("status", f"Simulation status: skipped {note}"))
@@ -2229,14 +2265,16 @@ class SimulationWindow:
         records, baselines, results = stress_test.run_stress(
             models, frictions, candles_by_market, combos, wait_for_fresh_signal=wait_for_fresh_signal,
             workers=workers, compute_device="auto", worker_status=lambda rows: post(("workers", rows)),
-            synthetic_dir=synthetic.SYNTHETIC_DIR, progress=lambda fraction, message: post(("progress", "simulation", fraction, message)))
+            synthetic_dir=synthetic.SYNTHETIC_DIR, memory_guard=self._run_guard(),
+            progress=lambda fraction, message: post(("progress", "simulation", fraction, message)))
         for result in results:
             result["stress_test"] = True
         settings = (f"stress plan of {len(combos)} combinations, up to {self.test_options.get('stress_paths', 3)} "
                     f"paths, alone and with history")
         index = stress_test.write_reports(records, baselines, dict(models), settings)
         post(("report", index))
-        post(("done", results, f"stress test of {len(records)} runs; report {index}"))
+        post(("done", results, join_notes(f"stress test of {len(records)} runs; report {index}",
+                                          self._run_guard().describe())))
 
     def _parallel_results(self, client, models, friction_inputs, start_time, wait_for_fresh_signal, workers):
         """Run the models on worker processes; (results, logged), or None after posting the error."""
@@ -2245,7 +2283,7 @@ class SimulationWindow:
         # CPU only: history runs read their indicators from the candle store, so GPU workers only add load.
         run = run_parallel(client, models, workers=workers, start_time=start_time, compute_device="cpu",
                            wait_for_fresh_signal=wait_for_fresh_signal, friction_inputs=friction_inputs,
-                           performance_path=self.performance_log_path,
+                           performance_path=self.performance_log_path, memory_guard=self._run_guard(),
                            progress=lambda phase, fraction, message: post(("progress", phase, fraction, message)))
         results = [result for result in run["results"] if result is not None]
         failed = "; ".join(f"{name}: {error}" for name, error in run["errors"].items())

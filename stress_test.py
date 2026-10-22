@@ -321,7 +321,8 @@ def _describe(task):
 
 
 def run_stress(models, frictions, candles_by_market, combos, modes=MODES, wait_for_fresh_signal=False,
-               progress=None, stop=None, workers=1, compute_device="cpu", worker_status=None, synthetic_dir=None):
+               progress=None, stop=None, workers=1, compute_device="cpu", worker_status=None, synthetic_dir=None,
+               memory_guard=None):
     """Run every model through every combination and mode. Returns (records, baselines, results).
 
     `models` are (name, profile); `candles_by_market` maps (product, granularity) to history.
@@ -343,15 +344,19 @@ def run_stress(models, frictions, candles_by_market, combos, modes=MODES, wait_f
 
     With `synthetic_dir` (such as synthetic.SYNTHETIC_DIR), every scenario path's candles are kept
     in that folder's synthetic.SyntheticStore, apart from the real history.
+
+    With a memory_guard.MemoryGuard, the results keep less chart data as memory fills, and the run
+    stops starting new tasks at the guard's budget (memory_guard.stopped then says so).
     """
     records, baselines, results, _ = _run(models, frictions, candles_by_market, combos, modes,
                                           wait_for_fresh_signal, progress, stop, workers, compute_device,
-                                          worker_status, baseline=True, style="stress", synthetic_dir=synthetic_dir)
+                                          worker_status, baseline=True, style="stress", synthetic_dir=synthetic_dir,
+                                          memory_guard=memory_guard)
     return records, baselines, results
 
 
 def run_scenarios(models, frictions, candles_by_market, scenarios, wait_for_fresh_signal=False, progress=None,
-                  stop=None, workers=1, compute_device="cpu", worker_status=None, synthetic_dir=None):
+                  stop=None, workers=1, compute_device="cpu", worker_status=None, synthetic_dir=None, memory_guard=None):
     """The simulator's synthetic data: every model on every path of every run of `scenarios` (a scenario set;
     chained modules make one run, see synthetic.runs), measured from the run's first candle.
 
@@ -362,12 +367,19 @@ def run_scenarios(models, frictions, candles_by_market, scenarios, wait_for_fres
     combos = [(synthetic.run_label(run), run, False, synthetic.run_paths(run)) for run in synthetic.runs(list(scenarios))]
     _, _, results, skipped = _run(models, frictions, candles_by_market, combos, ("alone",), wait_for_fresh_signal,
                                   progress, stop, workers, compute_device, worker_status, baseline=False,
-                                  style="scenario", synthetic_dir=synthetic_dir)
+                                  style="scenario", synthetic_dir=synthetic_dir, memory_guard=memory_guard)
     return results, skipped
 
 
+def _results_of(reply):
+    """The backtest results in a task's reply (none for a scenario that didn't fit the history)."""
+    if isinstance(reply, tuple):  # a baseline: (record, result)
+        return [reply[1]]
+    return [result for _, result in reply] if isinstance(reply, list) else []
+
+
 def _run(models, frictions, candles_by_market, combos, modes, wait_for_fresh_signal, progress, stop, workers,
-         compute_device, worker_status, baseline, style, synthetic_dir=None):
+         compute_device, worker_status, baseline, style, synthetic_dir=None, memory_guard=None):
     """run_stress and run_scenarios: (records, baselines, results, skipped)."""
     gpu_devices = []
     if workers > 1:
@@ -403,12 +415,19 @@ def _run(models, frictions, candles_by_market, combos, modes, wait_for_fresh_sig
             worker_status([dict(row) for row in rows])
 
     def finished(number, reply):
+        """Keep a task's reply; False when the memory guard says the run must stop."""
         nonlocal done
         replies[number] = reply
+        within = True
+        if memory_guard is not None:
+            # The earlier results are only walked the first time the guard thins (thinning twice changes nothing).
+            within = memory_guard.admit(_results_of(reply), (result for earlier in replies if earlier is not None
+                                                               for result in _results_of(earlier)))
         done += tasks[number][2]
         if progress is not None:
             kind = "stress" if style == "stress" else "scenario"
             progress(done / max(total, 1), f"{done} of {total} {kind} runs{where} ({_describe(tasks[number])})")
+        return within
 
     if workers == 1:
         direct = None if worker_status is None else _Direct(lambda event: (note(*event), report(None)))
@@ -417,7 +436,8 @@ def _run(models, frictions, candles_by_market, combos, modes, wait_for_fresh_sig
             for number, (function, args, _) in enumerate(tasks):
                 if stop is not None and stop():
                     break
-                finished(number, function(*args))
+                if not finished(number, function(*args)):
+                    break
         finally:
             _start_worker({})
     else:
@@ -443,8 +463,9 @@ def _run(models, frictions, candles_by_market, combos, modes, wait_for_fresh_sig
                     pending[pool.submit(function, *args)] = number
 
             start_more()
+            within = True
             while pending:
-                if stop is not None and stop():
+                if not within or (stop is not None and stop()):
                     for future in pending:
                         future.cancel()
                     break
@@ -452,8 +473,9 @@ def _run(models, frictions, candles_by_market, combos, modes, wait_for_fresh_sig
                 for future in ready:
                     number = pending.pop(future)
                     running[_model_of(tasks[number])] -= 1
-                    finished(number, future.result())
-                start_more()
+                    within = finished(number, future.result()) and within
+                if within:
+                    start_more()
                 report(status)
         report(status, force=True)
 
