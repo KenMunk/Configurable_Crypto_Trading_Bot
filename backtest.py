@@ -421,6 +421,12 @@ def run_backtest(candles, profile, starting_capital=None, progress=None, frictio
             raise ValueError(f"safeguards.loss_halt.{name} must be from 0 up to (not including) 1, not {value!r}")
     window_setting = safeguards.get("drawdown_window") or DEFAULT_DRAWDOWN_WINDOW
     window_candles = parse_period(window_setting, granularity_seconds, "safeguards.drawdown_window")
+    # With a cooldown, trading resumes this long after the drawdown limit paused it, measuring the limit afresh
+    # from there; without one, it waits for a fresh entry signal (or, with a window, room under the window's peak).
+    cooldown_setting = safeguards.get("drawdown_cooldown")
+    cooldown_candles = (parse_period(cooldown_setting, granularity_seconds, "safeguards.drawdown_cooldown")
+                        if cooldown_setting else None)
+    cooldown_ends = None  # the candle index the current pause's cooldown ends at
     round_trip_cost = 2 * (fee_rate + slippage) * position_fraction
     # Cash set aside for flash-crash buys; the main strategy never trades it.
     flash_reserve = flash_crash_reserve_of(profile) if flash_levels else 0.0
@@ -642,6 +648,7 @@ def run_backtest(candles, profile, starting_capital=None, progress=None, frictio
                 if reason == "DRAWDOWN_STOP":
                     paused, trend_reset = True, False
                     drawdown_pauses.append({"paused_at": candle["start"], "resumed_at": None})
+                    cooldown_ends = index + cooldown_candles if cooldown_candles else None
                 if reason == "LOSS_HALT":
                     halted_at = candle["start"]
             elif profit_lock and candle["high"] >= target_price and not entry.get("target_armed"):
@@ -672,6 +679,7 @@ def run_backtest(candles, profile, starting_capital=None, progress=None, frictio
             # (the trend that failed has ended) and then fire afresh before trading resumes.
             paused, trend_reset = True, False
             drawdown_pauses.append({"paused_at": candle["start"], "resumed_at": None})
+            cooldown_ends = index + cooldown_candles if cooldown_candles else None
             if entry is not None:
                 sell(candle, candle["close"], "DRAWDOWN_LIMIT")
         if halted_at is None and halt_floor() and equity < halt_floor():
@@ -683,13 +691,22 @@ def run_backtest(candles, profile, starting_capital=None, progress=None, frictio
                 sell(candle, candle["close"], "LOSS_HALT")
             for crash in {id(lot["episode"]): lot["episode"] for lot in flash_lots}.values():
                 sell_the_rebound(candle, crash, "LOSS_HALT")
+        if paused and cooldown_ends is not None and index >= cooldown_ends:
+            # The cooldown is over: trade again, measuring the limit from the model's value now.
+            paused, cooldown_ends = False, None
+            drawdown_pauses[-1]["resumed_at"] = candle["start"]
+            limit_peak_equity = equity
+            window_peaks.clear()
+            record_equity(index, equity)
         if paused and not entry_signal:
             trend_reset = True
         if waiting_for_fresh_signal and not entry_signal:
             waiting_for_fresh_signal = False  # the signal has switched off; the next one is fresh
 
         order_room = max_orders_per_day is None or orders_today < max_orders_per_day
-        can_enter = (not paused or trend_reset) and not waiting_for_fresh_signal and halted_at is None
+        # With a cooldown, only the cooldown ends a pause; without one, a fresh entry signal does.
+        can_enter = ((not paused or (trend_reset and cooldown_candles is None)) and not waiting_for_fresh_signal
+                     and halted_at is None)
         if entry is None and can_enter and order_room:
             position_value = max(cash - flash_reserve, 0.0) * position_fraction
             # Under a windowed limit, enter only with room for two round trips' costs above

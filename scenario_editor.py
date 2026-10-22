@@ -17,7 +17,7 @@ MODES = [("historic", "Historic data only"),
          ("synthetic", "Synthetic scenarios only"),
          ("stress", "Stress test")]
 DEFAULT_OPTIONS = {"mode": "historic", "scenario_set": str(synthetic.DEFAULT_SET), "top_n": 5,
-                   "stress_paths": 3}
+                   "stress_paths": 3, "synthetic_flash_crash_buys": False}
 # Every scenario parameter the editor shows, in order, with a label.
 FIELDS = [("drop", "Drop (0.5 = -50%)"), ("rise", "Rise (2.0 = +200%)"), ("days", "Days"),
           ("recovery_days", "Recovery days"), ("recovery", "Recovery (share of the drop)"),
@@ -92,6 +92,11 @@ class TestOptionsDialog:
         self.paths_var = tk.StringVar(value=str(self.options.get("stress_paths", 3)))
         ttk.Spinbox(stress, from_=1, to=50, textvariable=self.paths_var, width=4).pack(side="left", padx=4)
         ttk.Label(stress, text="paths of resampled scenarios, and writes a report per model.").pack(side="left")
+        # Off by default: a flash-crash ladder pauses stops on crash candles, which in synthetic crashes means
+        # riding them all the way down.
+        self.flash_var = tk.BooleanVar(value=bool(self.options.get("synthetic_flash_crash_buys", False)))
+        ttk.Checkbutton(stress, text="Flash-crash buys in synthetic and stress runs",
+                        variable=self.flash_var).pack(side="left", padx=(16, 0))
 
         focus = ttk.LabelFrame(frame, text="Focus", padding=8)
         focus.pack(fill="x", pady=(8, 0))
@@ -580,7 +585,7 @@ class TestOptionsDialog:
             self.plan_note_var.set(f"Plan not saved: {exc}")
             return
         self.options = {"mode": self.mode_var.get(), "scenario_set": str(self._set_path()), "top_n": top_n,
-                        "stress_paths": stress_paths}
+                        "stress_paths": stress_paths, "synthetic_flash_crash_buys": bool(self.flash_var.get())}
         if self.options["mode"] in ("historic+synthetic", "synthetic"):
             if not self.scenarios:
                 self.note_var.set("Add at least one scenario, or test on historic data only")

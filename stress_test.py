@@ -321,9 +321,17 @@ def _describe(task):
     return f"{args[6]}: {args[1]}" + (f" #{args[4] + 1}" if args[5] > 1 else "")
 
 
+def without_flash_crash_buys(profile):
+    """The profile with its flash-crash buys turned off (the rest unchanged)."""
+    strategy = profile.get("strategy", {})
+    if "flash_crash_buy" not in strategy:
+        return profile
+    return {**profile, "strategy": {key: value for key, value in strategy.items() if key != "flash_crash_buy"}}
+
+
 def run_stress(models, frictions, candles_by_market, combos, modes=MODES, wait_for_fresh_signal=False,
                progress=None, stop=None, workers=1, compute_device="cpu", worker_status=None, synthetic_dir=None,
-               memory_guard=None):
+               memory_guard=None, flash_crash_buys=True):
     """Run every model through every combination and mode. Returns (records, baselines, results).
 
     `models` are (name, profile); `candles_by_market` maps (product, granularity) to history.
@@ -348,16 +356,20 @@ def run_stress(models, frictions, candles_by_market, combos, modes=MODES, wait_f
 
     With a memory_guard.MemoryGuard, the run slows down as memory fills: fewer tasks run at once, down
     to one at the guard's budget, and the results keep less chart data. Every task still runs.
+
+    With `flash_crash_buys` False, every model runs without its flash-crash buys (see
+    without_flash_crash_buys), its real-history baseline included: stops then work on crash candles too.
     """
     records, baselines, results, _ = _run(models, frictions, candles_by_market, combos, modes,
                                           wait_for_fresh_signal, progress, stop, workers, compute_device,
                                           worker_status, baseline=True, style="stress", synthetic_dir=synthetic_dir,
-                                          memory_guard=memory_guard)
+                                          memory_guard=memory_guard, flash_crash_buys=flash_crash_buys)
     return records, baselines, results
 
 
 def run_scenarios(models, frictions, candles_by_market, scenarios, wait_for_fresh_signal=False, progress=None,
-                  stop=None, workers=1, compute_device="cpu", worker_status=None, synthetic_dir=None, memory_guard=None):
+                  stop=None, workers=1, compute_device="cpu", worker_status=None, synthetic_dir=None, memory_guard=None,
+                  flash_crash_buys=True):
     """The simulator's synthetic data: every model on every path of every run of `scenarios` (a scenario set;
     chained modules make one run, see synthetic.runs), measured from the run's first candle.
 
@@ -368,7 +380,8 @@ def run_scenarios(models, frictions, candles_by_market, scenarios, wait_for_fres
     combos = [(synthetic.run_label(run), run, False, synthetic.run_paths(run)) for run in synthetic.runs(list(scenarios))]
     _, _, results, skipped = _run(models, frictions, candles_by_market, combos, ("alone",), wait_for_fresh_signal,
                                   progress, stop, workers, compute_device, worker_status, baseline=False,
-                                  style="scenario", synthetic_dir=synthetic_dir, memory_guard=memory_guard)
+                                  style="scenario", synthetic_dir=synthetic_dir, memory_guard=memory_guard,
+                                  flash_crash_buys=flash_crash_buys)
     return results, skipped
 
 
@@ -380,8 +393,10 @@ def _results_of(reply):
 
 
 def _run(models, frictions, candles_by_market, combos, modes, wait_for_fresh_signal, progress, stop, workers,
-         compute_device, worker_status, baseline, style, synthetic_dir=None, memory_guard=None):
+         compute_device, worker_status, baseline, style, synthetic_dir=None, memory_guard=None, flash_crash_buys=True):
     """run_stress and run_scenarios: (records, baselines, results, skipped)."""
+    if not flash_crash_buys:
+        models = [(name, without_flash_crash_buys(profile)) for name, profile in models]
     gpu_devices = []
     if workers > 1:
         from parallel_backtest import resolve_compute_device

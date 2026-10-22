@@ -2256,6 +2256,7 @@ class SimulationWindow:
             models, frictions, candles_by_market, scenarios, wait_for_fresh_signal=wait_for_fresh_signal,
             workers=workers, compute_device="auto", worker_status=lambda rows: post(("workers", rows)),
             synthetic_dir=synthetic.SYNTHETIC_DIR, memory_guard=self._run_guard(),
+            flash_crash_buys=getattr(self, "test_options", {}).get("synthetic_flash_crash_buys", False),
             progress=lambda fraction, message: post(("progress", "simulation", fraction, message)))
         for note in skipped:
             post(("status", f"Simulation status: skipped {note}"))
@@ -2274,11 +2275,13 @@ class SimulationWindow:
             models, frictions, candles_by_market, combos, wait_for_fresh_signal=wait_for_fresh_signal,
             workers=workers, compute_device="auto", worker_status=lambda rows: post(("workers", rows)),
             synthetic_dir=synthetic.SYNTHETIC_DIR, memory_guard=self._run_guard(),
+            flash_crash_buys=getattr(self, "test_options", {}).get("synthetic_flash_crash_buys", False),
             progress=lambda fraction, message: post(("progress", "simulation", fraction, message)))
         for result in results:
             result["stress_test"] = True
         settings = (f"stress plan of {len(combos)} combinations, up to {self.test_options.get('stress_paths', 3)} "
-                    f"paths, alone and with history")
+                    f"paths, alone and with history, flash-crash buys "
+                    f"{'on' if getattr(self, 'test_options', {}).get('synthetic_flash_crash_buys', False) else 'off'}")
         index = stress_test.write_reports(records, baselines, dict(models), settings)
         post(("report", index))
         post(("done", results, join_notes(f"stress test of {len(records)} runs; report {index}, "

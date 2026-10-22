@@ -426,6 +426,7 @@ Either way:
 | `minimum_net_profit_gate` | Fraction, such as `0.05` | Absent, which turns the screen off | Simulated | The minimum expected net return the [friction screen](#5-the-friction-screen-worked-through) requires before it allows an entry. |
 | `max_drawdown_limit` | Fraction, such as `0.12` | `0` (off) | Simulated | The largest fall in the model's value it will tolerate. There are two modes, described below. |
 | `drawdown_window` | Duration such as `"180d"` or `"26w"` (or a candle count) | Not set | Simulated | Makes `max_drawdown_limit` apply within a trailing window. The reports always show the worst drawdown within this window, or within 180 days when it is not set. |
+| `drawdown_cooldown` | Duration such as `"30d"` (or a candle count) | Not set | Simulated | After the drawdown limit pauses trading, trading resumes once this long has passed, measuring the limit afresh from the model's value then. Without it, a pause ends only on a fresh entry signal (see below). |
 | `loss_halt` | Object: `below_start` and/or `from_peak`, fractions such as `0.9` and `0.5` | Off | Simulated | Stops the model **for good** when it is failing: once its value falls below `below_start` of the starting capital (`0.9` keeps it above -10% of what it started with), or `from_peak` below its highest value. It sells at the level that leaves its value there (at the open on a gap), sells any flash-crash lots, and never buys again. Checked within each candle like a stop, except on flash-crash candles, where it waits for the close, so a one-off bad print can't trip it but a collapse that closes in the crash does. The trade's exit reason is `LOSS_HALT`; the Metrics tab gives the time and the charts shade the rest of the run. |
 | `volatility_cap` | Fraction | none | Not modeled yet | To stand aside in volatile markets today, add a `VOLATILITY` indicator rule to the entry signal, such as `volatility < 0.8`. |
 | `risk_budget_per_trade` | Fraction | none | Not modeled yet | |
@@ -440,6 +441,8 @@ Either way:
   - With `0.10` and `"180d"`, the model never loses more than 10% within any six months. There are two exceptions:
     - **A gap.** When the price gaps through the stop, the stop fills at the gapped price, as a real stop-market order would.
     - **A flash crash, with `flash_crash_buy` set.** The equity stop doesn't fire on crash candles, so the model's value can fall further while a crash lasts (see [flash_crash_buy](#flash_crash_buy)).
+
+**With `drawdown_cooldown`** (either mode), a pause ends once the cooldown has passed, not on a fresh entry signal, which can't end it sooner. The limit is then measured from the model's value at that point: the peak resets, and under a window the window's peak resets too, so the model has room to trade again. Without a cooldown, a long window can keep a model out for good: it re-enters only with room under the window's peak, which an all-time peak never gives back. Separate pauses can add up to more than the limit either way.
 
 Pauses are shaded gray on the charts and listed in the Metrics tab.
 
