@@ -1,0 +1,56 @@
+{
+  "description": "Federal and California income tax rules the simulator's progressive tax model uses (see taxes.py and tax/README.md). Brackets are [upper bound of taxable income, rate] pairs, the last with no bound (null). A year missing here, or a jurisdiction missing from a year, uses the nearest year that has it. Tax rules change: check these against the sources before relying on them, and add each new year as it is published.",
+  "sources": {
+    "federal_2025": "IRS, Federal income tax rates and brackets (irs.gov/filing/federal-income-tax-rates-and-brackets); IRS Topic 409 for long-term rates; standard deduction as amended by the One Big Beautiful Bill Act",
+    "federal_2026": "IRS newsroom, tax inflation adjustments for tax year 2026 (Rev. Proc. 2025-32)",
+    "niit": "IRS Topic 559: 3.8% above $200,000 single or head of household, $250,000 married filing jointly (not indexed)",
+    "california_2025": "FTB 2025 California Tax Rate Schedules (ftb.ca.gov/forms/2025/2025-540-tax-rate-schedules.pdf); standard deduction from FTB Tax News, October 2025. The 2026 schedules were not yet published (October 2026), so 2026 uses 2025's."
+  },
+  "years": {
+    "2025": {
+      "federal": {
+        "standard_deduction": {"single": 15750, "married_joint": 31500, "head_of_household": 23625},
+        "ordinary": {
+          "single": [[11925, 0.10], [48475, 0.12], [103350, 0.22], [197300, 0.24], [250525, 0.32], [626350, 0.35], [null, 0.37]],
+          "married_joint": [[23850, 0.10], [96950, 0.12], [206700, 0.22], [394600, 0.24], [501050, 0.32], [751600, 0.35], [null, 0.37]],
+          "head_of_household": [[17000, 0.10], [64850, 0.12], [103350, 0.22], [197300, 0.24], [250500, 0.32], [626350, 0.35], [null, 0.37]]
+        },
+        "long_term": {
+          "single": [[48350, 0.0], [533400, 0.15], [null, 0.20]],
+          "married_joint": [[96700, 0.0], [600050, 0.15], [null, 0.20]],
+          "head_of_household": [[64750, 0.0], [566700, 0.15], [null, 0.20]]
+        },
+        "niit": {"rate": 0.038, "threshold": {"single": 200000, "married_joint": 250000, "head_of_household": 200000}},
+        "capital_loss_deduction": 3000
+      },
+      "california": {
+        "standard_deduction": {"single": 5706, "married_joint": 11412, "head_of_household": 11412},
+        "ordinary": {
+          "single": [[11079, 0.01], [26264, 0.02], [41452, 0.04], [57542, 0.06], [72724, 0.08], [371479, 0.093], [445771, 0.103], [742953, 0.113], [null, 0.123]],
+          "married_joint": [[22158, 0.01], [52528, 0.02], [82904, 0.04], [115084, 0.06], [145448, 0.08], [742958, 0.093], [891542, 0.103], [1485906, 0.113], [null, 0.123]],
+          "head_of_household": [[22173, 0.01], [52530, 0.02], [67716, 0.04], [83805, 0.06], [98990, 0.08], [505208, 0.093], [606251, 0.103], [1010417, 0.113], [null, 0.123]]
+        },
+        "mental_health_services": {"rate": 0.01, "over": 1000000},
+        "capital_loss_deduction": 3000
+      }
+    },
+    "2026": {
+      "federal": {
+        "standard_deduction": {"single": 16100, "married_joint": 32200, "head_of_household": 24150},
+        "ordinary": {
+          "single": [[12400, 0.10], [50400, 0.12], [105700, 0.22], [201775, 0.24], [256225, 0.32], [640600, 0.35], [null, 0.37]],
+          "married_joint": [[24800, 0.10], [100800, 0.12], [211400, 0.22], [403550, 0.24], [512450, 0.32], [768700, 0.35], [null, 0.37]],
+          "head_of_household": [[17700, 0.10], [67450, 0.12], [105700, 0.22], [201775, 0.24], [256200, 0.32], [640600, 0.35], [null, 0.37]]
+        },
+        "long_term": {
+          "single": [[49450, 0.0], [545500, 0.15], [null, 0.20]],
+          "married_joint": [[98900, 0.0], [613700, 0.15], [null, 0.20]],
+          "head_of_household": [[66200, 0.0], [579600, 0.15], [null, 0.20]]
+        },
+        "niit": {"rate": 0.038, "threshold": {"single": 200000, "married_joint": 250000, "head_of_household": 200000}},
+        "capital_loss_deduction": 3000,
+        "notes": "Head of household 24%/32% boundary taken as 201,775 (the source read lists both 201,775 and 201,750); unverified."
+      }
+    }
+  }
+}

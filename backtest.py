@@ -15,6 +15,7 @@ from candle_store import CandleStore, MarketCandles, MarketMetrics
 from friction import FrictionModel
 from indicators import parse_period
 from model_config import CompiledModel
+from taxes import LONG_TERM_SECONDS
 
 LOOKBACK_YEARS = 10
 DEFAULT_CACHE_DIR = Path(__file__).parent / "data"
@@ -24,7 +25,8 @@ DEFAULT_DRAWDOWN_WINDOW = "180d"  # reported as the worst drawdown within any 6 
 # Bumped whenever a change alters backtest results, so caches of old results (the model
 # search's registry) are never mixed with new ones. 3: per-trade tax reserves paid monthly.
 # 4: losses offset gains within a tax year, with net losses carried forward (see taxes.py).
-BACKTEST_VERSION = 4
+# 5: progressive federal and California tax on gains stacked on a salary, by default.
+BACKTEST_VERSION = 5
 
 GRANULARITY_SECONDS = {
     "ONE_MINUTE": 60,
@@ -484,10 +486,11 @@ def run_backtest(candles, profile, starting_capital=None, progress=None, frictio
             for position, (peak_index, value) in enumerate(window_peaks):
                 window_peaks[position] = (peak_index, value * kept)
 
-    def record_realized(pnl, candle):
+    def record_realized(pnl, candle, opened):
         """Set aside a closed trade's tax: its full tax on a gain, and on a loss, release the tax the loss saves
-        (see taxes.py). Returns the amount set aside (negative: released)."""
-        tax = ledger.realize(pnl, candle["start"])
+        (see taxes.py); `opened` is when it was bought, for long- or short-term rates. Returns the amount set
+        aside (negative: released)."""
+        tax = ledger.realize(pnl, candle["start"], long_term=candle["start"] - opened > LONG_TERM_SECONDS)
         set_aside(tax, candle)
         return tax
 
@@ -514,7 +517,7 @@ def run_backtest(candles, profile, starting_capital=None, progress=None, frictio
         pnl = proceeds - fee - entry["cost"]
         holding = entry
         units, entry = 0.0, None
-        tax = record_realized(pnl, candle)
+        tax = record_realized(pnl, candle, holding["time"])
         trades.append({
             "entry_time": holding["time"],
             "exit_time": candle["start"],
@@ -559,7 +562,7 @@ def run_backtest(candles, profile, starting_capital=None, progress=None, frictio
             cash += proceeds - fee
             fees_paid += fee
             pnl = proceeds - fee - lot["cost"]
-            tax = record_realized(pnl, candle)
+            tax = record_realized(pnl, candle, lot["time"])
             trades.append({
                 "entry_time": lot["time"], "exit_time": candle["start"],
                 "entry_price": lot["price"], "exit_price": exit_price,

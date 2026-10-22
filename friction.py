@@ -130,6 +130,12 @@ class FrictionModel:
         # tax_loss_offset false taxes each winning trade on its own instead.
         self.tax_loss_offset = bool(friction.get("tax_loss_offset", True))
         self.tax_loss_carryforward = bool(friction.get("tax_loss_carryforward", True))
+        # "progressive" (the default): federal and California income tax on gains stacked on the salary in the
+        # tax profile (tax/tax_profile.json); "flat": tax_buffer_rate on every gain. See taxes.py.
+        self.tax_model = friction.get("tax_model", "progressive")
+        if self.tax_model not in ("progressive", "flat"):
+            raise ValueError(f'friction_model.tax_model must be "progressive" or "flat", not {self.tax_model!r}')
+        self.tax_profile_path = friction.get("tax_profile")
         self.liquidity_fee_buffer = float(friction.get("liquidity_fee_buffer", DEFAULT_LIQUIDITY_FEE_BUFFER))
         self.charges_network_fee = _base_currency(profile) == "BTC"
         network = inputs.get("network_fee") if self.charges_network_fee else None
@@ -146,8 +152,12 @@ class FrictionModel:
         self.screen_enabled = bool(self.profit_target and "minimum_net_profit_gate" in safeguards)
 
     def tax_ledger(self):
-        """A fresh taxes.TaxLedger for one run under this profile's tax rule."""
-        from taxes import TaxLedger
+        """A fresh ledger for one run under this profile's tax rule: a taxes.ProgressiveTaxLedger, or with
+        tax_model "flat" (or no tax rate) a taxes.TaxLedger."""
+        from taxes import ProgressiveTaxLedger, TaxLedger, tax_code
+        if self.tax_model == "progressive" and self.tax_rate:
+            code = tax_code(self.tax_profile_path)
+            return ProgressiveTaxLedger(code, code.profile.get("loss_carryforward", True))
         return TaxLedger(self.tax_rate, self.tax_loss_offset, self.tax_loss_carryforward)
 
     def network_fee_fraction(self, price, position_value):
@@ -188,6 +198,7 @@ class FrictionModel:
             "tax_rate": self.tax_rate,
             "tax_loss_offset": self.tax_loss_offset,
             "tax_loss_carryforward": self.tax_loss_carryforward,
+            "tax_model": self.tax_model,
             "tax_rule": self.tax_ledger().describe(),
             "screen_enabled": self.screen_enabled,
             "profit_target": self.profit_target,

@@ -357,8 +357,10 @@ These settings model the real-world costs every trade pays.
 | `fallback_commission_rate` | Fraction | `0.005` | Simulated | The **profile rate**: used when the source is `config` or the live lookup fails. `exchange_commission_rate` is an older name for the same setting and takes precedence if both are present. |
 | `fee_buffer_multiplier` | Number, typically `1.0` to `1.5` | `1.0` | Simulated | Multiplies whichever fee rate is in use, as a safety cushion. A 0.5% rate with `1.25` becomes 0.625% per fill. |
 | `slippage_buffer` | Fraction | `0` | Simulated | Price penalty on every market-style fill: buys fill this much higher and sells this much lower. |
-| `tax_buffer_rate` | Fraction, such as `0.313` | `0` | Simulated | The tax rate on realized gains (see [Taxes](#how-taxes-are-settled)). The friction screen also uses it. |
-| `tax_loss_offset` | `true` or `false` | `true` | Simulated | `true`: profits set aside their full tax, losses release what they save, and the reserve is held until the year ends, when the year's net gain is taxed. `false`: each winning trade is taxed on its own, losses offset nothing, and tax is paid monthly. Tax rules change, so choose whichever matches yours. |
+| `tax_buffer_rate` | Fraction, such as `0.313` | `0` | Simulated | Turns tax on (`0` means no tax). With `tax_model: "flat"`, the rate on realized gains; with the progressive model, an estimate the friction screen uses (see [Taxes](#how-taxes-are-settled)). |
+| `tax_model` | `progressive` or `flat` | `progressive` | Simulated | `progressive`: federal and California income tax on gains stacked on the salary in your [tax profile](../tax/README.md). `flat`: `tax_buffer_rate` on every gain. |
+| `tax_profile` | A path, such as `tax/tax_profile.json` | Your private `tax/tax_profile.json`, or the example | Simulated | The tax profile the progressive model uses. |
+| `tax_loss_offset` | `true` or `false` | `true` | Simulated | With `tax_model: "flat"`. `true`: profits set aside their full tax, losses release what they save, and the reserve is held until the year ends, when the year's net gain is taxed. `false`: each winning trade is taxed on its own, losses offset nothing, and tax is paid monthly. Tax rules change, so choose whichever matches yours. |
 | `tax_loss_carryforward` | `true` or `false` | `true` | Simulated | With `tax_loss_offset`, whether a year that ends with a net loss carries it forward to offset later years' gains. |
 | `liquidity_fee_buffer` | Fraction | `0.5` | Simulated | A cushion used only by the friction screen: this fraction of the round-trip exchange fees plus the Bitcoin network fee for moving the position on-chain. It is never charged. |
 | `liquidity_buffer` | — | — | Not modeled yet | Superseded by `liquidity_fee_buffer`. The simulator ignores it. |
@@ -370,7 +372,15 @@ The Metrics tab shows the rates a run actually used and where they came from: `C
 
 #### How taxes are settled
 
-Only realized gains are taxed: tax is worked out as trades close, on their gain after fees, and a position still open owes nothing yet (so buy and hold, which never sells, pays no tax). Two rules are available.
+Only realized gains are taxed: tax is worked out as trades close, on their gain after fees, and a position still open owes nothing yet (so buy and hold, which never sells, pays no tax).
+
+**Progressive tax** (the default, `tax_model: "progressive"`). Each year's trading is taxed as the extra federal and California income tax it adds on top of the salary in your tax profile ([tax/README.md](../tax/README.md)), with that year's brackets:
+
+- A trade held more than a year is a long-term gain or loss, otherwise short-term. Short- and long-term results net against each other; short-term gains are federal ordinary income, long-term gains get the 0%, 15% and 20% rates, stacked on top. California taxes both as ordinary income, with its 1% surcharge over $1 million. Investment income above $200,000 of income ($250,000 married filing jointly) adds the 3.8% net investment income tax.
+- A year's net loss reduces other income by up to $3,000, and the rest carries forward to later years.
+- The timing is cautious, as below: each winning trade sets aside its tax at the year's marginal rates on the gains so far (losses left out), each losing trade releases what it saves, and the reserve is held until the year ends. Then the year's actual tax is paid and the difference returned (or, if the reserve fell short, made up from trading cash). The Metrics tab gives each year's federal, net investment income and California tax.
+
+With `tax_model: "flat"`, `tax_buffer_rate` is the rate on every gain, under one of two rules.
 
 **Losses offset gains** (the default, `tax_loss_offset: true`), as in most tax systems. The tax year is the calendar year (UTC).
 

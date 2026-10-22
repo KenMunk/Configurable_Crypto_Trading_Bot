@@ -164,6 +164,8 @@ config/*
 !config/README.md
 # Profiles loaded by `python engine.py`, whose base directory is quant_system/
 quant_system/config/
+# Private tax situation (salary, filing status); see tax/README.md
+tax/tax_profile.json
 # Private model search settings (see search_config/README.md)
 search_config/*
 !search_config/.example/

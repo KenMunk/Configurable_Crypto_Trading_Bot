@@ -85,9 +85,10 @@ def test_rules_describe_themselves():
     assert TaxLedger(0).describe() == "no tax"
 
 
-def test_by_default_a_backtests_losing_trade_gets_back_the_tax_its_loss_offsets():
+def test_with_a_flat_rate_a_backtests_losing_trade_gets_back_the_tax_its_loss_offsets():
     profile = _profile(
-        friction_model={"exchange_commission_rate": 0.0, "slippage_buffer": 0.0, "tax_buffer_rate": 0.3},
+        friction_model={"exchange_commission_rate": 0.0, "slippage_buffer": 0.0, "tax_buffer_rate": 0.3,
+                        "tax_model": "flat"},
         strategy={"direction": "LONG_ONLY", "entry_signal": {"all": ["close > 105", "close < 150"]},
                   "exit_signal": {"any": ["close > 190", "close < 110"]}})
     profile["capital_allocation"]["target_position_fraction"] = 0.5
@@ -107,7 +108,8 @@ def test_by_default_a_backtests_losing_trade_gets_back_the_tax_its_loss_offsets(
 
 def test_a_backtest_pays_the_years_net_tax_at_the_start_of_the_next_year():
     profile = _profile(
-        friction_model={"exchange_commission_rate": 0.0, "slippage_buffer": 0.0, "tax_buffer_rate": 0.3},
+        friction_model={"exchange_commission_rate": 0.0, "slippage_buffer": 0.0, "tax_buffer_rate": 0.3,
+                        "tax_model": "flat"},
         strategy={"direction": "LONG_ONLY", "entry_signal": {"all": ["close < 150"]},
                   "exit_signal": {"any": ["close > 190"]}})
     candles = [_candle(_at(2021, 12, 30), 100), _candle(_at(2021, 12, 31), 200),
@@ -129,7 +131,8 @@ def test_a_backtest_holds_the_cautious_reserve_and_returns_the_excess_at_year_en
     # A loss, then a bigger gain, in 2021: the gain sets aside its full tax; at year end only the tax on the
     # net gain is paid and the rest goes back to trading cash.
     profile = _profile(
-        friction_model={"exchange_commission_rate": 0.0, "slippage_buffer": 0.0, "tax_buffer_rate": 0.3},
+        friction_model={"exchange_commission_rate": 0.0, "slippage_buffer": 0.0, "tax_buffer_rate": 0.3,
+                        "tax_model": "flat"},
         strategy={"direction": "LONG_ONLY", "entry_signal": {"all": ["close == 100"]},
                   "exit_signal": {"any": ["close != 100"]}})
     days = [(12, 1, 100), (12, 2, 80), (12, 3, 100), (12, 4, 150), (12, 5, 120)]

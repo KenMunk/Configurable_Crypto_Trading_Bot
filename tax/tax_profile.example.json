@@ -1,0 +1,11 @@
+{
+  "description": "Your tax situation for the simulator's progressive tax model. Copy this file to tax/tax_profile.json (which Git ignores, so your income stays private) and edit it there. See tax/README.md.",
+  "filing_status": "single",
+  "salary": 70000,
+  "salary_by_year": {},
+  "jurisdictions": ["federal", "california"],
+  "long_term_rates": true,
+  "net_investment_income_tax": true,
+  "capital_loss_deduction": true,
+  "loss_carryforward": true
+}

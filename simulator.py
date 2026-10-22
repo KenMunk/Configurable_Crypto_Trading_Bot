@@ -195,7 +195,7 @@ def format_friction(result):
     else:
         lines.append("- Friction screen: off (needs profit_lock_target and minimum_net_profit_gate)")
 
-    yearly = friction.get("tax_loss_offset", False)
+    yearly = friction.get("tax_loss_offset", False) or friction.get("tax_model") == "progressive"
     lines += ["", f"Taxes paid: {result['taxes_paid']:,.2f}",
               f"Tax held for the next {'yearly' if yearly else 'monthly'} payment: {result['taxes_reserved']:,.2f}"]
     for payment in result["tax_payments"]:
@@ -204,7 +204,10 @@ def format_friction(result):
             period = str(payment["year"]) if yearly else f"{payment['year']}-{payment['month']:02d}"
             lines.append(
                 f"- {period}: net realized {payment['net_realized_gain']:+,.2f}, tax paid {payment['tax']:,.2f}"
-                + (f", {returned:,.2f} set aside beyond it returned" if returned else "")
+                + (f" (federal {payment['federal']:,.2f}, net investment income {payment['niit']:,.2f}, "
+                   f"California {payment['california']:,.2f})" if "federal" in payment and payment["tax"] else "")
+                + (f", {returned:,.2f} set aside beyond it returned" if returned > 0 else "")
+                + (f", {-returned:,.2f} more paid from trading cash" if returned < 0 else "")
                 + (f", loss carried forward {carried:,.2f}" if carried else "")
             )
     return lines
