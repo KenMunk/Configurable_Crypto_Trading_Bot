@@ -251,6 +251,11 @@ class _HoverChart:
                 ax.axvspan(np.datetime64(pause["paused_at"], "s"), np.datetime64(resumed, "s"),
                            color=PAUSE_SHADE, linewidth=0, zorder=0,
                            label="Paused (drawdown limit)" if number == 0 and ax is self.ax else "_nolegend_")
+        halted = self.result.get("halted_at")
+        if halted is not None and halted <= series_end:
+            for ax in self.axes:
+                ax.axvspan(np.datetime64(halted, "s"), np.datetime64(series_end, "s"), color=PAUSE_SHADE,
+                           linewidth=0, zorder=0, label="Halted (loss halt)" if ax is self.ax else "_nolegend_")
 
     def _shade_regimes(self):
         """Mark which regime is active: a strip along the main chart's top in each regime's color, named where a

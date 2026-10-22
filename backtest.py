@@ -417,6 +417,14 @@ def run_backtest(candles, profile, starting_capital=None, progress=None, frictio
     # With a drawdown window, the limit applies to the model's value against its highest
     # value in that trailing window, and is enforced with an equity stop (see below).
     window_limited = bool(max_drawdown_limit and safeguards.get("drawdown_window"))
+    # The loss halt stops the model for good once its value falls below a share of its starting capital
+    # or far enough below its peak: it recognises a market it is failing in and stops losing money there.
+    loss_halt = safeguards.get("loss_halt") or {}
+    halt_below = float(loss_halt.get("below_start", 0.0) or 0.0)
+    halt_from_peak = float(loss_halt.get("from_peak", 0.0) or 0.0)
+    for name, value in (("below_start", halt_below), ("from_peak", halt_from_peak)):
+        if not 0 <= value < 1:
+            raise ValueError(f"safeguards.loss_halt.{name} must be from 0 up to (not including) 1, not {value!r}")
     window_setting = safeguards.get("drawdown_window") or DEFAULT_DRAWDOWN_WINDOW
     window_candles = parse_period(window_setting, granularity_seconds, "safeguards.drawdown_window")
     round_trip_cost = 2 * (fee_rate + slippage) * position_fraction
@@ -446,6 +454,7 @@ def run_backtest(candles, profile, starting_capital=None, progress=None, frictio
     drawdown_pauses = []
     paused = False
     trend_reset = False
+    halted_at = None  # when the loss halt stopped the model, if it did
     orders_today = 0
     current_day = None
     screened_signals = 0
@@ -558,7 +567,7 @@ def run_backtest(candles, profile, starting_capital=None, progress=None, frictio
             flash_lots.append({"episode": episode, "drop": drop, "time": candle["start"], "price": limit_price,
                                "cost": spend, "fee": fee, "units": (spend - fee) / limit_price})
 
-    def sell_the_rebound(candle, episode):
+    def sell_the_rebound(candle, episode, reason="FLASH_REBOUND_SELL"):
         """Sell the lots bought in a flash crash at the close of the candle it recovered in."""
         nonlocal cash, fees_paid
         for lot in [lot for lot in flash_lots if lot["episode"] is episode]:
@@ -575,9 +584,14 @@ def run_backtest(candles, profile, starting_capital=None, progress=None, frictio
                 "entry_price": lot["price"], "exit_price": exit_price,
                 "position_cost": lot["cost"], "pnl": pnl, "tax_withheld": tax, "net_pnl": pnl - tax,
                 "fees": lot["fee"] + fee, "return": (proceeds - fee - tax) / lot["cost"] - 1,
-                "entry_reason": f"FLASH_CRASH_BUY_{lot['drop']:.0%}", "exit_reason": "FLASH_REBOUND_SELL",
+                "entry_reason": f"FLASH_CRASH_BUY_{lot['drop']:.0%}", "exit_reason": reason,
                 "equity_after": cash + (units + sum(held["units"] for held in flash_lots)) * candle["close"],
             })
+
+    def halt_floor():
+        """The value below which the loss halt stops the model (0 when it is off)."""
+        return max(float(starting_capital) * halt_below if halt_below else 0.0,
+                   peak_equity * (1 - halt_from_peak) if halt_from_peak else 0.0)
 
     total = len(candles)
     report_every = max(1, total // 100)
@@ -610,7 +624,7 @@ def run_backtest(candles, profile, starting_capital=None, progress=None, frictio
             tax_month = ((tax_month[0] + 1, 1) if tax_month[1] == 12
                          else (tax_month[0], tax_month[1] + 1))
             next_tax_settlement = _start_of_next_month(next_tax_settlement)
-        if episode is not None:
+        if episode is not None and halted_at is None:
             buy_the_crash(candle, episode)
         # The model never sells into a flash crash. No stop or profit target fires on a crash
         # candle, the one it recovers in included, since that candle traded in the crash; exit
@@ -633,6 +647,9 @@ def run_backtest(candles, profile, starting_capital=None, progress=None, frictio
                 # model exactly at the drawdown limit below its trailing-window peak.
                 floor = window_peak(index) * (1 - max_drawdown_limit)
                 stops.append(((floor - cash) / (units * (1 - slippage) * (1 - fee_rate)), "DRAWDOWN_STOP"))
+            if halt_floor():
+                # The price at which selling would leave the model's value exactly at the loss halt's floor.
+                stops.append(((halt_floor() - cash) / (units * (1 - slippage) * (1 - fee_rate)), "LOSS_HALT"))
             target_price = entry["price"] * (1 + profit_lock)
             triggered = [stop for stop in stops if candle["low"] <= stop[0]]
             if triggered:
@@ -642,6 +659,8 @@ def run_backtest(candles, profile, starting_capital=None, progress=None, frictio
                 if reason == "DRAWDOWN_STOP":
                     paused, trend_reset = True, False
                     drawdown_pauses.append({"paused_at": candle["start"], "resumed_at": None})
+                if reason == "LOSS_HALT":
+                    halted_at = candle["start"]
             elif profit_lock and candle["high"] >= target_price and not entry.get("target_armed"):
                 if target_trail:
                     # Keep riding the run: from the next candle, sell on a fall of target_trail from the high.
@@ -672,13 +691,22 @@ def run_backtest(candles, profile, starting_capital=None, progress=None, frictio
             drawdown_pauses.append({"paused_at": candle["start"], "resumed_at": None})
             if entry is not None:
                 sell(candle, candle["close"], "DRAWDOWN_LIMIT")
+        if halted_at is None and halt_floor() and equity < halt_floor():
+            # Checked at every close, a flash crash's included: a collapse that doesn't recover within its
+            # candle stops the model here. (Its intrabar level above is skipped on crash candles, as the
+            # other stops are, so a one-off bad print can't stop the model for good.)
+            halted_at = candle["start"]
+            if entry is not None:
+                sell(candle, candle["close"], "LOSS_HALT")
+            for crash in {id(lot["episode"]): lot["episode"] for lot in flash_lots}.values():
+                sell_the_rebound(candle, crash, "LOSS_HALT")
         if paused and not entry_signal:
             trend_reset = True
         if waiting_for_fresh_signal and not entry_signal:
             waiting_for_fresh_signal = False  # the signal has switched off; the next one is fresh
 
         order_room = max_orders_per_day is None or orders_today < max_orders_per_day
-        can_enter = (not paused or trend_reset) and not waiting_for_fresh_signal
+        can_enter = (not paused or trend_reset) and not waiting_for_fresh_signal and halted_at is None
         if entry is None and can_enter and order_room:
             position_value = max(cash - flash_reserve, 0.0) * position_fraction
             # Under a windowed limit, enter only with room for two round trips' costs above
@@ -758,6 +786,7 @@ def run_backtest(candles, profile, starting_capital=None, progress=None, frictio
         "friction": friction.describe(candles[0]["close"], starting_capital * position_fraction),
         "open_position": entry is not None,
         "drawdown_pauses": drawdown_pauses,
+        "halted_at": halted_at,
         "trades": trades,
         "indicators": model.indicator_meta(),
         "rules": model.rule_text(),

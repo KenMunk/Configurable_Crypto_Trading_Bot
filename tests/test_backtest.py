@@ -289,3 +289,70 @@ def test_trade_rows_and_summary_describe_each_outcome():
     assert "Net P&L +126.00" in summary
     assert "PROFIT_LOCK 1" in summary and "HARD_STOP 1" in summary
     assert trade_summary([]) == "No trades were made in this simulation"
+
+
+# --- the loss halt -------------------------------------------------------------------------------------
+
+def _always_in(**safeguards):
+    """A profile that buys at once and never sells on a signal, with no costs."""
+    return _profile(strategy={"direction": "LONG_ONLY", "entry_signal": {"all": ["close > 0"]},
+                              "exit_signal": {"any": ["close < 0"]}},
+                    safeguards={"use_hard_stop": False, **safeguards})
+
+
+def test_the_loss_halt_sells_at_its_floor_and_never_trades_again():
+    candles = [_candle(0, 100), _candle(900, 99, low=85, open_=99), _candle(1800, 120), _candle(2700, 130)]
+
+    result = run_backtest(candles, _always_in(loss_halt={"below_start": 0.9}))
+
+    trade = result["trades"][0]
+    assert (trade["exit_reason"], trade["exit_price"]) == ("LOSS_HALT", pytest.approx(90))  # value 9,000 there
+    assert result["trade_count"] == 1 and not result["open_position"]  # no re-entry while the price recovers
+    assert result["halted_at"] == 900
+    assert result["ending_equity"] == pytest.approx(9_000)
+
+
+def test_a_gap_through_the_loss_halts_floor_fills_at_the_open():
+    candles = [_candle(0, 100), _candle(900, 70, low=60, open_=75)]
+
+    result = run_backtest(candles, _always_in(loss_halt={"below_start": 0.9}))
+
+    assert result["trades"][0]["exit_price"] == pytest.approx(75)
+
+
+def test_the_loss_halt_can_measure_from_the_peak():
+    candles = [_candle(0, 100), _candle(900, 200), _candle(1800, 150, low=140, open_=190), _candle(2700, 300)]
+
+    result = run_backtest(candles, _always_in(loss_halt={"from_peak": 0.2}))
+
+    # The peak value is 20,000 at 200; a 20% fall leaves 16,000, at a price of 160.
+    assert result["trades"][0]["exit_price"] == pytest.approx(160)
+    assert result["halted_at"] == 1800 and result["trade_count"] == 1
+
+
+def test_without_a_loss_halt_nothing_halts():
+    candles = [_candle(0, 100), _candle(900, 50)]
+
+    result = run_backtest(candles, _always_in())
+
+    assert result["halted_at"] is None and result["open_position"]
+
+
+def test_on_a_flash_crash_candle_the_loss_halt_waits_for_the_close():
+    profile = _always_in(loss_halt={"below_start": 0.9})
+    profile["strategy"]["flash_crash_buy"] = {"enabled": True, "reserve": 100, "levels": [{"drop": 0.3, "allocation": 1.0}]}
+    wick = [_candle(0, 100), _candle(900, 99, low=50, open_=100), _candle(1800, 101)]  # recovers within the candle
+    collapse = [_candle(0, 100), _candle(900, 60, low=50, open_=100), _candle(1800, 55)]  # closes in the crash
+
+    held = run_backtest(wick, profile)
+    halted = run_backtest(collapse, profile)
+
+    assert held["halted_at"] is None and held["open_position"]
+    assert halted["halted_at"] == 900
+    assert {trade["exit_reason"] for trade in halted["trades"]} == {"LOSS_HALT"}  # the flash lot is sold too
+
+
+@pytest.mark.parametrize("bad", [{"below_start": 1.0}, {"from_peak": -0.1}])
+def test_loss_halt_settings_must_be_fractions(bad):
+    with pytest.raises(ValueError, match="loss_halt"):
+        run_backtest([_candle(0, 100), _candle(900, 101)], _always_in(loss_halt=bad))

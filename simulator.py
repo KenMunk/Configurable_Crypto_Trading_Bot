@@ -268,6 +268,8 @@ def format_backtest_result(result, recent_trades=10):
         lines += ["", f"Flash-crash buys: {len(flash):,} fills, net {sum(t['pnl'] for t in flash):+,.2f}"]
         lines += [f"- {_format_time(t['entry_time'])}: {t['entry_reason']} bought at {t['entry_price']:,.2f}, "
                   f"sold at {t['exit_price']:,.2f} ({t['pnl']:+,.2f})" for t in flash[-10:]]
+    if result.get("halted_at") is not None:
+        lines.append(f"Loss halt: stopped trading for good at {_format_time(result['halted_at'])}")
     pauses = result["drawdown_pauses"]
     if pauses:
         lines.append(f"Drawdown limit pauses: {len(pauses):,}")
