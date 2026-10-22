@@ -357,7 +357,9 @@ These settings model the real-world costs every trade pays.
 | `fallback_commission_rate` | Fraction | `0.005` | Simulated | The **profile rate**: used when the source is `config` or the live lookup fails. `exchange_commission_rate` is an older name for the same setting and takes precedence if both are present. |
 | `fee_buffer_multiplier` | Number, typically `1.0` to `1.5` | `1.0` | Simulated | Multiplies whichever fee rate is in use, as a safety cushion. A 0.5% rate with `1.25` becomes 0.625% per fill. |
 | `slippage_buffer` | Fraction | `0` | Simulated | Price penalty on every market-style fill: buys fill this much higher and sells this much lower. |
-| `tax_buffer_rate` | Fraction, such as `0.313` | `0` | Simulated | Tax reserved from each profitable completed trade and paid monthly (see [Taxes](#how-taxes-are-settled)). The friction screen also uses it. |
+| `tax_buffer_rate` | Fraction, such as `0.313` | `0` | Simulated | The tax rate on realized gains (see [Taxes](#how-taxes-are-settled)). The friction screen also uses it. |
+| `tax_loss_offset` | `true` or `false` | `true` | Simulated | `true`: profits set aside their full tax, losses release what they save, and the reserve is held until the year ends, when the year's net gain is taxed. `false`: each winning trade is taxed on its own, losses offset nothing, and tax is paid monthly. Tax rules change, so choose whichever matches yours. |
+| `tax_loss_carryforward` | `true` or `false` | `true` | Simulated | With `tax_loss_offset`, whether a year that ends with a net loss carries it forward to offset later years' gains. |
 | `liquidity_fee_buffer` | Fraction | `0.5` | Simulated | A cushion used only by the friction screen: this fraction of the round-trip exchange fees plus the Bitcoin network fee for moving the position on-chain. It is never charged. |
 | `liquidity_buffer` | — | — | Not modeled yet | Superseded by `liquidity_fee_buffer`. The simulator ignores it. |
 | `rebalancing_cost_adjustment` | `true` or `false` | none | Not modeled yet | The simulator never resizes an open position. |
@@ -368,11 +370,23 @@ The Metrics tab shows the rates a run actually used and where they came from: `C
 
 #### How taxes are settled
 
-The simulator reserves `tax_buffer_rate` of each profitable completed trade's net gain after fees. It moves that amount out of trading cash immediately, then pays the accumulated reserve at the first candle of the next UTC month. Losing trades do not offset tax reserved on profitable trades, either within the month or later.
+Only realized gains are taxed: tax is worked out as trades close, on their gain after fees, and a position still open owes nothing yet (so buy and hold, which never sells, pays no tax). Two rules are available.
 
-- The **Tax reserve** panel under Model value shows the amount withheld and awaiting payment; it returns to zero at the monthly payment. The reserve is excluded from the model's trading equity, so clearing it at payment does not create a second drop in equity.
-- The reserve is segregated from trading cash, so tax payments never sell holdings or force a strategy trade. Unrealized gains are not taxed.
-- Any reserve for the unfinished final month remains withheld and is reported as tax held for the next monthly payment.
+**Losses offset gains** (the default, `tax_loss_offset: true`), as in most tax systems. The tax year is the calendar year (UTC).
+
+- Out of caution, each winning trade sets aside its full tax, `tax_buffer_rate` of its gain, even when the year already has losses.
+- A losing trade releases the tax its loss would save, `tax_buffer_rate` of the loss, back to trading cash, as far as tax is set aside (never below zero). The trade's **Tax reserved** is then negative.
+- The reserve is held until the year ends. At the first candle of the next year, the year's actual tax is paid, `tax_buffer_rate` of its net realized gain (less any loss carried forward), and whatever was set aside beyond it goes back to trading cash. A year with a net loss pays nothing and gets back all it set aside.
+- With `tax_loss_carryforward: true` (the default), a year's net loss carries forward and offsets later years' gains at their year end, until used up. The Metrics tab lists each year's net realized gain, tax paid, amount returned and any loss carried forward.
+
+**Each winning trade taxed on its own** (`tax_loss_offset: false`), the simulator's rule before loss offsets. Each completed trade with a positive net gain reserves `tax_buffer_rate` of that gain; losses offset nothing, either within the month or later. The reserve is paid at the first candle of the next UTC month.
+
+Either way:
+
+- The **Tax reserve** panel under Model value shows the amount set aside and awaiting payment; it returns to zero at each payment. The reserve is excluded from the model's trading equity, so paying it does not create a second drop in equity.
+- The reserve is segregated from trading cash, so tax payments never sell holdings or force a strategy trade.
+- Any reserve for the unfinished final year (or month) remains set aside and is reported as tax held for the next payment.
+- Tax moving into or out of the reserve isn't a market gain or loss, so the reported drawdown leaves it out.
 
 ### 4.5 `capital_allocation`
 
@@ -421,7 +435,7 @@ Pauses are shaded gray on the charts and listed in the Metrics tab.
 
 ### 4.8 `tax_allocation`
 
-`tax_allocation` is an optional block for a scheduled tax reserve. The simulator does not use this schedule; it reserves tax per profitable trade using `friction_model.tax_buffer_rate` and pays the reserve monthly. The trader engine keeps the block with the loaded profile, so future code can read it through `get_model_configuration(ticker)`. Nothing checks its values yet. The four research templates (`btc_sma_30_100`, `btc_ema_10_100`, `btc_growth_09` and `btc_trend_vote_4in_1out`) each include a monthly example.
+`tax_allocation` is an optional block for a scheduled tax reserve. The simulator does not use this schedule; it works tax out from `friction_model.tax_buffer_rate`, `tax_loss_offset` and `tax_loss_carryforward` (see [Taxes](#how-taxes-are-settled)). The trader engine keeps the block with the loaded profile, so future code can read it through `get_model_configuration(ticker)`. Nothing checks its values yet. The four research templates (`btc_sma_30_100`, `btc_ema_10_100`, `btc_growth_09` and `btc_trend_vote_4in_1out`) each include a monthly example.
 
 | Field | Meaning |
 |---|---|

@@ -23,7 +23,8 @@ DEFAULT_STARTING_CAPITAL = 10_000.0
 DEFAULT_DRAWDOWN_WINDOW = "180d"  # reported as the worst drawdown within any 6 months
 # Bumped whenever a change alters backtest results, so caches of old results (the model
 # search's registry) are never mixed with new ones. 3: per-trade tax reserves paid monthly.
-BACKTEST_VERSION = 3
+# 4: losses offset gains within a tax year, with net losses carried forward (see taxes.py).
+BACKTEST_VERSION = 4
 
 GRANULARITY_SECONDS = {
     "ONE_MINUTE": 60,
@@ -199,17 +200,6 @@ def _format_day(timestamp):
     return datetime.fromtimestamp(timestamp, timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
 
-def _month_of(timestamp):
-    date = datetime.fromtimestamp(timestamp, timezone.utc)
-    return date.year, date.month
-
-
-def _start_of_next_month(timestamp):
-    date = datetime.fromtimestamp(timestamp, timezone.utc)
-    year, month = (date.year + 1, 1) if date.month == 12 else (date.year, date.month + 1)
-    return int(datetime(year, month, 1, tzinfo=timezone.utc).timestamp())
-
-
 def find_flash_crashes(candles, drop, granularity_seconds):
     """Find the flash crashes in `candles`.
 
@@ -314,9 +304,11 @@ def run_backtest(candles, profile, starting_capital=None, progress=None, frictio
     filled at that close. Hard stops, trailing stops and profit locks trigger intrabar on
     the candle's low/high and fill at their trigger price (or the open, if it gapped past
     it); when a stop and the profit lock are both hit in one candle the stop is assumed
-    first. Every entry signal must pass the friction screen (see friction.py). A tax reserve
-    is withheld from each profitable trade and paid monthly; losses do not offset reserves
-    from other trades. Flash crashes are traded as they happened: optional
+    first. Every entry signal must pass the friction screen (see friction.py). Tax on realized
+    gains is set aside from trading cash as trades close and paid later (see taxes.py): by
+    default losses offset gains within a tax year and net losses carry forward, paid yearly;
+    with friction_model.tax_loss_offset false, each winning trade is taxed on its own and paid
+    monthly. Flash crashes are traded as they happened: optional
     limit buys at strategy.flash_crash_buy levels, sold on the recovery candle's close;
     the model never sells into a crash (see the comment in the candle loop).
 
@@ -459,11 +451,9 @@ def run_backtest(candles, profile, starting_capital=None, progress=None, frictio
     current_day = None
     screened_signals = 0
     signal_blocked = False
-    tax_month = _month_of(candles[0]["start"])
-    next_tax_settlement = _start_of_next_month(candles[0]["start"])
-    realized_by_month = {}
-    tax_reserved = 0.0
-    taxes_paid = 0.0
+    # Tax on realized gains: what each closed trade sets aside or releases, and when it is paid (taxes.py).
+    ledger = friction.tax_ledger()
+    ledger.start(candles[0]["start"])
     tax_payments = []
     # Highest value in the trailing drawdown window, as a monotonic queue of (index, value).
     window_peaks = collections.deque()
@@ -479,36 +469,27 @@ def run_backtest(candles, profile, starting_capital=None, progress=None, frictio
             window_peaks.pop()
         window_peaks.append((index, value))
 
-    def record_realized(pnl, candle):
-        """Move this profitable trade's tax out of trading cash into its reserve."""
-        nonlocal cash, tax_reserved, peak_equity, limit_peak_equity
-        month = _month_of(candle["start"])
-        net_gain, taxable_gain, reserved = realized_by_month.get(month, (0.0, 0.0, 0.0))
-        tax = max(pnl, 0.0) * friction.tax_rate
-        realized_by_month[month] = (net_gain + pnl, taxable_gain + max(pnl, 0.0), reserved + tax)
-        if tax:
-            equity_before = cash + (units + sum(lot["units"] for lot in flash_lots)) * candle["close"]
-            cash -= tax
-            tax_reserved += tax
-            if equity_before > 0:
-                kept = (equity_before - tax) / equity_before
-                peak_equity *= kept
-                limit_peak_equity *= kept
-                for position, (peak_index, value) in enumerate(window_peaks):
-                    window_peaks[position] = (peak_index, value * kept)
-        return tax
+    def set_aside(tax, candle):
+        """Move `tax` from trading cash into the tax reserve (negative: back from the reserve to trading cash)."""
+        nonlocal cash, peak_equity, limit_peak_equity
+        if not tax:
+            return
+        equity_before = cash + (units + sum(lot["units"] for lot in flash_lots)) * candle["close"]
+        cash -= tax
+        if equity_before > 0 and equity_before - tax > 0:
+            # Tax moving in or out of the reserve isn't a market gain or loss: the drawdown peaks move with it.
+            kept = (equity_before - tax) / equity_before
+            peak_equity *= kept
+            limit_peak_equity *= kept
+            for position, (peak_index, value) in enumerate(window_peaks):
+                window_peaks[position] = (peak_index, value * kept)
 
-    def settle_taxes(month):
-        """Pay this month's separately reserved amounts; losses don't offset them."""
-        nonlocal tax_reserved, taxes_paid
-        net_gain, taxable_gain, tax = realized_by_month.pop(month, (0.0, 0.0, 0.0))
-        tax_reserved = max(tax_reserved - tax, 0.0)
-        taxes_paid += tax
-        tax_payments.append({
-            "year": month[0], "month": month[1], "net_realized_gain": net_gain,
-            "taxable_gain": taxable_gain,
-            "tax": tax,
-        })
+    def record_realized(pnl, candle):
+        """Set aside a closed trade's tax: its full tax on a gain, and on a loss, release the tax the loss saves
+        (see taxes.py). Returns the amount set aside (negative: released)."""
+        tax = ledger.realize(pnl, candle["start"])
+        set_aside(tax, candle)
+        return tax
 
     def buy(candle, fill_price, reason):
         nonlocal cash, units, entry, fees_paid, orders_today
@@ -619,11 +600,10 @@ def run_backtest(candles, profile, starting_capital=None, progress=None, frictio
         day = candle["start"] // 86_400
         if day != current_day:
             current_day, orders_today = day, 0
-        while candle["start"] >= next_tax_settlement:
-            settle_taxes(tax_month)
-            tax_month = ((tax_month[0] + 1, 1) if tax_month[1] == 12
-                         else (tax_month[0], tax_month[1] + 1))
-            next_tax_settlement = _start_of_next_month(next_tax_settlement)
+        for payment in ledger.settle(candle["start"]):
+            # The year's tax is paid from the reserve; what was set aside beyond it returns to trading cash.
+            set_aside(-payment["refund"], candle)
+            tax_payments.append(payment)
         if episode is not None and halted_at is None:
             buy_the_crash(candle, episode)
         # The model never sells into a flash crash. No stop or profit target fires on a crash
@@ -729,7 +709,7 @@ def run_backtest(candles, profile, starting_capital=None, progress=None, frictio
                 buy(candle, candle["close"], "ENTRY_SIGNAL")
 
         equity_series.append(cash + (units + sum(lot["units"] for lot in flash_lots)) * candle["close"])
-        tax_reserve_series.append(tax_reserved)
+        tax_reserve_series.append(ledger.reserved)
 
         if progress is not None and (index % report_every == 0 or index == total - 1):
             progress((index + 1) / total, f"{index + 1:,} / {total:,} candles, {len(trades):,} trades")
@@ -737,7 +717,7 @@ def run_backtest(candles, profile, starting_capital=None, progress=None, frictio
     last = candles[-1]
     ending_equity = cash + (units + sum(lot["units"] for lot in flash_lots)) * last["close"]
     wins = [trade for trade in trades if trade["net_pnl"] > 0]
-    estimated_tax_due = tax_reserved
+    estimated_tax_due = ledger.reserved
     # The strategy's first signal entry; flash-crash fills are opportunistic and reported separately.
     first_entry = next((trade["entry_time"] for trade in trades if trade["entry_reason"] == "ENTRY_SIGNAL"),
                        entry["time"] if entry else None)
@@ -773,8 +753,9 @@ def run_backtest(candles, profile, starting_capital=None, progress=None, frictio
         "win_rate": len(wins) / len(trades) if trades else 0.0,
         "fees_paid": fees_paid,
         "commission_rate": fee_rate,
-        "taxes_paid": taxes_paid,
-        "taxes_reserved": tax_reserved,
+        "taxes_paid": ledger.paid,
+        "taxes_reserved": ledger.reserved,
+        "tax_rule": ledger.describe(),
         "tax_payments": tax_payments,
         "estimated_tax_due": estimated_tax_due,
         "screened_signals": screened_signals,

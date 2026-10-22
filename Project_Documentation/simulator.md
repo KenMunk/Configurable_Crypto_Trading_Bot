@@ -420,7 +420,7 @@ To chart some of the models, select their rows (Ctrl-click or Shift-click for se
 | Worst in window | The largest fall from the highest value within the trailing window (`safeguards.drawdown_window`, or 180 days when it is not set), shown with the window, such as `12.34% / 180d`. |
 | Flash buys | The number of flash-crash limit buys that filled and were sold when their crash recovered. Buys still held at the end are not counted. |
 | Trades, Win rate | Completed trades, flash-crash buys included, and the share of them with a positive profit after fees. |
-| Fees, Taxes | Total commissions paid and tax withheld, including any reserve awaiting the next monthly payment. |
+| Fees, Taxes | Total commissions paid and tax withheld, including any reserve awaiting the next payment. |
 | Blocked signals | Entry signals the [friction screen](model_configuration.md#5-the-friction-screen-worked-through) rejected. |
 
 ### Chart
@@ -459,7 +459,7 @@ Nothing is marked while the model's indicators warm up: the regime can't be told
 
 ### Model value
 
-The Model value tab draws the value over time of every model in view on one chart: after a run, every model, or the 8 best by return when there are more (see [Showing model](#showing-model)). A second panel below it tracks each model's tax reserve, which builds as profitable trades close and returns to zero at each monthly payment.
+The Model value tab draws the value over time of every model in view on one chart: after a run, every model, or the 8 best by return when there are more (see [Showing model](#showing-model)). A second panel below it tracks each model's tax reserve, which builds as profitable trades close (and, by default, shrinks when losing trades offset the year's gains) and returns to zero at each payment.
 
 **Models on the chart**, the list on the left, picks which models it draws. It lists every model of the run, best return first, with its return:
 
@@ -483,7 +483,7 @@ With one model, the chart labels the start and end values, the subtitle gives th
 The Trades tab lists every completed trade of the chosen model, flash-crash buys included, with a summary above the table:
 
 - wins and losses
-- net P&L after fees and per-trade tax reserve
+- net P&L after fees and the tax the trade set aside (or released)
 - average, best and worst return
 - a count of each exit reason
 
@@ -496,8 +496,8 @@ Click a column heading to sort by it, and click again to reverse. Double-click a
 | Held | How long the position was open, such as `3d 4h` or `2h 15m`. |
 | Position | The cash committed to the trade, including the entry fee. |
 | Fees | The fees for both ends of the trade. |
-| Net P&L, Return | The profit after fees and per-trade tax reserve, in currency and as a fraction of Position. |
-| Tax reserved | The amount set aside from this trade's positive net gain. |
+| Net P&L, Return | The profit after fees and the tax the trade set aside or released, in currency and as a fraction of Position. |
+| Tax reserved | The tax set aside when this trade closed; negative when its loss released tax set aside on the year's gains (see [Taxes](#taxes)). |
 | Outcome | `Win` if the P&L is positive, otherwise `Loss`. |
 | Value after | The model's total value after the exit. |
 | Exit reason | Why the trade closed (see [Exit reasons](#exit-reasons)). |
@@ -541,7 +541,7 @@ Rows are keyed by the model's name, which is its file name, and sorted by it. Th
 | `buy_and_hold_multiple`, `buy_and_hold_return_pct` | The benchmark's result from `buy_and_hold_start`. |
 | `vs_buy_and_hold_pct` | How much bigger (+) or smaller (−) the model's ending value is than buy and hold's, in percent. |
 | `max_drawdown_pct`, `worst_in_window_pct`, `drawdown_window` | The drawdowns, as in the Comparison tab. |
-| `trades`, `win_rate_pct`, `fees`, `taxes`, `blocked_signals`, `flash_buys` | Trading activity and costs; `taxes` includes both paid tax and any reserve still held for the next monthly payment. |
+| `trades`, `win_rate_pct`, `fees`, `taxes`, `blocked_signals`, `flash_buys` | Trading activity and costs; `taxes` includes both paid tax and any reserve still held for the next payment. |
 | `first_recorded_utc`, `last_changed_utc` | When the model's row was first written, and when its results last changed, such as `2026-10-14 09:30:00 UTC`. These two are not compared when deciding whether a run changed anything. |
 
 Numbers are plain values without thousands separators or % signs, so they sort and chart correctly. If the file is open in Excel, Windows locks it: the run still completes and shows its results, but the status line says the file was not updated. Close it and run again to record the results.
@@ -565,7 +565,7 @@ The backtest (`backtest.py`) is a long-only, spot simulation. It holds at most o
 ### Order of events in each candle
 
 1. **New UTC day:** the `max_orders_per_day` count resets.
-2. **New calendar month:** pay the prior month's segregated tax reserve (see [Taxes](#taxes)).
+2. **New tax period:** pay the reserve of the year (or, with `tax_loss_offset` false, the month) just ended (see [Taxes](#taxes)).
 3. **Flash crashes**, if `flash_crash_buy` is set: any resting limit buy the candle traded down to fills, each level once per crash. What those buys hold is sold at the close of the candle in which the crash recovers.
 4. **Exits**, if a position is open, checked in priority order:
    1. **Stops.** These are the hard stop, the trailing stop and the drawdown stop. If the candle's low reaches any of them, the highest one triggered fills.
@@ -617,7 +617,7 @@ The backtest (`backtest.py`) is a long-only, spot simulation. It holds at most o
 
 ### Taxes
 
-Each completed trade with a positive net gain reserves `tax_buffer_rate` of that gain from trading cash. Losses do not offset tax reserved on other trades. The segregated reserve is paid at the first candle of the next UTC month, and the Tax reserve panel under Model value drops to zero at that point. Trading equity is reduced when tax is withheld, not again when the reserve is paid, and no holdings are sold to make the payment. An unfinished month's reserve remains withheld at the end of the test.
+By default, losses offset gains within each calendar year: each winning trade sets aside its full tax, each losing trade releases the tax it saves (as far as tax is set aside), and the reserve is held until the year ends. Then the year's actual tax, on its net realized gain, is paid, whatever was set aside beyond it returns to trading cash, and a net loss carries forward to later years. With `tax_loss_offset: false` in the profile's `friction_model`, each winning trade reserves its own tax, losses offset nothing, and the reserve is paid monthly. See [How taxes are settled](model_configuration.md#how-taxes-are-settled). Either way the reserve is segregated from trading cash: the Tax reserve panel under Model value drops to zero at each payment, trading equity changes when tax is set aside or released, not again when it is paid, and no holdings are sold to pay it. An unfinished period's reserve remains set aside at the end of the test.
 
 ### Drawdown limit
 

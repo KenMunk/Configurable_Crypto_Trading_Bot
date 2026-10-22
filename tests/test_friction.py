@@ -99,8 +99,10 @@ def _monthly_candles():
 
 
 def test_per_trade_tax_reserves_are_paid_monthly_and_losses_do_not_offset_them():
+    # The rule before loss offsets, still chosen with tax_loss_offset false.
     profile = _profile(
-        friction_model={"exchange_commission_rate": 0.0, "slippage_buffer": 0.0, "tax_buffer_rate": 0.3},
+        friction_model={"exchange_commission_rate": 0.0, "slippage_buffer": 0.0, "tax_buffer_rate": 0.3,
+                        "tax_loss_offset": False},
         strategy={"direction": "LONG_ONLY",
                   "entry_signal": {"all": ["close > 105", "close < 150"]},
                   "exit_signal": {"any": ["close > 190", "close < 110"]}},

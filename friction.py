@@ -126,6 +126,10 @@ class FrictionModel:
 
         self.slippage = float(friction.get("slippage_buffer", 0.0))
         self.tax_rate = float(friction.get("tax_buffer_rate", 0.0))
+        # Losses offset gains within a tax year, and a year's net loss carries forward (see taxes.py);
+        # tax_loss_offset false taxes each winning trade on its own instead.
+        self.tax_loss_offset = bool(friction.get("tax_loss_offset", True))
+        self.tax_loss_carryforward = bool(friction.get("tax_loss_carryforward", True))
         self.liquidity_fee_buffer = float(friction.get("liquidity_fee_buffer", DEFAULT_LIQUIDITY_FEE_BUFFER))
         self.charges_network_fee = _base_currency(profile) == "BTC"
         network = inputs.get("network_fee") if self.charges_network_fee else None
@@ -140,6 +144,11 @@ class FrictionModel:
         self.profit_target = float(exit_rules.get("profit_lock_target", 0.0))
         self.minimum_net_profit = float(safeguards.get("minimum_net_profit_gate", 0.0))
         self.screen_enabled = bool(self.profit_target and "minimum_net_profit_gate" in safeguards)
+
+    def tax_ledger(self):
+        """A fresh taxes.TaxLedger for one run under this profile's tax rule."""
+        from taxes import TaxLedger
+        return TaxLedger(self.tax_rate, self.tax_loss_offset, self.tax_loss_carryforward)
 
     def network_fee_fraction(self, price, position_value):
         """The on-chain fee for moving the position, as a fraction of its value."""
@@ -177,6 +186,9 @@ class FrictionModel:
             "network_fee_detail": self.network_fee_detail,
             "liquidity_fee_buffer": self.liquidity_fee_buffer,
             "tax_rate": self.tax_rate,
+            "tax_loss_offset": self.tax_loss_offset,
+            "tax_loss_carryforward": self.tax_loss_carryforward,
+            "tax_rule": self.tax_ledger().describe(),
             "screen_enabled": self.screen_enabled,
             "profit_target": self.profit_target,
             "minimum_net_profit": self.minimum_net_profit,

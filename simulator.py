@@ -179,7 +179,7 @@ def format_friction(result):
         f"- Charged per fill: {friction['fill_fee_rate']:.3%} commission + {friction['slippage']:.2%} slippage",
         f"- Liquidity buffer (screen only): {friction['liquidity_fee_buffer']:.0%} of round-trip fees"
         f" + network fee ({friction['network_fee_detail']})",
-        f"- Tax reserve: {friction['tax_rate']:.1%} of each profitable trade, paid monthly",
+        f"- Tax: {friction.get('tax_rule') or format(friction['tax_rate'], '.1%') + ' of each profitable trade'}",
     ]
     if friction["screen_enabled"]:
         expected = friction.get("expected_net_return")
@@ -195,13 +195,17 @@ def format_friction(result):
     else:
         lines.append("- Friction screen: off (needs profit_lock_target and minimum_net_profit_gate)")
 
+    yearly = friction.get("tax_loss_offset", False)
     lines += ["", f"Taxes paid: {result['taxes_paid']:,.2f}",
-              f"Tax held for the next monthly payment: {result['taxes_reserved']:,.2f}"]
+              f"Tax held for the next {'yearly' if yearly else 'monthly'} payment: {result['taxes_reserved']:,.2f}"]
     for payment in result["tax_payments"]:
-        if payment["tax"]:
+        carried, returned = payment.get("loss_carried_forward"), payment.get("refund")
+        if payment["tax"] or carried or returned:
+            period = str(payment["year"]) if yearly else f"{payment['year']}-{payment['month']:02d}"
             lines.append(
-                f"- {payment['year']}-{payment['month']:02d}: net realized "
-                f"{payment['net_realized_gain']:+,.2f}, tax paid {payment['tax']:,.2f}"
+                f"- {period}: net realized {payment['net_realized_gain']:+,.2f}, tax paid {payment['tax']:,.2f}"
+                + (f", {returned:,.2f} set aside beyond it returned" if returned else "")
+                + (f", loss carried forward {carried:,.2f}" if carried else "")
             )
     return lines
 
