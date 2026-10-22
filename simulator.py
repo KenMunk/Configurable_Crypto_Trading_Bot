@@ -2274,7 +2274,8 @@ class SimulationWindow:
                     f"paths, alone and with history")
         index = stress_test.write_reports(records, baselines, dict(models), settings)
         post(("report", index))
-        post(("done", results, join_notes(f"stress test of {len(records)} runs; report {index}",
+        post(("done", results, join_notes(f"stress test of {len(records)} runs; report {index}, "
+                                          f"and as a PDF {index.parent / 'report.pdf'}",
                                           self._run_guard().describe())))
 
     def _parallel_results(self, client, models, friction_inputs, start_time, wait_for_fresh_signal, workers):

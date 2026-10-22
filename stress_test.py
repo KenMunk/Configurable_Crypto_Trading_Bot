@@ -10,7 +10,8 @@ Run from the simulator (Test options... > "Stress test"). For each tested model:
 each of 2-3 measured two ways: "alone" from the scenario's first candle, and "with history" over
 the full real history with the scenario appended. A scenario with several paths contributes up
 to `max_paths` of them. Reports go to data/stress_reports/<time>/: index.html ranks the models
-by their worst result, <model>.html details each one, and results.csv holds every run.
+by their worst result, <model>.html details each one, report.pdf holds all of it in one file, and
+results.csv holds every run.
 
 Nothing here is logged to the performance log or recorded as a currency's best model.
 """
@@ -542,29 +543,34 @@ def _png(figure):
     return "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode("ascii")
 
 
-def _bar_chart(records, title):
-    from matplotlib.figure import Figure
-    ordered = sorted(records, key=lambda r: r["return"])
-    figure = Figure(figsize=(11, max(3, 0.22 * len(ordered) + 1.2)), dpi=90)
-    ax = figure.add_subplot(111)
+def _draw_bars(ax, ordered, title):
+    """Each run's return against buy and hold, as paired bars, worst at the bottom."""
     y = np.arange(len(ordered))
     ax.barh(y + 0.2, [100 * r["return"] for r in ordered], height=0.4, color="#2a78d6", label="Model")
     ax.barh(y - 0.2, [100 * r["buy_and_hold"] for r in ordered], height=0.4, color="#9a9a96", label="Buy and hold")
     ax.axvline(0, color="#333333", linewidth=0.8)
     ax.set_yticks(y, [r["scenario"][:70] for r in ordered], fontsize=7)
+    ax.set_ylim(-0.7, len(ordered) - 0.3)
     ax.set_xscale("symlog", linthresh=100)
-    ax.set_xlabel("Return, % (log scale beyond +-100%)")
+    ax.set_xlabel("Return, % (log scale beyond +-100%)", fontsize=8)
+    ax.tick_params(axis="x", labelsize=7)
     ax.set_title(title, fontsize=10, loc="left")
     ax.legend(loc="lower right", fontsize=8)
+
+
+def _bar_chart(records, title):
+    from matplotlib.figure import Figure
+    ordered = sorted(records, key=lambda r: r["return"])
+    figure = Figure(figsize=(11, max(3, 0.22 * len(ordered) + 1.2)), dpi=90)
+    _draw_bars(figure.add_subplot(111), ordered, title)
     figure.tight_layout()
     return _png(figure)
 
 
-def _worst_runs_chart(records, count=4):
-    from matplotlib.figure import Figure
-    worst = sorted(records, key=lambda r: r["return"])[:count]
-    figure = Figure(figsize=(11, 3.2), dpi=90)
-    axes = [figure.add_subplot(1, len(worst), i + 1) for i in range(len(worst))]
+def _draw_worst_runs(axes, records):
+    """The model's value and the market in each of the worst runs, one per axes."""
+    from matplotlib.ticker import FuncFormatter
+    worst = sorted(records, key=lambda r: r["return"])[:len(axes)]
     for ax, record in zip(axes, worst):
         equity = np.array(record["equity"]) / record["starting_capital"]
         close = np.array(record["close"]) / record["close"][0]
@@ -573,10 +579,23 @@ def _worst_runs_chart(records, count=4):
         ax.axhline(1, color="#333333", linewidth=0.6, linestyle="--")
         ax.set_yscale("log")
         ax.set_title(f"{record['scenario'][:38]}\n({record['mode']}): {record['return']:+.0%}", fontsize=7)
-        ax.tick_params(labelsize=6)
+        # Plain multiples of the start (0.5x, 2x), small, on the minor log ticks too.
+        multiple = FuncFormatter(lambda value, _: f"{value:.2g}x")
+        ax.yaxis.set_major_formatter(multiple)
+        ax.yaxis.set_minor_formatter(multiple)
+        ax.tick_params(which="both", labelsize=6)
         ax.set_xticks([])
-    if axes:
+    for ax in axes[len(worst):]:
+        ax.set_axis_off()
+    if worst:
         axes[0].legend(fontsize=6, loc="lower left")
+
+
+def _worst_runs_chart(records, count=4):
+    from matplotlib.figure import Figure
+    figure = Figure(figsize=(11, 3.2), dpi=90)
+    count = min(count, len(records))
+    _draw_worst_runs([figure.add_subplot(1, count, i + 1) for i in range(count)], records)
     figure.tight_layout()
     return _png(figure)
 
@@ -665,8 +684,182 @@ Returns are after the 0.9% taker fee, slippage and tax; buy and hold pays none o
     return summary
 
 
+# --- the PDF report ----------------------------------------------------------------------------------
+
+PDF_PAGE = (11, 8.5)  # inches: US Letter, landscape
+PDF_BAR_ROWS = 40  # runs per page of a bar chart
+PDF_TABLE_ROWS = 28  # runs per page of a run table
+PDF_SUMMARY_ROWS = 20  # models per page of the summary
+BAD, GOOD = "#b3261e", "#1a7a33"
+
+
+def _pdf_page(title, subtitle=""):
+    """A blank landscape page with a title (and a subtitle) along its top."""
+    from matplotlib.figure import Figure
+    figure = Figure(figsize=PDF_PAGE)
+    figure.text(0.04, 0.955, title, fontsize=15, weight="bold", va="top")
+    if subtitle:
+        figure.text(0.04, 0.915, _wrap(subtitle, 170), fontsize=8.5, color="#555555", va="top")
+    return figure
+
+
+def _pdf_table(figure, rect, columns, rows, colors=None, widths=None, left=(0,)):
+    """A table of `rows` (lists of text) under `columns`, from the top of `rect` (left, bottom, width, height,
+    as figure fractions); `colors[i][j]` colors a cell's text, and the columns in `left` are left-aligned."""
+    ax = figure.add_axes(rect)
+    ax.set_axis_off()
+    height = min(1.0, 0.045 * (len(rows) + 1))
+    table = ax.table(cellText=rows or [[""] * len(columns)], colLabels=columns, cellLoc="right", colWidths=widths,
+                     bbox=[0, 1 - height, 1, height])
+    table.auto_set_font_size(False)
+    table.set_fontsize(7.5)
+    for (row, column), cell in table.get_celld().items():
+        cell.set_edgecolor("#e3e2de")
+        cell.set_linewidth(0.5)
+        if column in left:
+            cell.get_text().set_horizontalalignment("left")
+            cell._loc = "left"
+        if row == 0:
+            cell.set_facecolor("#f0efea")
+            cell.get_text().set_weight("bold")
+        elif colors and colors[row - 1][column]:
+            cell.get_text().set_color(colors[row - 1][column])
+    return table
+
+
+def _wrap(text, width=150):
+    import textwrap
+    return "\n".join(textwrap.wrap(str(text), width))
+
+
+def _pct_cell(value, signed=True):
+    """_pct, with returns of 1,000% or more in thousands of percent (+1,022k%) so they fit a table cell."""
+    if value is not None and not (isinstance(value, float) and math.isinf(value)) and abs(value) >= 10:
+        return f"{value * 100 / 1000:{'+' if signed else ''},.1f}k%"
+    return _pct(value, signed)
+
+
+def _clip(text, length):
+    return text if len(text) <= length else text[:length - 1] + "…"
+
+
+def _chunks(items, size):
+    return [items[start:start + size] for start in range(0, len(items), size)] or [[]]
+
+
+def _pdf_summary_pages(pdf, rows, settings, stamp):
+    """The ranking of every model, PDF_SUMMARY_ROWS a page."""
+    columns = ["Model", "Currency", "Historic", "Runs", "Lost", "Beat B&H", "Median", "Worst", "Worst DD",
+               "Nightmares", "Verdict"]
+    pages = _chunks(rows, PDF_SUMMARY_ROWS)
+    for number, chunk in enumerate(pages, start=1):
+        figure = _pdf_page("Stress test summary" + (f" ({number} of {len(pages)})" if len(pages) > 1 else ""),
+                           f"{stamp} · {settings}. Models are ranked by their worst result: the most robust "
+                           f"first. Lost: runs that lost money. B&H: buy and hold. DD: drawdown. Nightmares: "
+                           f"nightmare runs that lost money. Every run's "
+                           f"numbers are in results.csv beside this report.")
+        cells, colors = [], []
+        for model, _, summary, baseline in chunk:
+            cells.append([_clip(model, 34), baseline["product"] if baseline else "",
+                          _pct_cell(baseline["return"]) if baseline else "", str(summary.get("runs", 0)),
+                          str(summary.get("lost", 0)), str(summary.get("beat", 0)), _pct_cell(summary.get("median")),
+                          _pct_cell(summary.get("worst")), _pct_cell(summary.get("worst_drawdown"), False),
+                          f"{summary.get('nightmare_lost', 0)} of {summary.get('nightmares', 0)}",
+                          _clip(verdict(summary).split(";")[0], 60)])
+            colors.append([None, None, None, None, BAD if summary.get("lost") else None, None, None,
+                           BAD if summary.get("worst", 0) < 0 else None, None, None, None])
+        _pdf_table(figure, (0.04, 0.06, 0.92, 0.82), columns, cells, colors,
+                   widths=[0.17, 0.07, 0.07, 0.04, 0.05, 0.06, 0.07, 0.06, 0.06, 0.08, 0.27], left=(0, 10))
+        pdf.savefig(figure)
+
+
+def _pdf_model_pages(pdf, model, records, baseline, profile, settings, stamp):
+    """One model's report: a first page (rules, verdict, headline numbers, worst runs), then for each mode its
+    chart and every run, a page at a time."""
+    summary = summarize(records)
+    market = f"{baseline['product']} {baseline['candles']} · " if baseline else ""
+    figure = _pdf_page(f"Stress test: {model}", f"{market}{stamp} · {settings}")
+    y = 0.86
+    strategy = (profile or {}).get("strategy", {})
+    for label, text in (("Entry", strategy.get("entry_signal", {}).get("description", "")),
+                        ("Exit", strategy.get("exit_signal", {}).get("description", ""))):
+        if text:
+            text = _wrap(f"{label}: {text}", 170)
+            figure.text(0.04, y, text, fontsize=8, color="#333333", va="top")
+            y -= 0.022 * (text.count("\n") + 1) + 0.01
+    figure.text(0.045, y - 0.01, _wrap(verdict(summary), 140), fontsize=10, va="top",
+                bbox=dict(facecolor="#f0efea", edgecolor="#2a78d6", boxstyle="square,pad=0.5"))
+    y -= 0.1
+    cards = [("Runs", summary.get("runs", 0)), ("Lost money", f"{summary.get('lost', 0)} of {summary.get('runs', 0)}"),
+             ("Beat buy and hold", f"{summary.get('beat', 0)} of {summary.get('runs', 0)}"),
+             ("Median return", _pct(summary.get("median"))), ("Worst return", _pct(summary.get("worst"))),
+             ("Worst drawdown", _pct(summary.get("worst_drawdown"), False)),
+             ("Historic baseline", _pct(baseline["return"]) if baseline else "")]
+    for number, (label, value) in enumerate(cards):
+        x = 0.04 + number * 0.132
+        figure.text(x, y, label, fontsize=7.5, color="#555555", va="top")
+        figure.text(x, y - 0.025, str(value), fontsize=13, weight="bold", va="top")
+    y -= 0.075
+    note = (f"Worst run: {summary.get('worst_label', '')}. ⚠ marks nightmare scenarios. Returns are after "
+            f"fees, slippage and tax; buy and hold pays none of them.") if records else "No stress runs."
+    figure.text(0.04, y, _wrap(note, 170), fontsize=7.5, color="#555555", va="top")
+    if records:
+        figure.text(0.04, y - 0.045, "Worst runs", fontsize=11, weight="bold", va="top")
+        count = min(4, len(records))
+        width = 0.92 / count
+        _draw_worst_runs([figure.add_axes((0.04 + i * width + 0.01, 0.07, width - 0.03, y - 0.2))
+                          for i in range(count)], records)
+    pdf.savefig(figure)
+    for title, mode, note in (
+            ("Scenarios alone", "alone", "Each scenario measured from its first candle, after indicators warmed up "
+                                         "on real history: how the model handles the scenario itself."),
+            ("Scenarios with history", "with history", "The full real history with the scenario appended, "
+                                                       "measured from the start: whether the scenario wipes out "
+                                                       "the model's historic gains.")):
+        chosen = sorted((r for r in records if r["mode"] == mode), key=lambda r: r["return"])
+        if not chosen:
+            continue
+        pages = _chunks(chosen, PDF_BAR_ROWS)
+        for number, chunk in enumerate(pages, start=1):
+            figure = _pdf_page(f"{model}: {title.lower()}", f"{note} Page {number} of {len(pages)}, worst first.")
+            _draw_bars(figure.add_axes((0.36, 0.08, 0.6, 0.79)), chunk, f"{title}: model against buy and hold")
+            pdf.savefig(figure)
+        columns = ["Scenario", "Model", "Buy & hold", "vs B&H", "Max DD", "Trades", "Win rate", "Fees", "Taxes",
+                   "Lost", "Beat B&H"]
+        pages = _chunks(chosen, PDF_TABLE_ROWS)
+        for number, chunk in enumerate(pages, start=1):
+            figure = _pdf_page(f"{model}: {title.lower()}, every run",
+                               f"Page {number} of {len(pages)}, worst first. ⚠ marks nightmare scenarios. "
+                               f"B&H: buy and hold. DD: drawdown. Lost: the run lost money.")
+            cells, colors = [], []
+            for r in chunk:
+                cells.append([_clip(("⚠ " if r["nightmare"] else "") + r["scenario"], 58), _pct_cell(r["return"]),
+                              _pct_cell(r["buy_and_hold"]), _pct_cell(r["vs_buy_and_hold"]), _pct_cell(r["max_drawdown"], False),
+                              str(r["trades"]), _pct_cell(r["win_rate"], False), f"{r['fees']:,.0f}", f"{r['taxes']:,.0f}",
+                              "yes" if r["lost_money"] else "no", "yes" if r["beat_buy_and_hold"] else "no"])
+                colors.append([None, BAD if r["lost_money"] else GOOD, None, None, None, None, None, None, None,
+                               BAD if r["lost_money"] else None, None])
+            _pdf_table(figure, (0.04, 0.05, 0.92, 0.83), columns, cells, colors,
+                       widths=[0.34, 0.07, 0.07, 0.07, 0.07, 0.05, 0.06, 0.07, 0.07, 0.06, 0.07])
+            pdf.savefig(figure)
+
+
+def write_pdf_report(path, rows, by_model, profiles=None, settings=""):
+    """The whole stress report in one PDF at `path`: the summary ranking, then each model's pages (see
+    _pdf_model_pages). `rows` are write_reports' ranked (model, file, summary, baseline)."""
+    from matplotlib.backends.backend_pdf import PdfPages
+    profiles = profiles or {}
+    stamp = f"{datetime.now(timezone.utc):%Y-%m-%d %H:%M} UTC"
+    with PdfPages(path, metadata={"Title": "Stress test report", "Subject": settings}) as pdf:
+        _pdf_summary_pages(pdf, rows, settings, stamp)
+        for model, _, _, baseline in rows:
+            _pdf_model_pages(pdf, model, by_model.get(model, []), baseline, profiles.get(model), settings, stamp)
+    return Path(path)
+
+
 def write_reports(records, baselines, profiles=None, settings="", folder=None):
-    """Write index.html, a report per model and results.csv; returns the index path."""
+    """Write index.html, a report per model, report.pdf (the whole report in one file) and results.csv;
+    returns the index path."""
     folder = Path(folder or REPORT_DIR / datetime.now().strftime("%Y%m%d_%H%M%S"))
     folder.mkdir(parents=True, exist_ok=True)
     profiles = profiles or {}
@@ -695,7 +888,8 @@ def write_reports(records, baselines, profiles=None, settings="", folder=None):
     index.write_text(f"""<!doctype html><html><head><meta charset='utf-8'><title>Stress test summary</title>
 <style>{STYLE}</style></head><body><h1>Stress test summary</h1>
 <p class='note'>{datetime.now(timezone.utc):%Y-%m-%d %H:%M} UTC &middot; {html.escape(settings)}. Models are ranked
-by their worst result: the most robust first. Every run's numbers are in <a href='results.csv'>results.csv</a>.</p>
+by their worst result: the most robust first. Every run's numbers are in <a href='results.csv'>results.csv</a>;
+the whole report is also in <a href='report.pdf'>report.pdf</a>.</p>
 <table><tr><th class='l'>Model</th><th class='l'>Currency</th><th>Historic</th><th>Runs</th><th>Lost money</th>
 <th>Beat buy &amp; hold</th><th>Median</th><th>Worst</th><th>Worst drawdown</th><th>Nightmares lost</th>
 <th class='l'>Verdict</th></tr>{body}</table></body></html>""", encoding="utf-8")
@@ -706,4 +900,5 @@ by their worst result: the most robust first. Every run's numbers are in <a href
         writer = csv.DictWriter(handle, fieldnames=columns, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(list(baselines.values()) + records)
+    write_pdf_report(folder / "report.pdf", rows, by_model, profiles, settings)
     return index

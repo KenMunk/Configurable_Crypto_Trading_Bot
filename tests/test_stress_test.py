@@ -1,4 +1,6 @@
 import csv
+import math
+import re
 import queue
 from types import SimpleNamespace
 
@@ -96,6 +98,15 @@ def test_every_model_runs_every_combination_alone_and_with_history_and_reports_a
     model_page = (tmp_path / "report" / "fast.html").read_text(encoding="utf-8")
     assert "Scenarios alone" in model_page and "Scenarios with history" in model_page
     assert model_page.count("data:image/png;base64,") == 3  # worst runs, and a chart for each mode
+    assert "report.pdf" in page
+    pdf = (tmp_path / "report" / "report.pdf").read_bytes()
+    pages = len(re.findall(rb"/Type /Page[^s]", pdf))
+    per_mode = {(record["model"], record["mode"]): 0 for record in records}
+    for record in records:
+        per_mode[(record["model"], record["mode"])] += 1
+    expected = 1 + 2 + sum(math.ceil(n / stress_test.PDF_BAR_ROWS) + math.ceil(n / stress_test.PDF_TABLE_ROWS)
+                           for n in per_mode.values())  # summary, a first page per model, each mode's charts and runs
+    assert pdf.startswith(b"%PDF") and pages == expected
     with (tmp_path / "report" / "results.csv").open(newline="", encoding="utf-8") as handle:
         rows = list(csv.DictReader(handle))
     assert len(rows) == len(records) + 2
