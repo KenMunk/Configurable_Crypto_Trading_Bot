@@ -121,6 +121,7 @@ Models are kept in one folder per currency, such as `config/DOGE-USD/` (see [con
 | **Run Simulation** | Backtests every selected profile. The button is disabled while a run is in progress. |
 | **Test Coinbase Authentication** | Makes a read-only account request with your key and shows the full result in the **Metrics** tab. |
 | **Clear data...** | Opens a dialog to clear stored data; see [Clearing stored data](#clearing-stored-data). |
+| **Stop monitoring** | Ends a [semi-live session](#semi-live-monitoring) early, keeping its results. Grayed out otherwise. |
 
 Next to the buttons, the **Mode** button switches between running models at once and one after another. Click it to toggle:
 
@@ -181,6 +182,20 @@ To change which models are in view, use any of these:
 
 Either way, **Model value** draws only the models in view, and **Showing model** lists only them. Each model keeps its line color however the view changes. A line beside the buttons says how many models are in view, such as `Charts show 5 of 40 models`. **Show all** brings every model back. The model on show stays if it is still in view; otherwise the best model in view by return takes its place. All three ways change the same view, so the Chart tab, the Model value tab and the gray rows in the Comparison tab always agree.
 
+### Scrolling
+
+The window scrolls up and down, with a scroll bar on its right; the two status lines stay at the bottom. The **Chart** tab is as tall as its panels need: the price chart takes about 330 pixels and each panel under it (RSI, MACD, ATR and so on) about 110, so a model with many oscillators gives each one a readable height instead of squeezing them into the window. A window taller than that is filled, as before, and other tabs fill the window without scrolling unless it is very short. The mouse wheel scrolls the window, except over a list, table or text box, which scroll themselves.
+
+### Scrolling through time
+
+The **Chart** and **Model value** charts show a window of time with a scroll bar under it. They open on the latest year, or the Chart tab on the session during [semi-live monitoring](#semi-live-monitoring). Each window has these controls:
+
+- **The scroll bar** moves the window through the history. Drag it, or click its arrows to move a tenth of the window at a time.
+- **Show** sets how much time the window holds: 1 week, 1 month, 3 months, 6 months, 1 year, 2 years, 5 years or All. The window keeps its end where it is. Once a semi-live session has started, the Chart tab also lists **Session**.
+- **Ctrl + mouse wheel** over the chart zooms in or out around the pointer, and **Shift + mouse wheel** scrolls through time. After a zoom, Show names the span, such as `45 days`.
+
+Whenever the window moves, the price or value axis and the panels without fixed bounds (MACD, ATR, OBV and so on) fit the data in view. The price axis fits the close price. Picking another model keeps the same stretch of time; if the window was at the end of the data, it stays at the end. The toolbar's zoom and pan, and double-clicking a trade, move the scroll bar with them.
+
 ### Full screen
 
 The **Full screen (F11)** button at the right end of the **Showing model** row fills the screen with the results. It hides the model list, the start date, the buttons and the progress bars, so the charts get the room. Press **Esc**, press **F11** again, or click **Exit full screen (Esc)** to return; the hidden controls come back as they were. The status lines stay visible, so a run started before going full screen can still be followed.
@@ -216,7 +231,7 @@ History is one path the market happened to take. Synthetic scenarios test how mo
 
 **Test options...**, above the buttons, opens the options window; the line beside it shows the current choice.
 
-- **Data to test on**: **Historic data only** (as before), **Historic data plus synthetic scenarios**, or **Synthetic scenarios only**.
+- **Data to test on**: **Historic data only** (as before), **Historic data plus synthetic scenarios**, **Synthetic scenarios only**, **Stress test** or **Semi-live monitoring** (see [Semi-live monitoring](#semi-live-monitoring)).
 - **Focus**: how many of each currency's historically best models to mark ▲ (see [Models](#models)).
 - **Stress test**: see [Stress tests](#stress-tests) below.
 - **Synthetic scenarios**: the scenario set to use, from `scenarios/`, listed as **modules**. Select one to edit it on the right (fields the type doesn't use are greyed out) and click **Apply changes to the scenario**.
@@ -275,6 +290,49 @@ When the test finishes, the simulator writes a report folder, `data/stress_repor
 - **results.csv**: every run's numbers, for a spreadsheet.
 
 Verdicts: **Fragile** when the worst run lost half or more; **Weak** when more than half of the runs lost money; **Robust** when no run lost more than 20%; **Mixed** otherwise. The results also fill the Comparison and Scenarios tabs. Like other synthetic results, nothing from a stress test is logged or recorded as a currency's best model, its baseline included.
+
+### Semi-live monitoring
+
+A backtest shows how a model did on the past. Semi-live monitoring shows how it does on the market as it moves now, against what history suggested could happen. Nothing is ever ordered: the models trade on paper.
+
+Choose **Semi-live monitoring** in **Test options...** and set it up on the **Semi-live monitoring** line:
+
+| Setting | Default | What it does |
+|---|---|---|
+| **Follow** | Every selected model's currency | The currencies to watch. By default, every currency the selected models trade (from their profiles' `product_id`), each in a session of its own. Pick one currency to watch only it, with only the selected models that trade it. |
+| **for** | `1d` | How long to monitor: a duration such as `90m`, `12h`, `1d` or `2w`. |
+| **checking the price every** | 30 seconds | How often the live price is read. 5 seconds at least. |
+| **moves over the last** | 365 days | The history the five directions are drawn from. |
+| **paths of each** | 5 | How many synthetic paths each model runs per direction. |
+
+Then select the models and click **Run Simulation**. There is a session for each currency followed. The sessions run side by side, start together once every projection is ready, and end together. A session works in four steps:
+
+1. **History.** Every model is backtested on its market's history, as in a normal run. The results fill the Comparison, Chart and other tabs, and are logged as usual.
+2. **Five directions and their odds.** The simulator looks at every stretch of the monitoring period's length in the recent history, such as every 24-hour move over the last year, and splits those moves into five ranges of equal width between the 2.5th and 97.5th percentiles: **Strong rally**, **Rally**, **Middle**, **Decline** and **Strong decline** (the outer two also take the rarer moves beyond). Each direction's line ends on the median move in its range, and its **probability** is the share of the moves that fell in it, so the middle is usually the most likely. A rising market projects a rising middle and a wild one a wide fan. The moves come from hourly candles when the models' candles are longer (downloading the hourly history once, for the period set in **moves over the last**), so a 1-hour session on daily models is judged on 1-hour moves, not on whole days. With too little history, the directions and odds come from a normal distribution of the recent per-candle moves instead.
+3. **Projections.** Each model runs on several synthetic paths per direction. The paths move like the market itself, with fat tails and calm and violent stretches, and each ends exactly on its direction's move. This gives the return to expect from the model if the price goes each way. In parallel mode, the runs are shared across the **Workers**.
+4. **Monitoring.** For the set period, the simulator reads the live price, and fetches each candle once it has closed and settled for 30 seconds. Every model trades the closed candles from the start of the session, exactly as a backtest would. Fills come at the candle's close, and stops trigger within the candle. The session begins with the candle open when it starts, and includes every candle that closes before it ends. A model whose candles are longer than the session, such as a daily model watched for 6 hours, has no candle to trade; its session record says so.
+
+The **Chart** tab carries on with the session while it runs and updates after every price check. Each model's chart shows its own currency's session: pick a model in **Showing model** to see another currency's.
+
+- **The live price**, in black, continues the price line without a break. The backtest's history ends with the last candle that closed before the run, so the price since then is drawn in the history's own color, from hourly candles (or the models' own, when finer), up to the session's start, where the live price takes over.
+- **The indicators carry on** too, on the price chart and in the panels under it. At every price check, the model's indicators are recomputed on its latest 2,000 candles plus the candle still open, built from the live prices so far: it opens at the last close, its high and low are the highest and lowest prices seen in it, it closes at the latest price, and its volume is the recent average for the share of the candle gone. Each line runs from the backtest's last candle, through each candle closed since, to the open candle's value at the current time, so it moves with the price until that candle closes and its real values replace the estimate. Hiding an indicator hides its live part too.
+- **The five directions** fan out as dashed lines from the price when the session started, each labelled with its probability now and its move by the end, such as `28% Rally +3.45%`. The most probable is drawn bold.
+- **The odds update as the price moves.** Each historic stretch suggests how the rest of the session could go: the live move so far plus how that stretch moved over the time left. Stretches that had moved like the live price by then count for more. So a price falling early shifts the odds towards the declines, and they settle on one direction only near the end.
+- A grey line marks the session's start, and a dotted blue line the current time. The chart opens on the **Session** view: the session, with twice its length (and at least three candles) of history before it. Scroll back through the history as usual (see [Scrolling through time](#scrolling-through-time)); the window stays where you put it as the chart updates. Zoomed out so far that the session is a sliver, the lines go unlabelled.
+
+**The status line** at the bottom of the window says how far in the sessions are and, for each currency, the price's change since the start and the most likely direction now with its probability, and names the best model so far. With one currency, it also says which direction the price is tracking most closely (the line the observed prices have stayed nearest to over the whole session) and how the best model compares with its projection.
+
+The sessions end when the period is over and the last candle has been fetched, or when you click **Stop monitoring**. Either way, each writes a record to `data/semi_live/<currency>_<start time>/`:
+
+- `session.json` has everything about the session: the directions and their latest odds, and for each model its historic return, its projected return in each direction (median, worst and best path), its live return, trades and position, buy and hold over the session, and what its projection expected by now.
+- `prices.csv` has every price observed, with each direction's projected price at the same moment, for a spreadsheet.
+
+Some caveats:
+
+- **The window must stay open.** Closing it ends the session without writing its record.
+- **Candles are real.** The candles a session fetches are stored in `data/candles.db` like any download.
+- **Profiles run as they are.** Unlike synthetic and stress runs, a semi-live session doesn't turn flash-crash buys off. The live market is real, so a model trades it as it would live, on the projections too.
+- **The odds are history's, not a forecast.** They say how often the currency has moved each way over such a period, and how often stretches that started like this one ended each way. Markets change, so treat them as a guide.
 
 ### Running models in parallel
 
@@ -427,13 +485,15 @@ To chart some of the models, select their rows (Ctrl-click or Shift-click for se
 
 The Chart tab draws the chosen model on a log price scale:
 
-- the close price, with every price-scale indicator (moving averages, VWAP, band and channel lines)
+- the close price, with every price-scale indicator (moving averages, VWAP, band and channel lines) drawn at 30% opacity, so the price and the buy and sell marks stand out
 - a separate panel under the price for each oscillator (RSI, MACD, ADX and so on), with its conventional reference levels
 - a thin green line through the chart at each buy and a red one at each sell, with a ▲ (buy) or ▼ (sell) in a strip kept clear along the bottom edge, so the marks never cover the price or indicator lines (with a price floor set, the strip isn't reserved)
 - gray shading where trading was paused by the drawdown limit
 - for a model with [regimes](model_configuration.md#49-regimes-experimental), which regime it was trading in (see [Regime marks](#regime-marks))
 
-The subtitle gives the model's trade count and return. Hover anywhere to see a crosshair and a tooltip listing the close and every indicator's value at that candle (and the active regime, for a model with regimes); an indicator still in its warm-up shows `warming up`. Use the toolbar to zoom, pan, go back, or save the chart as an image. All panels share one time axis, so zooming one zooms them all.
+The subtitle gives the model's trade count and return. Hover anywhere to see a crosshair, and the close and every indicator's value at that candle (and the active regime, for a model with regimes) in the **values panel** to the right of the chart; an indicator still in its warm-up shows `warming up`. The panel never covers the chart, and as you scroll down a tall chart it moves down with you, so the values stay in view. The Model value tab has the same panel. Use the toolbar to zoom, pan, go back, or save the chart as an image. All panels share one time axis, so zooming one zooms them all.
+
+To clean up the price chart, untick **Show indicators** (at the right of the row above the chart) to hide every indicator line, leaving the price and the trades. To hide just one, click its name or line in the legend; its entry fades, and clicking it again brings it back (and ticks **Show indicators** again if it was off). What you hide stays hidden when you pick another model or the chart redraws. The oscillator panels under the price aren't affected.
 
 **Lowest price shown** sets a floor for the price axis. Type a price and press **Enter** or **Apply**; **Clear** fits the axis to the data again. Lines below the floor are cut off, which is useful when one stray price squashes the chart: BTC-USD has a bad $0.06 print on 2017-04-15 that drags the 100-day Donchian channel down for 100 days, and a floor of `500` removes it from view. The floor:
 
@@ -455,7 +515,7 @@ A model with [regimes](model_configuration.md#49-regimes-experimental) switches 
 - a faint wash of the regime's color over every panel while it is active (none for the base regime)
 - a dashed line in the new regime's color at each **switch**
 
-Nothing is marked while the model's indicators warm up: the regime can't be told until every detector is ready, and the tooltip shows `warming up` there. Hover anywhere else to read the active regime. The Metrics tab lists each regime's detector, rules and stops, the time spent in each, and the latest switches.
+Nothing is marked while the model's indicators warm up: the regime can't be told until every detector is ready, and the values panel shows `warming up` there. Hover anywhere else to read the active regime. The Metrics tab lists each regime's detector, rules and stops, the time spent in each, and the latest switches.
 
 ### Model value
 

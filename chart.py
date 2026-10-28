@@ -11,6 +11,8 @@ from datetime import datetime, timezone
 import matplotlib.dates as mdates
 import numpy as np
 from matplotlib.ticker import FuncFormatter, Locator, LogLocator, MaxNLocator, NullFormatter
+from matplotlib.lines import Line2D
+from matplotlib.text import Annotation
 
 SURFACE = "#fcfcfb"
 PRIMARY_INK = "#0b0b0b"
@@ -29,6 +31,11 @@ OVERLAY_DASHES = [None, (0, (5, 2)), (0, (1.5, 1.5))]
 # Lines within one oscillator panel, in fixed order (e.g. MACD line, signal, histogram).
 PANEL_COLORS = ["#2a78d6", "#eb6834", "#1baf7a"]
 PRICE_PANEL_HEIGHT = 3  # relative to each oscillator panel
+# The height a chart asks for, in screen pixels: the main chart, each panel under it, and the title and date axis.
+# A window taller than that still fills it; a shorter one scrolls (see simulator.SimulationWindow).
+MAIN_CHART_PIXELS = 330
+PANEL_PIXELS = 110
+CHART_MARGIN_PIXELS = 90
 MODEL_VALUE_COLOR = "#2a78d6"
 # Models compared on the Model value chart take the categorical slots in fixed order, so a
 # model keeps its color between runs as long as its place in the list is unchanged.
@@ -42,9 +49,12 @@ REGIME_BASE_COLOR = BASELINE
 REGIME_WASH_ALPHA = 0.08
 REGIME_STRIP = (0.965, 1.0)  # the strip's bottom and top, as fractions of the chart's height
 REGIME_NAME_MIN_WIDTH = 0.04  # a stretch narrower than this share of the chart is too narrow to name in the strip
+LIVE_LABEL_MIN_WIDTH = 0.15  # a semi-live session narrower than this share of the chart shows its lines unlabelled
 BUY_COLOR = "#008300"
 SELL_COLOR = "#e34948"
 LINE_WIDTH = 1.5  # points; about 2px at 100 dpi
+INDICATOR_ALPHA = 0.3  # the price chart's indicator lines are drawn at 30% opacity, so the price and trades stand out
+HIDDEN_ENTRY_ALPHA = 0.3  # a hidden indicator's legend entry is faded
 
 
 def _format_value(value):
@@ -122,6 +132,70 @@ def buy_and_hold_values(result):
 TRADE_STRIP = 0.09
 
 
+# Room left above the peak close and below the lowest, as a share of the price's range in log terms.
+PRICE_MARGIN = 0.04
+
+
+def _fit_to_price(ax, closes):
+    """Scale a log price axis to the close price, from its lowest to its peak, so a line on the price chart
+    that is far off the price's scale (such as an average of OBV) runs off the edge instead of squashing it."""
+    prices = np.asarray(closes, dtype=float)
+    prices = prices[np.isfinite(prices) & (prices > 0)]
+    if not prices.size:
+        return
+    low, high = float(prices.min()), float(prices.max())
+    pad = np.exp(max(np.log(high / low), 0.02) * PRICE_MARGIN)
+    ax.set_ylim(low / pad, high * pad)
+
+
+def data_lines(ax):
+    """(x as date numbers, y) for each plotted data line on `ax`: not the trade marks, reference lines or the
+    hidden hover artists, which aren't in data coordinates or are animated."""
+    out = []
+    for line in ax.get_lines():
+        if line.get_animated() or line.get_transform() != ax.transData:
+            continue
+        x = np.asarray(line.get_xdata())
+        if x.size < 2:
+            continue
+        if not np.issubdtype(x.dtype, np.number):
+            x = mdates.date2num(x)
+        out.append((np.asarray(x, dtype=float), np.asarray(line.get_ydata(), dtype=float)))
+    return out
+
+
+def extent_in(series, lo, hi, positive=False):
+    """(lowest, highest) of the values whose x is within [lo, hi], over (x, y) pairs sorted by x; None if none."""
+    lows, highs = [], []
+    for x, y in series:
+        first, last = np.searchsorted(x, lo, side="left"), np.searchsorted(x, hi, side="right")
+        values = y[first:last]
+        values = values[np.isfinite(values) & ((values > 0) if positive else True)]
+        if values.size:
+            lows.append(values.min())
+            highs.append(values.max())
+    return (float(min(lows)), float(max(highs))) if lows else None
+
+
+def fit_axis(ax, series, lo, hi, log=False, margin=PRICE_MARGIN):
+    """Fit `ax`'s value axis to `series` (as data_lines gives) within the time window [lo, hi].
+
+    A log axis keeps `margin` of the log range above and below; a linear one 10% of the range, never
+    going below 0 for values that never do. Returns False, leaving the axis alone, with nothing in view.
+    """
+    extent = extent_in(series, lo, hi, positive=log)
+    if extent is None:
+        return False
+    low, high = extent
+    if log:
+        pad = np.exp(max(np.log(high / low), 0.02) * margin)
+        ax.set_ylim(low / pad, high * pad)
+    else:
+        room = (high - low) * 0.1 or abs(high) * 0.1 or 1.0
+        ax.set_ylim(max(low - room, 0.0) if low >= 0 else low - room, high + room)
+    return True
+
+
 def _reserve_trade_strip(ax):
     """Lower the price axis's bottom so the data fills the top and the trade triangles sit in an empty strip
     below it, clear of every line."""
@@ -141,7 +215,7 @@ def _trade_marks(ax, entries, exits, markersize, line_alpha, zorder, labels=Fals
     """
     edge = ax.get_xaxis_transform()  # x in data (time), y from 0 (bottom) to 1 (top) of the axes; see TRADE_STRIP
     style = dict(linestyle="none", markersize=markersize, markeredgecolor=SURFACE, markeredgewidth=1.5,
-                 transform=edge, clip_on=False, zorder=zorder)
+                 transform=edge, zorder=zorder)  # clipped: off-screen trades must not draw outside the chart
     return [
         ax.vlines(entries, 0, 1, transform=edge, colors=BUY_COLOR, linewidth=0.8, alpha=line_alpha, zorder=zorder - 1),
         ax.vlines(exits, 0, 1, transform=edge, colors=SELL_COLOR, linewidth=0.8, alpha=line_alpha, zorder=zorder - 1),
@@ -194,6 +268,9 @@ class _HoverChart:
         self.floor = None
         self.floor_fits = True
         self._shown = None  # the arguments of the last show(), so a new floor can redraw it
+        # Called with the hovered candle's values (text), or None when the pointer leaves, to show them beside the
+        # chart instead of in a tooltip over it. Without it, the tooltip shows in a corner of the chart.
+        self.on_hover = None
         canvas.mpl_connect("draw_event", self._on_draw)
         canvas.mpl_connect("motion_notify_event", self._on_move)
         canvas.mpl_connect("figure_leave_event", lambda event: self._hide_hover())
@@ -216,6 +293,35 @@ class _HoverChart:
     def _panel_count(self, result):
         """How many stacked panels sit under the main chart; none by default."""
         return 0
+
+    def view_range(self):
+        """(first, last) moment of the chart's data, as date numbers, or None before anything is shown."""
+        if self.result is None or self.x_values is None or not len(self.x_values):
+            return None
+        return float(self.x_values[0]), float(self.x_values[-1])
+
+    def show_window(self, lo, hi):
+        """Show the time window [lo, hi] (date numbers) on every panel, each fitted to the data in it."""
+        if self.result is None:
+            return
+        self.ax.set_xlim(lo, hi)
+        self._fit_main(lo, hi)
+        if self.floor is not None:
+            top = self.ax.get_ylim()[1]
+            if self.floor < top:
+                self.ax.set_ylim(self.floor, top)
+        for panel in self.axes[1:]:
+            if not getattr(panel, "fixed_bounds", False):
+                fit_axis(panel, data_lines(panel), lo, hi)
+        self.canvas.draw_idle()
+
+    def _fit_main(self, lo, hi):
+        """Fit the main chart's value axis to every line in the window; charts fit to their own values."""
+        fit_axis(self.ax, data_lines(self.ax), lo, hi, log=True)
+
+    def needed_height(self):
+        """The height, in pixels, that shows the main chart and every panel under it at a readable size."""
+        return MAIN_CHART_PIXELS + PANEL_PIXELS * (len(self.axes) - 1) + CHART_MARGIN_PIXELS
 
     def set_floor(self, floor):
         """Start the main chart's value axis at `floor`, or fit it to the data when None.
@@ -367,16 +473,20 @@ class _HoverChart:
         for crosshair in self.crosshairs:
             crosshair.set_xdata([x, x])
         self.hover_dot.set_data([x], [y])
-        self.tooltip.set_text(self.tooltip_text(index))
+        if self.on_hover is not None:
+            self.on_hover(self.tooltip_text(index))
+        self.tooltip.set_text(self.tooltip_text(index) if self.on_hover is None else "")
         # Sit in the corner away from the cursor so the tooltip never hides the hovered point.
         cursor_on_right = event.x > self.ax.bbox.x0 + self.ax.bbox.width / 2
         self.tooltip.xy = (0.01, self.tooltip_top) if cursor_on_right else (0.99, self.tooltip_top)
         self.tooltip.set_horizontalalignment("left" if cursor_on_right else "right")
         for artist in self._hover_artists:
-            artist.set_visible(True)
+            artist.set_visible(artist is not self.tooltip or self.on_hover is None)
         self._blit()
 
     def _hide_hover(self):
+        if self.on_hover is not None:
+            self.on_hover(None)
         if not any(artist.get_visible() for artist in self._hover_artists):
             return
         for artist in self._hover_artists:
@@ -400,10 +510,73 @@ class BacktestChart(_HoverChart):
     def _panel_count(self, result):
         return len([meta for meta in result["indicators"] if meta["panel_outputs"]])
 
+    _lives = None  # each semi-live session's latest snapshot (semi_live.LiveSession.snapshot), by currency
+
+    def __init__(self, figure, canvas):
+        # Which indicator lines show, by legend label: all of them unless switched off, and not the hidden ones.
+        # Both outlast redraws for other models.
+        self.indicators_shown = True
+        self.hidden = set()
+        self.indicator_lines = {}  # label -> the price chart's lines for it
+        self._legend_entries = {}  # legend handle or text -> label
+        self.on_indicators_changed = None  # called after a legend click changes what shows
+        super().__init__(figure, canvas)
+        canvas.mpl_connect("pick_event", self._on_pick)
+
+    def set_indicators_shown(self, shown):
+        """Show or hide every indicator line on the price chart (the hidden ones stay hidden when shown)."""
+        self.indicators_shown = bool(shown)
+        self._apply_visibility()
+
+    def toggle_indicator(self, label):
+        """Hide the indicator called `label` on the price chart, or show it again."""
+        self.hidden ^= {label}
+        if label not in self.hidden:
+            self.indicators_shown = True  # showing one line shows the indicators again
+        self._apply_visibility()
+
+    def _apply_visibility(self):
+        for label, lines in self.indicator_lines.items():
+            visible = self.indicators_shown and label not in self.hidden
+            for line in lines:
+                line.set_visible(visible)
+        for artist, label in self._legend_entries.items():
+            visible = self.indicators_shown and label not in self.hidden
+            artist.set_alpha(1.0 if visible else HIDDEN_ENTRY_ALPHA)
+        self.canvas.draw_idle()
+
+    def _on_pick(self, event):
+        label = self._legend_entries.get(event.artist)
+        if label is None:
+            return
+        self.toggle_indicator(label)
+        if self.on_indicators_changed is not None:
+            self.on_indicators_changed()
+
+    def _link_legend(self):
+        """Make each indicator's legend entry clickable, to hide or show its lines."""
+        self._legend_entries = {}
+        legend = self.ax.get_legend()
+        if legend is None:
+            return
+        handles = getattr(legend, "legend_handles", None) or getattr(legend, "legendHandles", [])
+        for handle, text in zip(handles, legend.get_texts()):
+            label = text.get_text()
+            if label in self.indicator_lines:
+                handle.set_picker(6)
+                text.set_picker(True)
+                self._legend_entries[handle] = self._legend_entries[text] = label
+    _live_artists = ()
+    _live_series = ()
+
     def show(self, result):
         self._shown = (result,)
         times = self._begin(result)
         self._focus_artists = []  # cleared along with the axes
+        self._live_artists, self._live_series = [], []
+        self.indicator_lines = {}
+        self.output_lines = {}  # each indicator output -> its line, on the price chart or a panel
+        self.output_labels = {}  # each price-chart output -> its indicator's legend label
         series = result["series"]
         ax = self.ax
         self.closes = np.asarray(series["close"])
@@ -423,9 +596,11 @@ class BacktestChart(_HoverChart):
             for number, output in enumerate(meta["price_scale_outputs"]):
                 band_edge = output.endswith((".upper", ".lower"))
                 line_style = {"linestyle": dashes} if dashes else {}
-                ax.plot(times, self.indicators[output], color=color, **line_style,
-                        linewidth=1 if band_edge else LINE_WIDTH, solid_joinstyle="round", zorder=zorder,
-                        label=meta["label"] if number == 0 else "_nolegend_")
+                (line,) = ax.plot(times, self.indicators[output], color=color, **line_style,
+                                  linewidth=1 if band_edge else LINE_WIDTH, solid_joinstyle="round", zorder=zorder,
+                                  alpha=INDICATOR_ALPHA, label=meta["label"] if number == 0 else "_nolegend_")
+                self.indicator_lines.setdefault(meta["label"], []).append(line)
+                self.output_lines[output], self.output_labels[output] = line, meta["label"]
 
         self.panels = [meta for meta in result["indicators"] if meta["panel_outputs"]]
         for panel_ax, meta in zip(self.axes[1:], self.panels):
@@ -442,6 +617,7 @@ class BacktestChart(_HoverChart):
 
         self._shade_pauses()
         self._shade_regimes()
+        _fit_to_price(ax, self.closes)
         subtitle = f"{result['trade_count']:,} trades, {result['total_return']:+.2%} return"
         self._finish(
             title=f"{result['product_id']} close price, indicators and trades",
@@ -453,16 +629,120 @@ class BacktestChart(_HoverChart):
         )
         if trades and (self.floor is None or not self.floor_fits):  # a floor in use is the lowest value shown
             _reserve_trade_strip(ax)
+        self._link_legend()
+        self._apply_visibility()
+        self._draw_live()
+
+    @property
+    def live(self):
+        """The semi-live session of the shown model's currency, or None."""
+        if not self._lives or self.result is None:
+            return None
+        return self._lives.get(self.result["product_id"])
+
+    def clear_live(self):
+        """Forget every semi-live session (the next show draws none)."""
+        self._lives = {}
+
+    def show_live(self, snapshot):
+        """Carry the chart on with a semi-live session, or update it (None takes every session off): the live
+        price after the history and the five directions with their odds, on the chart of any model trading the
+        session's currency."""
+        if snapshot is None:
+            self.clear_live()
+        else:
+            self._lives = {**(self._lives or {}), snapshot["product_id"]: snapshot}
+        for artist in self._live_artists:
+            artist.remove()
+        removed = set(self._live_artists)
+        for label, lines in self.indicator_lines.items():  # the live parts of the indicator lines go too
+            self.indicator_lines[label] = [line for line in lines if line not in removed]
+        self._live_artists, self._live_series = [], []
+        self._draw_live()
+        self.canvas.draw_idle()
+
+    def _live_shown(self):
+        return self.live is not None
+
+    def _draw_live(self):
+        if not self._live_shown():
+            return
+        import semi_live
+        series = self.result["series"]
+        times = series["time"]
+        candle = times[-1] - times[-2] if len(times) > 1 else 0
+        self._live_artists, self._live_series = semi_live.draw_live(
+            self.ax, self.live, times[-1], series["close"][-1], candle,
+            history_style={"color": PRICE_COLOR, "linewidth": LINE_WIDTH, "solid_joinstyle": "round"})
+        self._live_artists += self._draw_live_indicators()
+        for artist in self._live_artists:
+            artist.set_in_layout(False)
+        self._apply_visibility()
+
+    def _draw_live_indicators(self):
+        """Carry each indicator line on through the session (its values computed on the latest candles and the
+        open one; see semi_live.LiveSession.indicators), in the line's own style, on the price chart and the
+        panels. The price chart's parts show and hide with their indicator."""
+        row = next((row for row in self.live["rows"] if row["model"] == self.result.get("model_name")), None)
+        live = row and row.get("indicators")
+        if not live:
+            return []
+        x = mdates.date2num(np.array([int(t) for t in live["time"]], dtype="datetime64[s]"))
+        added = []
+        for output, values in live["values"].items():
+            line = self.output_lines.get(output)
+            if line is None:
+                continue
+            extension = Line2D(x, np.asarray(values, dtype=float))
+            extension.update_from(line)
+            extension.set_label("_nolegend_")
+            line.axes.add_line(extension)
+            added.append(extension)
+            if output in self.output_labels:
+                self.indicator_lines.setdefault(self.output_labels[output], []).append(extension)
+        return added
+
+    def view_range(self):
+        """The backtest's span, carried on to the end of a semi-live session shown on it."""
+        span = super().view_range()
+        if span is None or not self._live_shown():
+            return span
+        return span[0], max(span[1], float(mdates.date2num(np.datetime64(int(self.live["ends"]), "s"))))
+
+    def session_window(self):
+        """(lo, hi): a semi-live session shown on the chart, with twice its length (and at least three candles)
+        of history before it; None without one."""
+        if not self._live_shown():
+            return None
+        started, ends = self.live["started"], self.live["ends"]
+        times = self.result["series"]["time"]
+        candle = times[-1] - times[-2] if len(times) > 1 else 0
+        before = max(2 * (ends - started), 3 * candle)
+        return tuple(float(mdates.date2num(np.datetime64(int(t), "s"))) for t in (started - before, ends))
+
+    def _fit_main(self, lo, hi):
+        """The price axis fits the close price in the window, as in show(), with the trade strip below it, and
+        a semi-live session's live price and directions when one is shown."""
+        fit_axis(self.ax, [(self.x_values, self.closes), *self._live_series], lo, hi, log=True)
+        if self._live_shown():  # the directions' labels only where the session is wide enough to read them
+            session = (self.live["ends"] - self.live["started"]) / 86400
+            for artist in self._live_artists:
+                if isinstance(artist, Annotation):
+                    artist.set_visible(session >= LIVE_LABEL_MIN_WIDTH * (hi - lo))
+        floor_used = self.floor is not None and self.floor < self.ax.get_ylim()[1]
+        if self.result["trades"] and not floor_used:
+            _reserve_trade_strip(self.ax)
 
     def _draw_panel(self, ax, times, meta):
         """One oscillator on its own scale, with its conventional reference levels."""
+        ax.fixed_bounds = bool(meta["bounds"])  # show_window leaves these at their bounds
         for level in meta["levels"]:
             ax.axhline(level, color=BASELINE, linewidth=1, zorder=1)
         outputs = meta["panel_outputs"]
         for output, color in zip(outputs, PANEL_COLORS * len(outputs)):
             field = output.split(".", 1)[1] if "." in output else meta["label"]
-            ax.plot(times, self.indicators[output], color=color, linewidth=1.2, zorder=2,
-                    solid_joinstyle="round", label=field)
+            (self.output_lines[output],) = ax.plot(times, self.indicators[output], color=color, linewidth=1.2,
+                                                   zorder=2, solid_joinstyle="round", label=field)
         if meta["bounds"]:
             # Fixed-scale oscillators label their bounds and reference levels (0, 30, 70, 100).
             ax.set_ylim(*meta["bounds"])
@@ -481,7 +761,7 @@ class BacktestChart(_HoverChart):
     def tooltip_text(self, index):
         """Every indicator's value at the candle, oscillators included."""
         lines = [_format_timestamp(self.result["series"]["time"][index]),
-                 f"Close  {self.closes[index]:,.2f}"]
+                 f"Close  {_format_value(self.closes[index])}"]
         regime = regime_at(self.result, index)
         if regime is not None:
             lines.append(f"Regime  {regime}")
@@ -556,6 +836,12 @@ class ModelValueChart(_HoverChart):
 
     def _panel_count(self, result):
         return 1 if self.tax_panel else 0
+
+    def view_range(self):
+        """Every model's time range: models can start at different times."""
+        if self.result is None or not getattr(self, "run_x", None):
+            return None
+        return float(min(x[0] for x in self.run_x)), float(max(x[-1] for x in self.run_x))
 
     def show(self, result, primary=0, slots=None, heading=None, marks=(), legend_location=None):
         """Plot one backtest result, or a list of them to compare models on one chart.

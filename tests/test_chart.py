@@ -296,3 +296,100 @@ def test_plot_false_hides_an_indicator_and_hovering_a_panel_moves_every_crosshai
     assert {crosshair.get_xdata()[0] for crosshair in chart.crosshairs} == {chart.x_values[index]}
     assert "quiet (ATR 14)" in chart.tooltip.get_text()  # off the chart, still in the tooltip
     assert not chart.tooltip.get_in_layout()
+
+
+def test_the_price_axis_is_scaled_to_the_price_not_to_lines_far_off_its_scale():
+    # An SMA of OBV sits on the price chart but runs to millions: it must not squash the price.
+    prices = [0.1 + 0.002 * i for i in range(40)]
+    candles = [{**_candle(i * 900, p), "volume": 1e9} for i, p in enumerate(prices)]
+    profile = _profile(indicators={"fast_ema": {"type": "EMA", "period": 2}, "slow_ema": {"type": "EMA", "period": 5},
+                                   "emergency_ema": {"type": "EMA", "period": 1},
+                                   "obv": {"type": "OBV"}, "obv_sma": {"type": "SMA", "period": 3, "source": "obv"}})
+    result = run_backtest(candles, profile)
+    assert max(v for v in result["series"]["indicators"]["obv_sma"] if v == v) > 1e9
+    figure = Figure(figsize=(8, 4), dpi=100)
+    chart = BacktestChart(figure, FigureCanvasAgg(figure))
+
+    chart.show(result)
+
+    low, high = chart.ax.get_ylim()
+    assert max(prices) < high < max(prices) * 1.1
+    assert low < min(prices)  # the lowest close, and the trade strip below it
+
+
+def test_indicator_lines_are_drawn_at_30_percent_opacity_and_the_price_is_not():
+    chart, _ = _chart_with_result()
+
+    close = next(line for line in chart.ax.get_lines() if line.get_label() == "Close")
+    assert close.get_alpha() is None
+    lines = [line for lines in chart.indicator_lines.values() for line in lines]
+    assert lines and all(line.get_alpha() == pytest.approx(0.3) for line in lines)
+
+
+def test_indicators_switch_off_together_or_one_at_a_time_and_stay_so_for_the_next_model():
+    chart, result = _chart_with_result()
+    label = "fast_ema (EMA 2)"
+
+    chart.set_indicators_shown(False)
+    assert not any(line.get_visible() for lines in chart.indicator_lines.values() for line in lines)
+    chart.set_indicators_shown(True)
+    chart.toggle_indicator(label)
+    assert not any(line.get_visible() for line in chart.indicator_lines[label])
+    assert all(line.get_visible() for line in chart.indicator_lines["slow_ema (EMA 5)"])
+
+    chart.show(result)  # another model, or a redraw
+    assert not any(line.get_visible() for line in chart.indicator_lines[label])
+    entry = next(artist for artist, name in chart._legend_entries.items() if name == label)
+    assert entry.get_alpha() == pytest.approx(0.3)
+
+    changed = []
+    chart.on_indicators_changed = lambda: changed.append(chart.indicators_shown)
+    chart._on_pick(SimpleNamespace(artist=entry))  # clicking the legend entry shows it again
+    assert all(line.get_visible() for line in chart.indicator_lines[label]) and changed == [True]
+    close = next(line for line in chart.ax.get_lines() if line.get_label() == "Close")
+    assert close.get_visible()
+
+
+def test_hover_values_go_beside_the_chart_instead_of_over_it():
+    chart, result = _chart_with_result()
+    shown = []
+    chart.on_hover = shown.append
+    index = 7
+    x_pixel, y_pixel = chart.ax.transData.transform((chart.x_values[index], chart.closes[index]))
+
+    chart._on_move(SimpleNamespace(inaxes=chart.ax, xdata=chart.x_values[index] + 1e-6, x=x_pixel, y=y_pixel))
+
+    assert "Close  102.00" in shown[-1] and "fast_ema (EMA 2)  101.56" in shown[-1]
+    assert not chart.tooltip.get_visible()  # no tooltip over the chart
+    assert all(crosshair.get_visible() for crosshair in chart.crosshairs) and chart.hover_dot.get_visible()
+
+    chart._on_move(SimpleNamespace(inaxes=None, xdata=None, x=0, y=0))
+    assert shown[-1] is None
+
+
+def test_a_semi_live_session_carries_the_indicator_lines_on(tmp_path):
+    import tests.test_semi_live as t
+    history = t._history()
+    session, models = t._session(tmp_path, history)
+    session.add_tick(t.STARTED + 600, history[-1]["close"] * 1.02)
+    result = run_backtest(history, models[0][1])
+    result["model_name"] = "ema"
+    figure = Figure(figsize=(10, 6), dpi=100)
+    chart = BacktestChart(figure, FigureCanvasAgg(figure))
+    chart.show(result)
+    label = "fast_ema (EMA 2)"
+    before = len(chart.indicator_lines[label])
+
+    chart.show_live(session.snapshot(t.STARTED + 600))
+
+    lines = chart.indicator_lines[label]
+    assert len(lines) == before + 1
+    extension = lines[-1]
+    assert extension.get_color() == lines[0].get_color() and extension.get_alpha() == lines[0].get_alpha()
+    assert mdates.num2date(extension.get_xdata()[-1]).timestamp() == pytest.approx(t.STARTED + 600)
+    chart.toggle_indicator(label)  # the live part hides with its indicator
+    assert not extension.get_visible()
+
+    chart.show_live(session.snapshot(t.STARTED + 900))  # an update replaces the live part, keeping one
+    assert len(chart.indicator_lines[label]) == before + 1 and extension not in chart.indicator_lines[label]
+    assert not chart.indicator_lines[label][-1].get_visible()

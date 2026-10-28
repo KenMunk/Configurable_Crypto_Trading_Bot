@@ -28,6 +28,7 @@ from memory_guard import (DEFAULT_PERCENT as DEFAULT_MEMORY_PERCENT, MemoryGuard
                           format_bytes)
 from parallel_backtest import max_workers, parse_workers, run_parallel
 from scenario_editor import describe_mode as describe_data_mode, load_options
+from time_window import TimeWindow
 import synthetic
 from performance_log import DEFAULT_PATH as PERFORMANCE_LOG, describe_update, update_performance_log
 from model_config import CompiledModel, ProfileError, is_legacy_profile
@@ -981,14 +982,35 @@ class SimulationWindow:
         self.full_screen = False
         self.performance_log_path = PERFORMANCE_LOG
         self.floor_notes = []  # (chart, note variable) for each chart tab's floor control
+        self.chart_widgets = []  # (tab, chart, canvas widget) for each chart tab, sized to its panels
+        self.hover_panels = []  # (column, label) beside each chart, showing the hovered values
+        self.time_windows = {}  # chart -> its TimeWindow: the scroll bar and span under it
+        self._fit_job = None  # a pending _fit_page
 
         self._build_ui()
         self.root.bind("<F11>", lambda _event: self._set_full_screen(not self.full_screen))
         self.root.bind("<Escape>", lambda _event: self._set_full_screen(False))
 
     def _build_ui(self):
-        main = ttk.Frame(self.root, padding=12)
-        main.pack(fill="both", expand=True)
+        # The status lines stay at the bottom of the window; everything else scrolls, so a chart with many
+        # panels can be as tall as it needs (see _fit_page).
+        status = ttk.Frame(self.root, padding=(12, 0, 12, 8))
+        status.pack(side="bottom", fill="x")
+        ttk.Label(status, text="Status", font=("Segoe UI", 10, "bold")).pack(anchor="w")
+        ttk.Label(status, textvariable=self.result_var, foreground="#1a5d1a").pack(anchor="w", pady=(4, 0))
+        ttk.Label(status, textvariable=self.auth_status_var, foreground="#1a5d1a").pack(anchor="w", pady=(4, 0))
+        self.page_scroll = ttk.Scrollbar(self.root, orient="vertical")
+        self.page_scroll.pack(side="right", fill="y")
+        self.page = tk.Canvas(self.root, highlightthickness=0, borderwidth=0,
+                              yscrollcommand=self._page_scrolled)
+        self.page.pack(side="left", fill="both", expand=True)
+        self.page_scroll.configure(command=self.page.yview)
+        main = self.page_frame = ttk.Frame(self.page, padding=12)
+        self.page_window = self.page.create_window(0, 0, window=main, anchor="nw")
+        self.page.bind("<Configure>", lambda _event: self._schedule_fit())
+        self.root.bind_all("<MouseWheel>", self._scroll_page, add="+")
+        self.root.bind_all("<Button-4>", self._scroll_page, add="+")
+        self.root.bind_all("<Button-5>", self._scroll_page, add="+")
 
         # Everything above the results; full screen hides it so the charts get the room.
         self.controls = ttk.Frame(main)
@@ -1100,6 +1122,11 @@ class SimulationWindow:
             side="left", padx=(8, 0)
         )
         ttk.Button(action_row, text="Clear data...", command=self._open_clear_data).pack(side="left", padx=(8, 0))
+        # Ends a semi-live session early (it keeps its results); disabled otherwise.
+        self.stop_event = threading.Event()
+        self.stop_button = ttk.Button(action_row, text="Stop monitoring", command=self.stop_event.set)
+        self.stop_button.pack(side="left", padx=(8, 0))
+        self.stop_button.state(["disabled"])
         self.parallel_var = tk.BooleanVar(value=True)
         self.mode_text = tk.StringVar()
         self.mode_button = ttk.Checkbutton(action_row, textvariable=self.mode_text, variable=self.parallel_var,
@@ -1165,15 +1192,6 @@ class SimulationWindow:
         self.timings = {}  # "single" / "parallel" -> the last run in that mode, for compare_timings
         self.run_timing = None  # the run under way: started, mode, models
 
-        # Status is packed from the bottom first so the expanding tabs never push it off-screen.
-        ttk.Label(main, textvariable=self.auth_status_var, foreground="#1a5d1a").pack(
-            side="bottom", anchor="w", pady=(4, 0)
-        )
-        ttk.Label(main, textvariable=self.result_var, foreground="#1a5d1a").pack(
-            side="bottom", anchor="w", pady=(4, 0)
-        )
-        ttk.Label(main, text="Status", font=("Segoe UI", 10, "bold")).pack(side="bottom", anchor="w")
-
         picker_row = self.picker_row = ttk.Frame(main)
         picker_row.pack(fill="x", pady=(0, 6))
         self.full_screen_button = ttk.Button(picker_row, text="Full screen (F11)",
@@ -1193,6 +1211,7 @@ class SimulationWindow:
 
         self.results_tabs = ttk.Notebook(main)
         self.results_tabs.pack(fill="both", expand=True, pady=(0, 10))
+        self.results_tabs.bind("<<NotebookTabChanged>>", lambda _event: self._schedule_fit())
 
         self.comparison_tab = self._add_comparison_tab()
         self.chart_tab, self.chart = self._add_chart_tab("Chart", BacktestChart, "Lowest price shown:")
@@ -1201,6 +1220,7 @@ class SimulationWindow:
         self.trades_tab = self._add_trades_tab()
         self.scenarios_tab = self._add_scenarios_tab()
         self.scenario_charts_tab = self._add_scenario_charts_tab()
+        self.semi_live_snapshots = {}  # each semi-live session's latest snapshot, by currency, on the Chart tab
 
         self.metrics_tab = ttk.Frame(self.results_tabs)
         self.results_tabs.add(self.metrics_tab, text="Metrics")
@@ -1235,14 +1255,124 @@ class SimulationWindow:
         ttk.Button(floor_row, text="Clear", command=lambda: (floor_var.set(""), apply())).pack(
             side="left", padx=(4, 0))
         ttk.Label(floor_row, textvariable=note_var, foreground="#555555").pack(side="left", padx=(12, 0))
+        if hasattr(chart, "set_indicators_shown"):
+            # Clean up the price chart: every indicator line off or on, or one at a time from the legend.
+            shown_var = tk.BooleanVar(value=True)
+            ttk.Label(floor_row, text="(click a name in the legend to hide or show it)", foreground="#555555").pack(
+                side="right", padx=(6, 0))
+            ttk.Checkbutton(floor_row, text="Show indicators", variable=shown_var,
+                            command=lambda: chart.set_indicators_shown(shown_var.get())).pack(side="right", padx=(16, 0))
+            chart.on_indicators_changed = lambda: shown_var.set(chart.indicators_shown)
         self.floor_notes.append((chart, note_var))
         self._describe_floor(chart, note_var)
 
         if model_list:
             self._add_view_list(tab)
         toolbar.pack(side="bottom", fill="x")
+        # Scroll through time under the chart: a year at a time by default.
+        window = self.time_windows[chart] = TimeWindow(tab, chart, canvas.get_tk_widget())
+        window.frame.pack(side="bottom", fill="x", pady=(2, 0))
+        self._add_hover_panel(tab, chart)
         canvas.get_tk_widget().pack(fill="both", expand=True)
+        self.chart_widgets.append((tab, chart, canvas.get_tk_widget()))
         return tab, chart
+
+    HOVER_PANEL_WIDTH = 290  # pixels
+    HOVER_HINT = "Hover over the chart to see each value here"
+
+    def _add_hover_panel(self, tab, chart):
+        """A column beside the chart that shows the hovered candle's values, in place of a tooltip over the chart.
+        The values stay in view as the page scrolls (see _stick_hover_panels)."""
+        column = tk.Frame(tab, width=self.HOVER_PANEL_WIDTH, background="#ffffff")
+        column.pack(side="right", fill="y", padx=(6, 0))
+        column.pack_propagate(False)
+        label = tk.Label(column, text=self.HOVER_HINT, justify="left", anchor="nw", background="#ffffff",
+                         foreground="#1f2328", font=("Segoe UI", 9), wraplength=self.HOVER_PANEL_WIDTH - 16,
+                         padx=8, pady=6, borderwidth=1, relief="solid")
+        label.place(x=0, y=0, relwidth=1)
+        self.hover_panels.append((column, label))
+
+        def show(text):
+            label.configure(text=text or self.HOVER_HINT)
+            self._stick_hover_panels()
+
+        chart.on_hover = show
+
+    def _page_scrolled(self, first, last):
+        """The page's scroll command: move its scroll bar, and keep the hover values in view."""
+        self.page_scroll.set(first, last)
+        self._stick_hover_panels()
+
+    def _stick_hover_panels(self):
+        """Keep each hover panel's values at the top of the visible part of its column, so scrolling down a tall
+        chart brings them along, without leaving the column."""
+        try:
+            page_top = self.page.winfo_rooty()
+        except tk.TclError:
+            return
+        for column, label in self.hover_panels:
+            if not column.winfo_ismapped():
+                continue
+            room = column.winfo_height() - label.winfo_reqheight()
+            offset = min(max(page_top - column.winfo_rooty() + 4, 0), max(room, 0))
+            if int(float(label.place_info().get("y", 0))) != offset:
+                label.place_configure(y=offset)
+
+    def _schedule_fit(self):
+        """Fit the page to its contents once the window is idle (several changes at once fit once)."""
+        if self._fit_job is None:
+            self._fit_job = self.root.after_idle(self._fit_page)
+
+    def _fit_page(self):
+        """Size the scrolling page: the chart tab on show asks for room for every one of its panels, and the page
+        is the window's height, or taller (with the scroll bar) when its contents need more."""
+        self._fit_job = None
+        try:
+            shown = self.results_tabs.nametowidget(self.results_tabs.select())
+        except (KeyError, tk.TclError):
+            shown = None
+        charted = False
+        for tab, chart, widget in self.chart_widgets:
+            height = chart.needed_height() if tab is shown else 1
+            charted = charted or tab is shown
+            if int(float(widget.cget("height"))) != height:
+                widget.configure(height=height)
+        self.page_frame.update_idletasks()
+        # Only the tab on show sets the results' height: a chart tab the room for every panel, any other tab a
+        # modest minimum it stretches beyond to fill the window. Otherwise the tallest tab would set it for all.
+        tabs_height = shown.winfo_reqheight() if charted else self.MIN_RESULTS_HEIGHT
+        if int(float(self.results_tabs.cget("height") or 0)) != tabs_height:
+            self.results_tabs.configure(height=tabs_height)
+            self.page_frame.update_idletasks()
+        width, visible = self.page.winfo_width(), self.page.winfo_height()
+        height = max(visible, self.page_frame.winfo_reqheight())
+        self.page.itemconfigure(self.page_window, width=width, height=height)
+        self.page.configure(scrollregion=(0, 0, width, height))
+        if height <= visible:
+            self.page.yview_moveto(0)
+        self._stick_hover_panels()
+
+    MIN_RESULTS_HEIGHT = 300  # pixels the results tabs ask for when no chart tab is on show
+
+    # Widgets that scroll themselves; the wheel over them scrolls them, not the page.
+    SELF_SCROLLING = {"Listbox", "Treeview", "Text", "TCombobox", "TSpinbox", "Spinbox", "Scrollbar", "TScrollbar"}
+
+    def _scroll_page(self, event):
+        """Scroll the page with the mouse wheel, unless the pointer is over a list, table or text box, or the
+        event belongs to another window (Test options, Choose models)."""
+        try:
+            widget = event.widget if not isinstance(event.widget, str) else self.root.nametowidget(event.widget)
+            if widget.winfo_toplevel() is not self.root or widget.winfo_class() in self.SELF_SCROLLING:
+                return
+        except (KeyError, tk.TclError, AttributeError):
+            return
+        if self.page_frame.winfo_reqheight() <= self.page.winfo_height():
+            return
+        if getattr(event, "num", None) in (4, 5):
+            steps = -1 if event.num == 4 else 1
+        else:
+            steps = -1 if event.delta > 0 else 1
+        self.page.yview_scroll(steps * 3, "units")
 
     def _add_view_list(self, tab):
         """A list beside the Model value chart for picking the models it draws, best return first."""
@@ -1325,6 +1455,8 @@ class SimulationWindow:
             note_var.set(str(exc))
             return
         chart.set_floor(floor)
+        if chart in self.time_windows:
+            self.time_windows[chart].refresh()  # set_floor redrew the whole history
         self._describe_floor(chart, note_var)
 
     @staticmethod
@@ -1349,6 +1481,7 @@ class SimulationWindow:
         else:
             self.controls.pack(fill="x", before=self.picker_row)
         self.full_screen_button.configure(text="Exit full screen (Esc)" if on else "Full screen (F11)")
+        self._schedule_fit()
 
     def _add_comparison_tab(self):
         tab = ttk.Frame(self.results_tabs, padding=(0, 6, 0, 0))
@@ -1597,6 +1730,9 @@ class SimulationWindow:
         self.value_chart.show([self.results[position] for position in self.in_view],
                               primary=self.in_view.index(index),
                               slots=[self.color_slots[position] for position in self.in_view])
+        for chart in (self.chart, self.value_chart):
+            self.time_windows[chart].refresh()  # the same stretch of time as before, or the latest
+        self._schedule_fit()  # the new model may have more or fewer panels
         for chart, note_var in self.floor_notes:
             self._describe_floor(chart, note_var)
         self._show_trades(result)
@@ -1723,7 +1859,8 @@ class SimulationWindow:
             self.test_mode_var.set(describe_data_mode(options))
             self._refresh_models()
 
-        TestOptionsDialog(self.root, self.test_options, saved, markets=[m for m in markets if m.split()[-1]])
+        TestOptionsDialog(self.root, self.test_options, saved, markets=[m for m in markets if m.split()[-1]],
+                          currencies=[product for product in self.model_products.values() if product])
 
     def selected_model_paths(self):
         """The Selected list's models, in its order."""
@@ -1966,6 +2103,22 @@ class SimulationWindow:
         else:
             self.scenario_note_var.set("Run with synthetic scenarios (Test options...) to compare models across them")
 
+    def _show_semi_live(self, snapshot):
+        """Show a semi-live session's latest state (a snapshot from semi_live.LiveSession): carried on on the Chart
+        tab for the models of its currency, and summed up with the other currencies on the status line."""
+        import semi_live
+        first = not self.semi_live_snapshots
+        window = self.time_windows[self.chart]
+        if first:  # the Chart tab carries on with the session, and opens on it
+            window.add_span("Session", self.chart.session_window)
+            window.reset("Session")
+        self.semi_live_snapshots[snapshot["product_id"]] = snapshot
+        self.chart.show_live(snapshot)
+        window.refresh()  # keeps the stretch of time on show, following the session while at its end
+        self.result_var.set(f"Simulation status: {semi_live.describe_all(self.semi_live_snapshots.values())}")
+        if first:
+            self.results_tabs.select(self.chart_tab)
+
     def _add_trades_tab(self):
         tab = ttk.Frame(self.results_tabs, padding=(0, 6, 0, 0))
         self.results_tabs.add(tab, text="Trades")
@@ -2105,6 +2258,11 @@ class SimulationWindow:
                 "historic+synthetic", "synthetic") else []
             if mode in ("historic+synthetic", "synthetic") and not scenarios:
                 raise ValueError("The scenario set is empty: add scenarios in Test options, or test historic data only")
+            if mode == "semi-live":
+                import semi_live
+                settings = semi_live.settings_of(self.test_options)
+                models, _ = semi_live.pick_models(models, settings[0])  # every selected currency, or the one set
+                scenarios = settings  # the worker's semi-live settings
             problems = [f"{name}: {report.splitlines()[1][2:]}" for name, profile in models
                         for valid, report in [describe_profile(profile)] if not valid]
             if problems:
@@ -2130,6 +2288,9 @@ class SimulationWindow:
             self.progress_vars[phase].set("waiting")
         self.metrics_text.delete("1.0", tk.END)
         self.run_button.state(["disabled"])
+        self.stop_event.clear()
+        if mode == "semi-live":
+            self.stop_button.state(["!disabled"])
         self.result_var.set("Simulation status: testing the Coinbase API")
         # Not `mode`: that is the data mode the worker needs. Scenario and stress runs make a task per model per path,
         # shared across every worker; history runs a task per model.
@@ -2174,6 +2335,9 @@ class SimulationWindow:
             if mode == "stress":
                 self._stress_test(client, models, frictions, wait_for_fresh_signal, workers)
                 return
+            if mode == "semi-live":
+                self._semi_live(client, models, frictions, start_time, wait_for_fresh_signal, workers, scenarios)
+                return
             if mode != "synthetic" and workers > 1 and len(models) > 1:
                 outcome = self._parallel_results(client, models, inputs, start_time, wait_for_fresh_signal, workers)
                 if outcome is None:
@@ -2191,6 +2355,92 @@ class SimulationWindow:
             post(("done", results, join_notes(logged, self._run_guard().describe())))
         except Exception as exc:  # Reported in the window; the worker must not die silently.
             post(("error", exc))
+
+    def _semi_live(self, client, models, frictions, start_time, wait_for_fresh_signal, workers, settings):
+        """A semi-live session for each currency the models trade (semi_live.py): backtest the models on history
+        and show the results, project five directions per currency and run every model on its currency's, then
+        paper-trade the models on the live markets until the period ends or Stop monitoring is clicked. The
+        sessions start and end together. `settings` are semi_live.settings_of's."""
+        import semi_live
+        post = self.progress_queue.put
+        currency, period, poll, paths, basis = settings
+        results, logged, candles_by_market = self._serial_results(client, models, frictions, start_time,
+                                                                  wait_for_fresh_signal)
+        post(("shown", results, logged))
+
+        products = list(dict.fromkeys(profile["product_id"] for _, profile in models))
+        planned = []  # (product, its models, its markets, odds, projections, last close)
+        for number, product in enumerate(products):
+            chosen = [(name, profile) for name, profile in models if profile["product_id"] == product]
+            markets = {market: candles for market, candles in candles_by_market.items() if market[0] == product}
+            finest = min(markets, key=lambda market: resolve_granularity(market[1])[1])
+            history, seconds = markets[finest], resolve_granularity(finest[1])[1]
+            detail = self._semi_live_detail_candles(client, product, seconds, basis)
+            if detail is not None:
+                history, seconds = detail
+            odds = semi_live.DirectionOdds(history, seconds, period, basis)
+            targets = odds.targets
+            count = f" ({number + 1} of {len(products)})" if len(products) > 1 else ""
+            post(("status", f"Simulation status: projecting {product}{count} five ways over "
+                            f"{semi_live.format_duration(period)} ({targets[0]['method']}): " + ", ".join(
+                                f"{t['name']} {t['change']:+.2%} ({t['probability']:.0%})" for t in targets)))
+            projections = semi_live.run_projections(
+                chosen, frictions, markets, targets, time.time(), period, paths=paths, workers=workers,
+                wait_for_fresh_signal=wait_for_fresh_signal,
+                progress=lambda fraction, message, number=number: post(
+                    ("progress", "simulation", (number + fraction) / len(products), message)))
+            planned.append((product, chosen, markets, odds, projections, (history, seconds)))
+
+        # The sessions start once every projection is ready, so their clocks and the live prices start together.
+        started = time.time()
+        sessions = []
+        for product, chosen, markets, odds, projections, lead_in in planned:
+            anchor_price = semi_live.latest_price(client, product) or lead_in[0][-1]["close"]
+            description = (f"{product} for {semi_live.format_duration(period)}, price checked every {poll:g} s; "
+                           f"directions from {odds.targets[0]['method']} over the last {basis:g} days; "
+                           f"{paths} paths each")
+            sessions.append(semi_live.LiveSession(
+                product, chosen, frictions, markets, odds.targets, projections, started, period, anchor_price,
+                historic={r["model_name"]: r for r in results}, wait_for_fresh_signal=wait_for_fresh_signal,
+                settings=description, odds=odds, lead_in=lead_in))
+        names = ", ".join(products)
+        post(("progress", "simulation", 0.0, f"monitoring {names} live"))
+
+        def update(snapshot):
+            post(("semi_live", snapshot))
+            post(("progress", "simulation", snapshot["fraction"],
+                  f"monitoring {names}: {semi_live.format_duration(snapshot['now'] - started)} of "
+                  f"{semi_live.format_duration(period)}"))
+
+        complete = semi_live.monitor(client, sessions, self.stop_event, poll, update)
+        moment, snapshots, notes = time.time(), [], []
+        for session in sessions:
+            done = complete or moment >= session.ends
+            snapshot = session.snapshot(moment, finished=done, stopped=not done)
+            snapshots.append(snapshot)
+            try:
+                notes.append(f"{session.product_id} record in {semi_live.write_session(snapshot)}")
+            except OSError as exc:
+                notes.append(f"{session.product_id} record not written ({exc})")
+        post(("semi_live_done", snapshots, "; ".join(notes)))
+
+    def _semi_live_detail_candles(self, client, product, seconds, basis_days):
+        """(candles, seconds) of the last `basis_days` in semi_live.DETAIL_GRANULARITY candles, when the models'
+        candles (`seconds` long) are coarser, for the directions and their odds; None when the models' are as
+        fine, or the download fails (the models' own candles are used)."""
+        import semi_live
+        granularity, detail_seconds = resolve_granularity(semi_live.DETAIL_GRANULARITY)
+        if seconds <= detail_seconds:
+            return None
+        self.progress_queue.put(("status", f"Simulation status: gathering {product} {granularity} data for the "
+                                           f"directions"))
+        end = int(time.time()) // detail_seconds * detail_seconds
+        try:
+            candles = load_candles(client, product, granularity, end - int(basis_days * 86400) - detail_seconds * 400,
+                                   end)
+        except Exception:  # Only the directions' detail is lost; the session goes on.
+            return None
+        return (candles, detail_seconds) if len(candles) > semi_live.MIN_SAMPLES else None
 
     def _run_guard(self):
         """This run's memory guard (see memory_guard.py): the one Run Simulation made, or a default one."""
@@ -2342,32 +2592,21 @@ class SimulationWindow:
                 self.last_report = event[1]
                 webbrowser.open(Path(event[1]).as_uri())
             elif kind == "done":
-                self.results, logged = event[1], event[2]
-                # The earlier run's chart data on disk belongs to results no longer shown.
-                clean_spills(keep=[self.memory_guard.spill_folder] if self.memory_guard is not None else [])
-                best = max(range(len(self.results)), key=lambda i: self.results[i]["total_return"])
-                self._show_comparison(self.results)
-                self._show_scenarios(self.results)
-                self._fill_scenario_charts(self.results)
-                self.color_slots = {}
-                historic = [result for result in self.results if is_historic(result)]
-                per_currency = {product: self.results.index(historic[position])
-                                for product, position in best_by_currency(historic).items()}
-                # Several currencies: chart each one's best; one currency: its best few.
-                view = list(per_currency.values()) if len(per_currency) > 1 else default_view(self.results)
-                self._set_view(view, current=best)
-                if historic:
-                    logged = f"{self._record_best_models(historic)}; {logged}"
-                if len(self.results) == 1:
-                    result = self.results[0]
-                    self.results_tabs.select(self.chart_tab)
-                    self.result_var.set(f"Simulation status: complete ({result['total_return']:+.2%} over "
-                                        f"{result['trade_count']:,} trades); {logged}")
-                else:
-                    self.results_tabs.select(self.comparison_tab)
-                    self.result_var.set(
-                        f"Simulation status: complete, {len(self.results)} models; best "
-                        f"{self.results[best]['model_name']} {self.results[best]['total_return']:+.2%}; {logged}")
+                self.chart.clear_live()  # a finished session's prices leave the chart with its run
+                self._show_results(event[1], event[2])
+                finished = succeeded = True
+            elif kind == "shown":  # a semi-live session's historic results; the session goes on
+                self.semi_live_snapshots = {}
+                self.chart.clear_live()
+                self._show_results(event[1], event[2], status="Simulation status: historic run done")
+            elif kind == "semi_live":
+                self._show_semi_live(event[1])
+            elif kind == "semi_live_done":
+                import semi_live
+                _, snapshots, note = event
+                for snapshot in snapshots:
+                    self._show_semi_live(snapshot)
+                self.result_var.set(f"Simulation status: {semi_live.describe_all(snapshots)}; {note}")
                 finished = succeeded = True
             elif kind == "error":
                 self.result_var.set(f"Simulation status: error - {event[1]}")
@@ -2379,8 +2618,38 @@ class SimulationWindow:
         if finished:
             self._show_workers([])
             self.run_button.state(["!disabled"])
+            self.stop_button.state(["disabled"])
         else:
             self.root.after(100, self._poll_progress)
+
+    def _show_results(self, results, logged, status="Simulation status: complete"):
+        """Fill the result tabs with a run's results and report them on the status line."""
+        self.results = results
+        # The earlier run's chart data on disk belongs to results no longer shown.
+        clean_spills(keep=[self.memory_guard.spill_folder] if self.memory_guard is not None else [])
+        best = max(range(len(self.results)), key=lambda i: self.results[i]["total_return"])
+        self._show_comparison(self.results)
+        self._show_scenarios(self.results)
+        self._fill_scenario_charts(self.results)
+        self.color_slots = {}
+        historic = [result for result in self.results if is_historic(result)]
+        per_currency = {product: self.results.index(historic[position])
+                        for product, position in best_by_currency(historic).items()}
+        # Several currencies: chart each one's best; one currency: its best few.
+        view = list(per_currency.values()) if len(per_currency) > 1 else default_view(self.results)
+        self._set_view(view, current=best)
+        if historic:
+            logged = f"{self._record_best_models(historic)}; {logged}"
+        if len(self.results) == 1:
+            result = self.results[0]
+            self.results_tabs.select(self.chart_tab)
+            self.result_var.set(f"{status} ({result['total_return']:+.2%} over "
+                                f"{result['trade_count']:,} trades); {logged}")
+        else:
+            self.results_tabs.select(self.comparison_tab)
+            self.result_var.set(
+                f"{status}, {len(self.results)} models; best "
+                f"{self.results[best]['model_name']} {self.results[best]['total_return']:+.2%}; {logged}")
 
     def _show_workers(self, rows):
         """Show what each stress test worker is running (rows from stress_test.run_stress), or hide the table."""
@@ -2388,7 +2657,10 @@ class SimulationWindow:
             self.workers_table.delete(*self.workers_table.get_children())
             self.workers_label.grid_remove()
             self.workers_table.grid_remove()
+            self._schedule_fit()
             return
+        if not self.workers_table.winfo_ismapped() or int(self.workers_table.cget("height")) != min(len(rows), 16):
+            self._schedule_fit()  # the table appears or grows, so the page's height changes
         self.workers_label.grid()
         self.workers_table.grid()
         self.workers_table.configure(height=min(len(rows), 16))

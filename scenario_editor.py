@@ -8,6 +8,7 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 
+import semi_live
 import stress_test
 import synthetic
 
@@ -15,9 +16,11 @@ OPTIONS_FILE = Path(__file__).parent / "data" / "simulator_options.json"
 MODES = [("historic", "Historic data only"),
          ("historic+synthetic", "Historic data plus synthetic scenarios"),
          ("synthetic", "Synthetic scenarios only"),
-         ("stress", "Stress test")]
+         ("stress", "Stress test"),
+         ("semi-live", "Semi-live monitoring")]
 DEFAULT_OPTIONS = {"mode": "historic", "scenario_set": str(synthetic.DEFAULT_SET), "top_n": 5,
-                   "stress_paths": 3, "synthetic_flash_crash_buys": False}
+                   "stress_paths": 3, "synthetic_flash_crash_buys": False, **semi_live.DEFAULT_SETTINGS}
+SELECTED_CURRENCY = "Every selected model's currency"
 # Every scenario parameter the editor shows, in order, with a label.
 FIELDS = [("drop", "Drop (0.5 = -50%)"), ("rise", "Rise (2.0 = +200%)"), ("days", "Days"),
           ("recovery_days", "Recovery days"), ("recovery", "Recovery (share of the drop)"),
@@ -55,6 +58,11 @@ def describe_mode(options):
         except (OSError, ValueError):
             count = 0
         return f"Data: stress test ({count} combinations in the stress plan, alone and with history; a report per model)"
+    if options["mode"] == "semi-live":
+        settings = {**semi_live.DEFAULT_SETTINGS, **options}
+        currency = settings["semi_live_currency"] or "every selected model's currency"
+        return (f"Data: semi-live monitoring of {currency} for {settings['semi_live_period']} (history, then five "
+                f"projected directions with {settings['semi_live_paths']} paths each, then live paper trading)")
     try:
         count = len(synthetic.runs(synthetic.load_set(options["scenario_set"])))
     except (OSError, ValueError):
@@ -65,7 +73,7 @@ def describe_mode(options):
 class TestOptionsDialog:
     """Edits the simulator's test options; calls `on_save(options)` when the user clicks Save."""
 
-    def __init__(self, root, options, on_save, markets=()):
+    def __init__(self, root, options, on_save, markets=(), currencies=()):
         import tkinter as tk
         from tkinter import messagebox, simpledialog, ttk
         from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
@@ -97,6 +105,37 @@ class TestOptionsDialog:
         self.flash_var = tk.BooleanVar(value=bool(self.options.get("synthetic_flash_crash_buys", False)))
         ttk.Checkbutton(stress, text="Flash-crash buys in synthetic and stress runs",
                         variable=self.flash_var).pack(side="left", padx=(16, 0))
+
+        live = ttk.LabelFrame(frame, text="Semi-live monitoring", padding=8)
+        live.pack(fill="x", pady=(8, 0))
+        settings = {**semi_live.DEFAULT_SETTINGS, **self.options}
+        live_top = ttk.Frame(live)
+        live_top.pack(fill="x")
+        ttk.Label(live_top, text="Follow").pack(side="left")
+        self.live_currency_var = tk.StringVar(value=settings["semi_live_currency"] or SELECTED_CURRENCY)
+        ttk.Combobox(live_top, textvariable=self.live_currency_var, state="readonly", width=28,
+                     values=[SELECTED_CURRENCY, *sorted(set(currencies))]).pack(side="left", padx=4)
+        ttk.Label(live_top, text="for").pack(side="left")
+        self.live_period_var = tk.StringVar(value=str(settings["semi_live_period"]))
+        ttk.Entry(live_top, textvariable=self.live_period_var, width=6).pack(side="left", padx=4)
+        ttk.Label(live_top, text="(such as 90m, 12h, 1d, 2w), checking the price every").pack(side="left")
+        self.live_poll_var = tk.StringVar(value=f"{settings['semi_live_poll_seconds']:g}")
+        ttk.Spinbox(live_top, from_=5, to=3600, increment=5, textvariable=self.live_poll_var, width=5).pack(
+            side="left", padx=4)
+        ttk.Label(live_top, text="seconds.").pack(side="left")
+        live_bottom = ttk.Frame(live)
+        live_bottom.pack(fill="x", pady=(4, 0))
+        ttk.Label(live_bottom, text="Project five directions from its moves over the last").pack(side="left")
+        self.live_basis_var = tk.StringVar(value=f"{settings['semi_live_basis_days']:g}")
+        ttk.Spinbox(live_bottom, from_=7, to=3650, increment=30, textvariable=self.live_basis_var, width=5).pack(
+            side="left", padx=4)
+        ttk.Label(live_bottom, text="days, and run each model on").pack(side="left")
+        self.live_paths_var = tk.StringVar(value=str(settings["semi_live_paths"]))
+        ttk.Spinbox(live_bottom, from_=1, to=100, textvariable=self.live_paths_var, width=4).pack(side="left", padx=4)
+        ttk.Label(live_bottom, text="paths of each.", ).pack(side="left")
+        ttk.Label(live, text="Backtests the models on history, projects where the price could go, then paper-trades "
+                             "them on the live market and shows how each does against its projection. Never places "
+                             "an order.", foreground="#555555").pack(anchor="w", pady=(4, 0))
 
         focus = ttk.LabelFrame(frame, text="Focus", padding=8)
         focus.pack(fill="x", pady=(8, 0))
@@ -584,8 +623,20 @@ class TestOptionsDialog:
         except (OSError, ValueError) as exc:
             self.plan_note_var.set(f"Plan not saved: {exc}")
             return
+        currency = self.live_currency_var.get()
+        live = {"semi_live_currency": "" if currency == SELECTED_CURRENCY else currency,
+                "semi_live_period": self.live_period_var.get().strip(),
+                "semi_live_poll_seconds": self.live_poll_var.get().strip(),
+                "semi_live_paths": self.live_paths_var.get().strip(),
+                "semi_live_basis_days": self.live_basis_var.get().strip()}
+        try:
+            _, _, poll, paths, basis = semi_live.settings_of(live)
+        except semi_live.SemiLiveError as exc:
+            self.note_var.set(str(exc))
+            return
+        live.update(semi_live_poll_seconds=poll, semi_live_paths=paths, semi_live_basis_days=basis)
         self.options = {"mode": self.mode_var.get(), "scenario_set": str(self._set_path()), "top_n": top_n,
-                        "stress_paths": stress_paths, "synthetic_flash_crash_buys": bool(self.flash_var.get())}
+                        "stress_paths": stress_paths, "synthetic_flash_crash_buys": bool(self.flash_var.get()), **live}
         if self.options["mode"] in ("historic+synthetic", "synthetic"):
             if not self.scenarios:
                 self.note_var.set("Add at least one scenario, or test on historic data only")

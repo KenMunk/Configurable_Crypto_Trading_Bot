@@ -159,6 +159,8 @@ The code is split into small modules:
 | `model_assessor.py` | Goals: checks models against your targets, ranks a currency's models, and moves the weakest to its discard folder; `--organize` files profiles into their currency's folder. |
 | `synthetic.py` | Synthetic market scenarios (crashes, bear markets, pumps, chop, volatility shocks, resampled history) built from each market's own behaviour, for robustness tests. |
 | `stress_test.py` | Stress tests: every scenario and nightmare alone and in pairs, with and without history, and an HTML report per model. |
+| `semi_live.py` | Semi-live monitoring: five projected directions for each selected currency, each with its probability, then paper trading the models on the live market against them. |
+| `time_window.py` | The scroll bar and span picker under the simulator's charts: a year (or any span) of history at a time. |
 | `scenario_editor.py` | The simulator's Test options window: historic or synthetic data, the scenario editor and preview, and how many top models to highlight. |
 | `model_lab.py` | Model Lab: the window that queues and runs model searches and shows the top 20 models. |
 | `model_library.py` | Where models live: one folder per currency under `config/`, their discard folders, and each currency's recorded best model. |
@@ -169,7 +171,7 @@ The code is split into small modules:
 | `indicators.py` | The indicator library: moving averages, oscillators, bands, volatility, trend and volume. |
 | `rules.py` | The rule language: formulas parsed against a whitelist and never executed as Python. |
 | `friction.py` | Trading costs: live fee tier, slippage, Bitcoin network fee, tax, and the friction screen. |
-| `chart.py` | The price, indicator and model-value charts, with hover tooltips. |
+| `chart.py` | The price, indicator and model-value charts, with the hovered values shown beside them. |
 | `engine.py` | The trader: settings, profile loading, ledger, Coinbase authentication, status dashboard, serial link, GPU helper. |
 
 ---
@@ -289,6 +291,8 @@ Configurable_Crypto_Trading_Bot/
 ├── model_lab.py              Model Lab: queue and run searches, see the top 20
 ├── synthetic.py              Synthetic market scenarios for robustness tests
 ├── stress_test.py            Stress tests and their reports
+├── semi_live.py              Semi-live monitoring: projections and live paper trading
+├── time_window.py            Scrolling the simulator's charts through time
 ├── scenario_editor.py        The simulator's Test options window
 ├── model_assessor.py         Checks models against your goals; ranks and discards
 ├── search_registry.py        Evaluations shared by every model search
