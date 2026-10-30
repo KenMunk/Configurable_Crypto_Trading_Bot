@@ -583,6 +583,28 @@ def run_backtest(candles, profile, starting_capital=None, progress=None, frictio
         return max(float(starting_capital) * halt_below if halt_below else 0.0,
                    peak_equity * (1 - halt_from_peak) if halt_from_peak else 0.0)
 
+    def exit_stops(index):
+        """The (price, reason) stops guarding the open position on candle `index`; the live trader reads the
+        next candle's from result["live_state"], so it checks the same levels the backtest does."""
+        stops = []
+        if use_hard_stop and hard_stop_pct:
+            stops.append((entry["price"] * (1 - hard_stop_pct), "HARD_STOP"))
+        if trailing_stop:
+            # Trails the highest price since entry, as of the previous candle, since a
+            # candle's high and low can't be ordered within it.
+            stops.append((entry["highest"] * (1 - trailing_stop), "TRAILING_STOP"))
+        if entry.get("target_armed"):
+            stops.append((entry["highest"] * (1 - target_trail), "TARGET_TRAIL"))
+        if window_limited:
+            # The price at which selling (after its slippage and fee) would leave the
+            # model exactly at the drawdown limit below its trailing-window peak.
+            floor = window_peak(index) * (1 - max_drawdown_limit)
+            stops.append(((floor - cash) / (units * (1 - slippage) * (1 - fee_rate)), "DRAWDOWN_STOP"))
+        if halt_floor():
+            # The price at which selling would leave the model's value exactly at the loss halt's floor.
+            stops.append(((halt_floor() - cash) / (units * (1 - slippage) * (1 - fee_rate)), "LOSS_HALT"))
+        return stops
+
     total = len(candles)
     report_every = max(1, total // 100)
     equity_series = []
@@ -622,23 +644,7 @@ def run_backtest(candles, profile, starting_capital=None, progress=None, frictio
         holding_through_crash = episode is not None and not recovered_now
 
         if entry is not None and episode is None:
-            stops = []
-            if use_hard_stop and hard_stop_pct:
-                stops.append((entry["price"] * (1 - hard_stop_pct), "HARD_STOP"))
-            if trailing_stop:
-                # Trails the highest price since entry, as of the previous candle, since a
-                # candle's high and low can't be ordered within it.
-                stops.append((entry["highest"] * (1 - trailing_stop), "TRAILING_STOP"))
-            if entry.get("target_armed"):
-                stops.append((entry["highest"] * (1 - target_trail), "TARGET_TRAIL"))
-            if window_limited:
-                # The price at which selling (after its slippage and fee) would leave the
-                # model exactly at the drawdown limit below its trailing-window peak.
-                floor = window_peak(index) * (1 - max_drawdown_limit)
-                stops.append(((floor - cash) / (units * (1 - slippage) * (1 - fee_rate)), "DRAWDOWN_STOP"))
-            if halt_floor():
-                # The price at which selling would leave the model's value exactly at the loss halt's floor.
-                stops.append(((halt_floor() - cash) / (units * (1 - slippage) * (1 - fee_rate)), "LOSS_HALT"))
+            stops = exit_stops(index)
             target_price = entry["price"] * (1 + profit_lock)
             triggered = [stop for stop in stops if candle["low"] <= stop[0]]
             if triggered:
@@ -748,7 +754,22 @@ def run_backtest(candles, profile, starting_capital=None, progress=None, frictio
     if first_entry is not None:
         starts.append(bisect.bisect_left([candle["start"] for candle in candles], first_entry))
     benchmark_index = min(starts, default=0)
+    # Where the model stands after the last candle, for the live trader (live_trader.py): its open position, and
+    # the stops and profit target that would guard it on the next candle, as the loop above would compute them.
+    live_state = {
+        "last_candle": last["start"], "entry_signal": bool(entry_signals[-1]), "position": None, "stops": [],
+        "profit_target": None, "position_fraction": position_fraction, "paused": paused,
+        "halted": halted_at is not None, "orders_today": orders_today, "max_orders_per_day": max_orders_per_day,
+    }
+    if entry is not None:
+        live_state["position"] = {
+            "time": entry["time"], "price": entry["price"], "cost": entry["cost"], "units": units,
+            "highest": entry["highest"], "reason": entry["reason"], "target_armed": bool(entry.get("target_armed"))}
+        live_state["stops"] = [{"price": price, "reason": reason} for price, reason in exit_stops(total)]
+        if profit_lock and not entry.get("target_armed"):
+            live_state["profit_target"] = {"price": entry["price"] * (1 + profit_lock), "arms_trail": bool(target_trail)}
     return {
+        "live_state": live_state,
         "product_id": profile.get("product_id"),
         "compute_device": compute_device,
         "gpu_indicators": list(model.gpu_indicators),

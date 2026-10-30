@@ -16,7 +16,9 @@ Each strategy is a JSON **model profile**. A profile names its indicators, write
 }
 ```
 
-> **Not financial advice.** This is experimental software. Backtest results are not predictions, and the trader does not place orders yet.
+> **Risk warning: this is a speculative automated trader.** It buys and sells cryptocurrency on its own, without asking you first. Cryptocurrency prices are extremely volatile, and **you can lose your entire investment**. Backtested, simulated and paper-traded results do not predict future returns. Nothing in this project is financial advice. Use it at your own risk, and only with money you can afford to lose completely.
+>
+> This is experimental software. The live trader trades real money when its API key can trade, and paper-trades with a view-only key; start with small amounts.
 
 ---
 
@@ -40,7 +42,8 @@ Each strategy is a JSON **model profile**. A profile names its indicators, write
 | Tool | Command | What it does | Status |
 |---|---|---|---|
 | **Simulator** | `python simulator.py` | A desktop app that backtests one or more model profiles over up to 10 years of Coinbase candles. It charges fees, slippage and taxes, and shows the results in sortable tables and interactive charts. | Working |
-| **Trader** | `python engine.py` | The headless runtime for an always-on machine. It loads profiles from `quant_system/config/` (one per ticker), opens its ledger and serial link, and starts a status dashboard with an on-demand Coinbase authentication check. Run directly, it exits as soon as start-up finishes; the [Trader guide](Project_Documentation/trader.md#keeping-the-engine-running) has a launcher that keeps it running. | Foundation only; does not trade yet |
+| **Live trader** | `python live_trader.py` | Runs any number of models on any number of currencies at once, several per currency if you like, each with its own capital in a trading ledger. At every candle close it replays each model through the simulator's own backtest and trades the account to match; between closes it sells on the backtest's stops. Its API key decides: a key that can trade means live trading, a view-only key means paper trading, with the two modes' records kept apart. A stand-alone tool on Linux, macOS or Windows: `--background` runs it detached and restarts it after a crash, `--status` and `--stop` manage it, with no service manager needed. After a power cut it resumes from its ledger; `--backup` and `--restore` move it to another machine. It has a read-only web portal that any machine on your network can open (`http://<machine>:8080/portal`). See the [Live trading guide](Project_Documentation/live_trading.md). | Working; live or paper by API key |
+| **Trader** | `python engine.py` | The headless runtime for an always-on machine. It loads profiles from `quant_system/config/` (one per ticker), opens its ledger and serial link, and starts a status dashboard with an on-demand Coinbase authentication check. Run directly, it exits as soon as start-up finishes; `live_trader.py` runs it with the trader and serves `/api/live`. | Foundation for the live trader |
 | **Model profiles** | `config/*.json` | Declarative strategy definitions in one format for both tools (the simulator reads `config/`; `python engine.py` reads `quant_system/config/`): 24 indicators, a safe rule language, and settings for friction, capital and safeguards. | Working |
 | **Parallel backtests** | `python parallel_backtest.py config/*.json` | Backtests many profiles at once on worker processes (by default one per CPU but two, keeping one CPU for the window and candle downloads and one for merging results), with one thread writing the candle database and one merging results into the performance log. When optional GPU dependencies and devices are available, CUDA is selected automatically and adds one worker slot per GPU; `--compute-device cpu` forces CPU-only mode. Supported moving averages run on GPU, while trading, fees and tax simulation remain CPU-based. GPU slots may not improve throughput when CPU simulation is the bottleneck. See [Running models in parallel](Project_Documentation/simulator.md#running-models-in-parallel). | Working |
 | **Model search** | `python model_search.py` | Breeds and backtests generations of vote-based models for one market, seeded by your existing models and their logged results, until improvement plateaus. Writes a varied set of the best to `config/` and the performance log, then ranks all of the currency's models against your goals and moves the bottom 80% to `config/discard/`. Several searches can run at once (`--instances N`), sharing every evaluation so none is repeated. CUDA is selected automatically when available and adds GPU-backed evaluator capacity; `--compute-device cpu` forces CPU-only evaluation. Everything it searches over comes from a private settings file in `search_config/` ([README](search_config/README.md)). | Working |
@@ -113,6 +116,7 @@ All documentation lives in [Project_Documentation/](Project_Documentation/), whi
 | Page | What it covers |
 |---|---|
 | [Simulator guide](Project_Documentation/simulator.md) | Installing and launching the simulator; every control and results tab; the buy-and-hold benchmark; the model performance log; the candle cache; exactly how trades are filled, charged and taxed; what a backtest leaves out; scripting backtests in Python; troubleshooting. |
+| [Live trading guide](Project_Documentation/live_trading.md) | How the live trader decides (the simulator's backtest, replayed at each candle close); deployments and the settings file; live or paper by API key, with separate records; orders and sizing; safeguards; the trading ledger, restarts and reviews; the dashboard. |
 | [Trader guide](Project_Documentation/trader.md) | Every `.env` setting; creating a view-only Coinbase API key; running the engine and keeping it running; the status dashboard and its security; profiles, ledger, serial link and GPU helper; the trading safety switches; troubleshooting. |
 | [Model configuration guide](Project_Documentation/model_configuration.md) | Creating a profile step by step; every field with its default and whether the simulator uses it; flash-crash buys; the friction screen with a worked example; what validation catches. This page was formerly `config_file_structure.md`. |
 
@@ -143,8 +147,8 @@ All documentation lives in [Project_Documentation/](Project_Documentation/), whi
         |                                                        |
         +------------ edit the profile, compare variants <-------+
 
-  When a profile is ready:  copy it to the trader's config/ folder  ----->  engine.py
-                            (live trading is not built yet)
+  When a profile is ready:  add it to the live trader's settings  ----->  live_trader.py
+                            (paper with a view-only key; live with a key that can trade)
 ```
 
 The code is split into small modules:
@@ -172,7 +176,12 @@ The code is split into small modules:
 | `rules.py` | The rule language: formulas parsed against a whitelist and never executed as Python. |
 | `friction.py` | Trading costs: live fee tier, slippage, Bitcoin network fee, tax, and the friction screen. |
 | `chart.py` | The price, indicator and model-value charts, with the hovered values shown beside them. |
-| `engine.py` | The trader: settings, profile loading, ledger, Coinbase authentication, status dashboard, serial link, GPU helper. |
+| `live_trader.py` | The live trader: deployments, the trading ledger, replaying each model through the backtest, paper and Coinbase orders, safeguards, recovery after a restart. |
+| `data_home.py` | Where the live trader keeps your data: one folder outside the program, chosen per system or with `--set-data-dir`. |
+| `recovery.py` | Resuming after a power cut, a crash or a move: recovery bundles (automatic and on demand), restoring them, the ledger's damage check, and outage records. |
+| `process_control.py` | Running the live trader on its own: detached in the background, a supervisor that restarts it, the stop request, and the lock that allows one trader at a time. |
+| `web_portal.py` | The live trader's read-only web portal and its JSON endpoints, served by the engine's dashboard. |
+| `engine.py` | The trader foundation: settings, profile loading, ledger, Coinbase authentication, status dashboard, serial link, GPU helper. |
 
 ---
 
@@ -267,7 +276,7 @@ The blueprint has five sections, which this summary follows:
 | Inward friction screen | Built in the simulator | `friction.py` |
 | Outward value harvesting | Profile fields only | n/a |
 | Headless node runtime | Foundation: settings, profile loading, Coinbase authentication check | `engine.py` |
-| Live data streaming, live signal evaluation, order routing | Not built | n/a |
+| Live prices, live signal evaluation, order routing | Built: many models on many currencies, decisions replayed through the backtest, paper or live orders | `live_trader.py` |
 | Low-wear SQLite ledger | Database created with WAL; no tables or midnight flush yet | `engine.py` |
 | LAN-only status API | Built; isolation depends on your firewall | `engine.py` |
 | Serial interlock and cutover handshake | The serial port opens; no protocol yet | `engine.py` |
@@ -283,6 +292,8 @@ The blueprint's code listing is an early snapshot of `engine.py`. The current en
 ```text
 Configurable_Crypto_Trading_Bot/
 ├── simulator.py              Simulator window (run this to backtest)
+├── live_trader.py            Live trader: many models on many currencies, paper or live
+├── web_portal.py             The live trader's web portal (read-only monitoring page)
 ├── engine.py                 Trader runtime (status dashboard, Coinbase auth, ledger)
 ├── backtest.py               Candle download; the backtest engine
 ├── candle_store.py           Candle cache and stored indicators (SQLite)
@@ -312,6 +323,10 @@ Configurable_Crypto_Trading_Bot/
 │   │   ├── discard/          Models ranked out by the search or the assessor
 │   │   └── best_model.json   The currency's best model, chosen by the simulator
 │   └── *.json                Older private profiles, before currency folders (ignored by Git)
+├── live_config/              The live trader's settings template (your settings live in its data folder)
+├── process_control.py        Running the live trader on its own: background, restarts, stop, one at a time
+├── recovery.py               Backups, restoring them, and resuming after an outage or a move
+├── data_home.py              The live trader's data folder, outside the program
 ├── scenarios/                Synthetic scenario sets for the simulator
 ├── search_config/
 │   ├── .example/             Public template search settings and goals (tracked)
@@ -347,7 +362,7 @@ The `data/` folder is created by the simulator's first run and is ignored by Git
 
 | Path | In Git | Contents |
 |---|---|---|
-| `.env` | Ignored | API keys and runtime settings; see [Setting up the .env file](Project_Documentation/trader.md#2-setting-up-the-env-file) |
+| `.env` | Ignored | The simulator's API key and runtime settings; see [Setting up the .env file](Project_Documentation/trader.md#2-setting-up-the-env-file). The live trader doesn't read it: its own `live_trader.env` lives in its [data folder](Project_Documentation/live_trading.md#its-own-configuration-file). |
 | `.env.example` | Tracked | The template for `.env` |
 | `config/*.json` | Ignored | Your private model profiles |
 | `config/.example/` | Tracked | Public template profiles |
@@ -390,6 +405,7 @@ They use fake Coinbase clients, so they need no API key.
 ## Safety
 
 - **The simulator only reads.** It lists your accounts, reads your fee tier and downloads candles from Coinbase, and it fetches the public Bitcoin network fee from mempool.space. If authentication fails with HTTP 401, it also asks api.ipify.org for your public IP address to show in the error. Its only changes to your machine are the files it creates (`data/`, `ledger/fortress.db`) and, if you accept its prompts, installing the Coinbase SDK and adding Python to your user `PATH`.
-- **The trader cannot trade yet.** No code places orders. Use a **view-only** API key, and keep `COINBASE_ALLOW_TRADING`, `LIVE_EXECUTION_ACTIVE` and every profile's `live_execution_active` set to `false`. See [Trading safety switches](Project_Documentation/trader.md#10-trading-safety-switches).
-- **The dashboard has no login.** Keep its port behind a firewall on your local network.
+- **The live trader's API key decides whether it trades real money.** With a key that can trade, every deployment places real orders. With a view-only key it paper-trades, and `--paper` forces paper trading. Paper and live records are kept apart, so paper positions can never become real orders. Keep a **view-only** key until you mean to trade. See [Paper and live](Project_Documentation/live_trading.md#5-paper-and-live).
+- **Your trading data lives outside the program.** The live trader keeps its ledger, settings, backups, logs and CSV reports in a data folder in your user profile (see [Your data folder](Project_Documentation/live_trading.md#3-your-data-folder)), never in the repository, so removing or updating the program never touches it.
+- **The web portal and dashboard are for your local network.** They answer only private-network addresses, can ask for `DASHBOARD_PASSWORD`, and use plain HTTP: never forward their port to the internet.
 - **Backtests are optimistic.** Read [what the results do not include](Project_Documentation/simulator.md#what-the-results-do-not-include) before trusting a result.

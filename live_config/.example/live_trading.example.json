@@ -1,0 +1,43 @@
+{
+  "settings": {
+    "poll_seconds": 15,
+    "fee_refresh_hours": 24,
+    "order_timeout_seconds": 30,
+    "sell_fallback_to_market": true,
+    "quote_currency": "USD"
+  },
+  "global_safeguards": {
+    "max_global_drawdown": 0.25,
+    "liquidate_on_global_drawdown": false,
+    "max_order_value": 2500,
+    "max_orders_per_day": 50,
+    "max_price_age_seconds": 120,
+    "max_entry_delay_candles": 1,
+    "max_entry_price_deviation": 0.03,
+    "balance_tolerance": 0.001
+  },
+  "deployments": [
+    {
+      "id": "btc_trend_vote",
+      "profile": "config/.example/btc_trend_vote_4in_1out.example.json",
+      "capital": 1000
+    },
+    {
+      "id": "btc_ema_cross",
+      "profile": "config/.example/btc_ema_10_100.example.json",
+      "capital": 500,
+      "order_style": "MARKET"
+    },
+    {
+      "id": "eth_best",
+      "profile": "best:ETH-USD",
+      "capital": 750
+    },
+    {
+      "id": "doge_best",
+      "profile": "best:DOGE-USD",
+      "capital": 250,
+      "enabled": false
+    }
+  ]
+}

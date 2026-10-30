@@ -237,3 +237,18 @@ cdp_api_key*.json
 # Cached historical market data
 data/
 search_config/model_search.json
+
+# Private live trading settings and the HALT switch (see live_config/README.md)
+live_config/*
+!live_config/.example/
+!live_config/README.md
+# Real trading records written by live_trader.py
+**/ledger/trading_ledger.db
+**/ledger/trading_ledger.db-*
+# The live trader's log files (headless mode), rotated as live_trader.log.1, .2, ...
+logs/
+
+# The live trader's lock, process records and stop requests (see process_control.py)
+run/
+# The live trader's recovery bundles: they hold the ledger and your tax profile (see recovery.py)
+backups/

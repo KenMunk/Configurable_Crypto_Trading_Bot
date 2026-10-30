@@ -42,3 +42,11 @@ def user_files_in_tmp(tmp_path, monkeypatch):
     monkeypatch.setattr(stress_test, "PLAN_FILE", tmp_path / "stress_plan.json")
     monkeypatch.setattr(stress_test, "NIGHTMARE_SET", tmp_path / "nightmares.json")
     monkeypatch.setattr(stress_test, "REPORT_DIR", tmp_path / "stress_reports")
+    # The live trader's data folder, the remembered choice of it and the tax profile it points taxes.py at: all in
+    # this test's folder; and never move the program folder's own files.
+    import data_home
+    import taxes
+    monkeypatch.setenv(data_home.ENV_VAR, str(tmp_path / "trader_data"))
+    monkeypatch.setattr(data_home, "POINTER_FILE", tmp_path / "trader_settings" / "data_location.json")
+    monkeypatch.setattr(data_home, "adopt_program_folder_data", lambda paths, program_dir: [])
+    monkeypatch.setattr(taxes, "PROFILE_FILE", taxes.PROFILE_FILE)

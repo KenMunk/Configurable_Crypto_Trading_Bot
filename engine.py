@@ -7,16 +7,20 @@ place orders: COINBASE_ALLOW_TRADING and LIVE_EXECUTION_ACTIVE are read and repo
 but nothing acts on them yet.
 """
 
+import base64
 import gc
+import hmac
+import ipaddress
 import json
 import logging
 import os
+import socket
 import subprocess
 import sqlite3
 import sys
 import threading
 import time
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.request import Request, urlopen
 
 DEFAULT_ENV_PATH = ".env"
@@ -166,7 +170,14 @@ def load_environment_config(env_path=DEFAULT_ENV_PATH):
             "enabled": False,
         },
         "lan_port": 8080,
+        # The dashboard and web portal: the address to listen on (all interfaces, so other machines on the network
+        # can reach it), an optional password, and whether clients outside private networks may connect at all.
+        "dashboard_host": "0.0.0.0",
+        "dashboard_password": "",
+        "dashboard_allow_public": False,
         "live_execution_active": False,
+        # The live trader paper-trades even with an API key that can trade (live_trader.py --paper does the same).
+        "force_paper_trading": False,
     }
 
     if not os.path.exists(env_file):
@@ -211,8 +222,16 @@ def load_environment_config(env_path=DEFAULT_ENV_PATH):
             elif normalized_key == "KRAKEN_ENABLED":
                 config["kraken"]["enabled"] = bool(value)
 
+            elif normalized_key == "DASHBOARD_HOST":
+                config["dashboard_host"] = str(value) or "0.0.0.0"
+            elif normalized_key == "DASHBOARD_PASSWORD":
+                config["dashboard_password"] = str(value)
+            elif normalized_key == "DASHBOARD_ALLOW_PUBLIC":
+                config["dashboard_allow_public"] = bool(value)
             elif normalized_key == "LAN_PORT":
                 config["lan_port"] = int(value)
+            elif normalized_key == "FORCE_PAPER_TRADING":
+                config["force_paper_trading"] = bool(value)
             elif normalized_key == "LIVE_EXECUTION_ACTIVE":
                 config["live_execution_active"] = bool(value)
 
@@ -289,20 +308,90 @@ class IndustrialHardwareInterlock:
             return False
 
 
+def client_allowed(address, allow_public=False):
+    """Whether a client at `address` may use the dashboard: this machine and private networks (home and office
+    LANs, link-local addresses) always may; addresses on the internet only with DASHBOARD_ALLOW_PUBLIC."""
+    if allow_public:
+        return True
+    try:
+        ip = ipaddress.ip_address(str(address).split("%", 1)[0])
+    except ValueError:
+        return False
+    if getattr(ip, "ipv4_mapped", None):
+        ip = ip.ipv4_mapped
+    return ip.is_loopback or ip.is_private or ip.is_link_local
+
+
+def lan_addresses():
+    """This machine's addresses on its local networks, for telling other machines where the dashboard is."""
+    found = set()
+    try:  # the address of the interface that routes outwards; nothing is sent
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+            probe.connect(("192.0.2.1", 9))
+            found.add(probe.getsockname()[0])
+    except OSError:
+        pass
+    try:
+        found.update(info[4][0] for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET))
+    except OSError:
+        pass
+    return sorted(address for address in found if not address.startswith("127."))
+
+
 class LocalDashboardHandler(BaseHTTPRequestHandler):
-    """Read-only JSON status endpoints for the engine.
+    """Read-only JSON status endpoints and the live trader's web portal.
 
     GET / or /api/status returns the node state; GET /api/coinbase/authenticate runs a
-    fresh read-only Coinbase check. There is no authentication, and the server binds to
-    all interfaces, so keep the port off untrusted networks.
+    fresh read-only Coinbase check; /portal and /api/live... are the live trader's portal
+    (web_portal.py). The server listens on every interface so other machines on the
+    network can use it, answers only private-network clients unless DASHBOARD_ALLOW_PUBLIC
+    is set, and asks for DASHBOARD_PASSWORD when one is set. It is plain HTTP: keep it on
+    networks you trust.
     """
 
     def log_message(self, format, *args):
         # Silence the default per-request stderr logging.
         return
 
+    def _authorized(self):
+        """Refuse clients from outside private networks, and ask for the password when one is set."""
+        config = self.server.engine_ref.api_config
+        if not client_allowed(self.client_address[0], config.get("dashboard_allow_public", False)):
+            self.send_error(403, "Only machines on private networks may use this dashboard")
+            return False
+        password = config.get("dashboard_password") or ""
+        if not password:
+            return True
+        header = self.headers.get("Authorization", "")
+        supplied = ""
+        if header.startswith("Basic "):
+            try:
+                supplied = base64.b64decode(header[6:], validate=True).decode("utf-8").partition(":")[2]
+            except (ValueError, UnicodeDecodeError):
+                supplied = ""
+        if hmac.compare_digest(supplied.encode("utf-8"), password.encode("utf-8")):
+            return True
+        self.send_response(401)
+        self.send_header("WWW-Authenticate", 'Basic realm="Trading node", charset="UTF-8"')
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+        return False
+
     def do_GET(self):
-        if self.path == "/api/coinbase/authenticate":
+        if not self._authorized():
+            return
+        from web_portal import SECURITY_HEADERS, route
+        answer = route(self.path, getattr(self.server.engine_ref, "live_trader", None))
+        if answer is not None:
+            status, content_type, body, headers = answer
+            self.send_response(status)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(body)))
+            for name, value in {**SECURITY_HEADERS, **headers}.items():
+                self.send_header(name, value)
+            self.end_headers()
+            self.wfile.write(body)
+        elif self.path == "/api/coinbase/authenticate":
             result = self.server.engine_ref.authenticate_coinbase()
             self.send_response(200 if result["authenticated"] else 502)
             self.send_header("Content-Type", "application/json")
@@ -323,6 +412,18 @@ class LocalDashboardHandler(BaseHTTPRequestHandler):
                 "timestamp_utc": int(time.time()),
                 "monitored_assets": list(self.server.engine_ref.loaded_models.keys()),
             }
+            trader = getattr(self.server.engine_ref, "live_trader", None)
+            if trader is not None:
+                # Each currency the live trader runs, with how many deployments trade it; details at /api/live.
+                live = trader.snapshot()
+                status_payload["monitored_assets"] = live.get("currencies", [])
+                status_payload["live_trading"] = {
+                    "mode": live.get("mode"), "system_live": live.get("system_live"),
+                    "halt_file": live.get("halt_file"),
+                    "deployments": len(live.get("deployments", [])),
+                    "needs_review": [row["id"] for row in live.get("deployments", [])
+                                     if row.get("status") == "NEEDS_REVIEW"],
+                }
             self.wfile.write(json.dumps(status_payload, indent=4).encode("utf-8"))
         else:
             self.send_error(404, "Endpoint Out of Scope")
@@ -347,6 +448,7 @@ class QuantitativeTradingEngine:
         self.serial_link_active = False
         self.web_server = None
         self.last_coinbase_authentication = None
+        self.live_trader = None  # set by live_trader.py; the dashboard then serves /api/live
 
     def get_exchange_connection(self, exchange_name):
         """Return the .env settings for "coinbase" or "kraken" (a dict, not a live connection)."""
@@ -527,16 +629,35 @@ class QuantitativeTradingEngine:
                     print(f"❌ [ORCHESTRATOR] Parsing failure on {file_name}: {exc}")
         gc.collect()
 
-    def spin_up_lan_isolated_dashboard(self, port):
-        """Serve LocalDashboardHandler on all interfaces at `port` from a daemon thread."""
+    def spin_up_lan_isolated_dashboard(self, port, host=None):
+        """Serve LocalDashboardHandler at `port` from daemon threads, one per request.
+
+        `host` defaults to DASHBOARD_HOST (all interfaces), so other machines on the network can reach it; use
+        127.0.0.1 to keep it to this machine. Returns the URLs it can be reached at ([] if it couldn't start).
+        """
+        host = host or self.api_config.get("dashboard_host") or "0.0.0.0"
         try:
-            self.web_server = HTTPServer(("0.0.0.0", port), LocalDashboardHandler)
-            self.web_server.engine_ref = self
-            server_thread = threading.Thread(target=self.web_server.serve_forever, daemon=True)
-            server_thread.start()
-            print(f"📡 [LAN SERVER] Private status dashboard active at http://localhost:{port}")
-        except Exception as exc:  # pragma: no cover - environment-specific
-            print(f"❌ [LAN SERVER] Interface socket bind failure: {exc}")
+            self.web_server = ThreadingHTTPServer((host, port), LocalDashboardHandler)
+        except OSError as exc:  # pragma: no cover - environment-specific
+            LOGGER.error("[LAN SERVER] Could not listen on %s:%s: %s", host, port, exc)
+            return []
+        self.web_server.daemon_threads = True
+        self.web_server.engine_ref = self
+        port = self.web_server.server_address[1]
+        server_thread = threading.Thread(target=self.web_server.serve_forever, daemon=True)
+        server_thread.start()
+        if host in ("0.0.0.0", ""):  # every interface: this machine and its network addresses
+            hosts = ["localhost"] + lan_addresses()
+        elif host in ("127.0.0.1", "localhost"):
+            hosts = ["localhost"]
+        else:
+            hosts = [host]
+        urls = [f"http://{name}:{port}/" for name in hosts]
+        LOGGER.info("[LAN SERVER] Dashboard listening on %s:%s; open %s", host, port,
+                    ", ".join(url + "portal" for url in urls))
+        if self.api_config.get("dashboard_password"):
+            LOGGER.info("[LAN SERVER] The dashboard asks for DASHBOARD_PASSWORD")
+        return urls
 
     def execute_isolated_gpu_simulation(self, device_id, target_architecture, raw_prices, window_size):
         """Return a simple moving average of raw_prices (window_size) computed on one GPU.

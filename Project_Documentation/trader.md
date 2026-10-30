@@ -2,7 +2,9 @@
 
 `engine.py` is the trader: the headless runtime meant to run around the clock on a small, always-on machine on your local network. That machine is the "headless node" in the [quant infrastructure blueprint](../README.md#the-quant-infrastructure-blueprint).
 
-> **Current status: foundation only. The engine does not trade yet.**
+> **Trading lives in `live_trader.py`.** It builds on this engine (settings, Coinbase client, dashboard) and runs any number of models on any number of currencies. See the [Live trading guide](live_trading.md). This page covers the engine foundation it uses.
+>
+> **The engine on its own does not trade.**
 >
 > Today the engine does four things:
 >
@@ -56,7 +58,7 @@ At start-up, `initialize_node_cluster()` runs four steps in order:
 
 ## 2. Setting up the .env file
 
-The engine and the simulator both read secrets and runtime settings from a `.env` file in the **current working directory**. Git ignores `.env`, so your keys stay out of the repository. Create it from the template:
+The engine and the simulator both read secrets and runtime settings from a `.env` file in the **current working directory**. The live trader does not: it has its own configuration file, `live_trader.env` in its data folder (see [Its own configuration file](live_trading.md#its-own-configuration-file)), so the simulator's key never decides whether it trades real money. Git ignores `.env`, so your keys stay out of the repository. Create it from the template:
 
 ```bash
 cp .env.example .env
@@ -73,11 +75,13 @@ In PowerShell: `Copy-Item .env.example .env`
 | `COINBASE_KEY_FILE` | empty | Engine, simulator | The path to a key JSON file, used only when the name or the secret above is empty. Both values then come from the file. A relative path resolves against the engine's base directory: the current directory for the simulator, but `quant_system/` for `python engine.py`. An absolute path is safest. |
 | `COINBASE_REQUIRED_PERMISSIONS` | `view` | Reports | A comma-separated list of the permissions you expect the key to have. It is documentation only: authentication results repeat it, but it grants nothing. |
 | `COINBASE_BASE_URL` | `https://api.coinbase.com` | Engine, simulator | The API host. |
-| `COINBASE_ALLOW_TRADING` | `false` | Not used yet | A reserved guard for future order routing. Keep it `false`. |
+| `COINBASE_ALLOW_TRADING` | `false` | Not used | No longer gates trading: the live trader trades live when its API key can trade. |
 | `COINBASE_ENABLED` | `false` | Not used yet | Loaded, but nothing checks it. Authentication works either way. |
 | `KRAKEN_API_KEY`, `KRAKEN_API_SECRET`, `KRAKEN_BASE_URL`, `KRAKEN_ENABLED` | empty, empty, `https://api.kraken.com`, `false` | Not used yet | Placeholders for a future Kraken connection. |
 | `LAN_PORT` | `8080` | Your launcher | Loaded, but `python engine.py` always uses port 8080. The [launcher script](#keeping-the-engine-running) below uses this value. It must be a whole number: any other value stops both the engine and the simulator from starting. |
-| `LIVE_EXECUTION_ACTIVE` | `false` | Not used yet | A reserved system-wide switch for live trading. Keep it `false`. |
+| `DASHBOARD_HOST`, `DASHBOARD_PASSWORD`, `DASHBOARD_ALLOW_PUBLIC` | `0.0.0.0`, empty, `false` | Engine, live trader | Who can reach the dashboard and the live trader's web portal; see [the web portal](live_trading.md#who-can-see-it). |
+| `LIVE_EXECUTION_ACTIVE` | `false` | Not used | No longer gates trading (see `FORCE_PAPER_TRADING`). |
+| `FORCE_PAPER_TRADING` | `false` | Live trader, in `live_trader.env` only | `true` paper-trades even with an API key that can trade. |
 
 ### How the file is read
 
@@ -109,7 +113,7 @@ Git ignores files named `cdp_api_key*.json`. If you keep a key file inside the r
 
 1. Sign in to the Coinbase Developer Platform. Its documentation is at <https://docs.cdp.coinbase.com/>.
 2. Create a **Secret API key** for the Advanced Trade API. The `.env` template supports both the ECDSA and the Ed25519 signature algorithm.
-3. Grant only the **View** permission. Nothing in this project needs Trade or Transfer permissions. A view-only key also guarantees that no bug can move your money.
+3. Grant only the **View** permission for the simulator, and for paper trading. A view-only key guarantees that no bug can move your money. The live trader trades **real money** when its key also has **Trade**; never grant **Transfer**.
 4. *(Optional)* Restrict the key to your public IP address. If authentication fails with HTTP 401, the result includes your outbound IP address to help you check this.
 5. Put the key in `.env`, either as the name and secret or as a key file (see [section 2](#2-setting-up-the-env-file)).
 6. Test the key with the simulator's **Test Coinbase Authentication** button, or with the engine's [`/api/coinbase/authenticate`](#5-the-status-dashboard) endpoint.
@@ -271,7 +275,7 @@ curl http://localhost:8080/api/status
 
 ### Security
 
-The dashboard listens on **all network interfaces** (`0.0.0.0`), over plain HTTP, with **no login**. Anyone who can reach the port can read the status and trigger an authentication check with your key. The check returns only success or failure, an account count and, on HTTP 401, your outbound IP address. It never returns the key.
+The dashboard listens on **all network interfaces** (`0.0.0.0`, or `DASHBOARD_HOST`), over plain HTTP. It answers only clients on private networks (unless `DASHBOARD_ALLOW_PUBLIC=true`) and asks for `DASHBOARD_PASSWORD` when one is set; without a password, anyone on your network who can reach the port can read the status, the [live trader's portal](live_trading.md#9-the-web-portal-watching-from-any-machine-on-your-network), and trigger an authentication check with your key. The check returns only success or failure, an account count and, on HTTP 401, your outbound IP address. It never returns the key.
 
 - Block the port with a firewall so that only your local network can reach it, and never forward it from your router. The blueprint's `ufw` rules for Linux are in section 4, "Production Security & Local LAN Isolation Rules", of [quant_infrastructure_blueprint.md](quant_infrastructure_blueprint.md).
 - On Windows, if Windows Defender Firewall asks whether to allow Python, allow it on private networks only.
@@ -340,18 +344,16 @@ The simulator does not use this helper; its backtests run on the CPU with numpy.
 
 ## 10. Trading safety switches
 
-Several switches exist for the day live trading is built:
+The [live trader](live_trading.md) decides from its **API key**. With a key that can trade it places real orders; with a view-only key it paper-trades (see [Paper and live](live_trading.md#5-paper-and-live)). The settings that used to gate live trading no longer do:
 
-| Switch | Where | Current effect |
+| Setting | Where | Now |
 |---|---|---|
-| `COINBASE_ALLOW_TRADING` | `.env` | None yet |
-| `LIVE_EXECUTION_ACTIVE` | `.env` | None yet |
-| `execution.live_execution_active` | Each model profile | None yet |
-| `safeguards.live_execution_active` | Each model profile | None yet |
+| `FORCE_PAPER_TRADING=true` | `live_trader.env` | Paper-trades even with a key that can trade, as `live_trader.py --paper` does |
+| `COINBASE_ALLOW_TRADING`, `LIVE_EXECUTION_ACTIVE` | `.env` | Not used by the live trader (which doesn't read `.env` at all) |
+| `"live"` | A deployment in the settings | Not used; the deployment's notes say so |
+| `execution.live_execution_active`, `safeguards.live_execution_active` | Model profiles | Not used by the live trader |
 
-The intended design is that live trading requires **both** a system-level switch and the model's own switch, so that a model can never grant itself trading access (see [system_config_structure.md](system_config_structure.md)). Keep every switch `false` until order routing exists and has been tested.
-
-The strongest protection available today is a **view-only API key**: even a future bug cannot trade with it.
+The strongest protection is the API key itself. A **view-only** key can't trade, whatever any setting says, and it is all that paper trading needs.
 
 ---
 
